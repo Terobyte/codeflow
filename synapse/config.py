@@ -1,0 +1,101 @@
+"""SynapseConfig — one dataclass holding every M0 threshold/model-id/secret-name, so nothing
+important is a hidden magic number scattered across modules. Thresholds marked "owed" in the
+design doc (§7/§8) are config, not constants, precisely so they can be tuned without a code
+change once real numbers land from испытание №4/№5.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class SynapseConfig:
+    # Cascade tiers (Р-14).
+    tier1_model: str = "gemini-3.5-flash"
+    tier1_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    tier2_model: str = "google/gemini-3.5-flash"
+    tier3_model: str = "claude-haiku-4-5"
+
+    google_api_key: str | None = None
+    openrouter_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    deepgram_api_key: str | None = None
+    fish_audio_api_key: str | None = None
+    fish_reference_id: str | None = None
+
+    request_timeout_s: float = 10.0
+
+    # Circuit breaker windows (Р-14).
+    rpm_mute_s: float = 60.0
+    rpd_reset_hour_utc: int = 8  # M0-допущение: сброс free tier ~полночь Pacific (±1ч DST, owed)
+
+    # Kora liveness (Р-11) — owed-пороги §7/§8, значения — конфиг, не константы.
+    stale_after_s: float = 120.0
+    unreachable_after_s: float = 300.0
+    heartbeat_interval_s: float = 30.0
+
+    # Destructive-task confirmation protocol (Р-16).
+    confirm_timeout_s: float = 30.0
+    max_rereadbacks: int = 2
+
+    # SPEAK invariant window (Р-15г).
+    critical_speak_window_s: float = 5.0
+
+    # Cost cap (§11.5). None disables the cap.
+    max_paid_calls_per_day: int | None = 500
+
+    affirm_words: frozenset[str] = field(default_factory=lambda: frozenset({"да", "подтверждаю", "делай"}))
+    deny_words: frozenset[str] = field(default_factory=lambda: frozenset({"нет", "отмена", "стоп"}))
+    destructive_keywords: frozenset[str] = field(
+        default_factory=lambda: frozenset(
+            {
+                "удали",
+                "сотри",
+                "перезапиши",
+                "снеси",
+                "отформатируй",
+                "деплой",
+                "drop",
+                "rm",
+                "delete",
+                "overwrite",
+            }
+        )
+    )
+
+    journal_dir: str = "journals"
+    include_owed_prompt_rules: bool = True
+
+    @classmethod
+    def from_env(cls, env: dict[str, str] | None = None) -> "SynapseConfig":
+        e = env if env is not None else os.environ
+        return cls(
+            google_api_key=e.get("GOOGLE_API_KEY") or None,
+            openrouter_api_key=e.get("OPENROUTER_API_KEY") or None,
+            anthropic_api_key=e.get("ANTHROPIC_API_KEY") or None,
+            deepgram_api_key=e.get("DEEPGRAM_API_KEY") or None,
+            fish_audio_api_key=e.get("FISH_AUDIO_API_KEY") or None,
+            fish_reference_id=e.get("FISH_REFERENCE_ID") or None,
+        )
+
+    def validate_voice_keys(self) -> None:
+        """Hard-fail with the full list of missing keys (R5) — called when assembling the
+        voice pipeline (synapse.pipeline.app.build_pipeline). The console/text path never
+        calls this and works with no keys at all."""
+        missing = [
+            name
+            for name, val in (
+                ("GOOGLE_API_KEY", self.google_api_key),
+                ("OPENROUTER_API_KEY", self.openrouter_api_key),
+                ("ANTHROPIC_API_KEY", self.anthropic_api_key),
+                ("DEEPGRAM_API_KEY", self.deepgram_api_key),
+                ("FISH_AUDIO_API_KEY", self.fish_audio_api_key),
+                ("FISH_REFERENCE_ID", self.fish_reference_id),
+            )
+            if not val
+        ]
+        if missing:
+            raise RuntimeError(
+                "synapse: missing required keys for the voice pipeline: " + ", ".join(missing)
+            )

@@ -1,0 +1,10 @@
+{"advance_s": 1.0, "user": "Скачай Дюну и вырежи главу один в Markdown"}
+{"advance_s": 2.0, "kora_event": {"type": "task_started", "class": "narratable"}}
+{"advance_s": 3.0, "user": "Какой статус?"}
+{"advance_s": 5.0, "kora_event": {"type": "task_completed", "class": "critical", "payload": {"file": "chapter-1.md"}, "speak": "Готово: глава 1 сохранена в chapter-1.md."}}
+{"advance_s": 2.0, "user": "Удали старые бэкапы"}
+{"advance_s": 3.0, "user": "Да, подтверждаю"}
+{"advance_s": 2.0, "user": "Отмени"}
+{"advance_s": 1.0, "kora_event": {"type": "heartbeat"}}
+{"advance_s": 400.0}
+{"advance_s": 1.0, "user": "Какой статус?"}
