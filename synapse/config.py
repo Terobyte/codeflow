@@ -23,6 +23,9 @@ class SynapseConfig:
     deepgram_api_key: str | None = None
     fish_audio_api_key: str | None = None
     fish_reference_id: str | None = None
+    # s2.1-pro-free is free through end of July 2026 (§11.4 M0 assumption); "s2-pro" (paid)
+    # is pipecat's own FishAudioTTSService default.
+    fish_tts_model: str = "s2.1-pro-free"
 
     request_timeout_s: float = 10.0
 
@@ -70,7 +73,7 @@ class SynapseConfig:
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SynapseConfig":
         e = env if env is not None else os.environ
-        return cls(
+        kwargs = dict(
             google_api_key=e.get("GOOGLE_API_KEY") or None,
             openrouter_api_key=e.get("OPENROUTER_API_KEY") or None,
             anthropic_api_key=e.get("ANTHROPIC_API_KEY") or None,
@@ -78,6 +81,12 @@ class SynapseConfig:
             fish_audio_api_key=e.get("FISH_AUDIO_API_KEY") or None,
             fish_reference_id=e.get("FISH_REFERENCE_ID") or None,
         )
+        # Unlike the api keys above, fish_tts_model has a real (non-None) default -- only
+        # override it when the env var is actually set, so an unset FISH_TTS_MODEL keeps the
+        # dataclass default instead of clobbering it with None.
+        if e.get("FISH_TTS_MODEL"):
+            kwargs["fish_tts_model"] = e["FISH_TTS_MODEL"]
+        return cls(**kwargs)
 
     def validate_voice_keys(self) -> None:
         """Hard-fail with the full list of missing keys (R5) — called when assembling the

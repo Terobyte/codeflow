@@ -8,14 +8,21 @@ handled:
   (b) the aggregator's commit lands BEFORE the abort is marked -> the tail it appended is
       scrubbed retroactively, the moment the abort is marked.
 
-Pure core, no pipecat imports — a `context` here is duck-typed as "anything with a
-`.messages` list", so `GenerationGuard` itself is unit-testable with a bare fake object.
-`make_guarded_assistant_aggregator` is the pipecat-specific integration glue on top.
+`GenerationGuard` itself has no pipecat dependency in its own logic — a `context` here is
+duck-typed as "anything with a `.messages` list", so it is unit-testable with a bare fake
+object. The rest of this module is pipecat-specific integration glue on top:
+`make_guarded_assistant_aggregator` wraps the assistant aggregator that commits generations;
+`GenerationStartHook` is the frame-flow glue that actually calls `start_generation` (wired
+into the live pipeline in app.py). Two `GenerationStartHook`s, not one, because tool-loop
+re-inference re-enters the LLM UPSTREAM of the switcher, past a pre-switcher-only hook.
 """
 from __future__ import annotations
 
 import itertools
 from typing import Any, Protocol
+
+from pipecat.frames.frames import Frame, LLMContextFrame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
 class _HasMessages(Protocol):
@@ -36,8 +43,24 @@ class GenerationGuard:
 
     def start_generation(self, context: _HasMessages) -> int:
         """Called when a new turn's generation begins (LLMContextFrame pushed). Snapshots
-        the pre-generation message count so a later scrub knows where to cut."""
+        the pre-generation message count so a later scrub knows where to cut.
+
+        Also forgets every earlier generation's bookkeeping (an unbounded cascade-retry
+        session would otherwise grow these dicts forever). Stale generations are collected
+        from the UNION of all three structures, not just `_snapshot_len`: the guarded
+        aggregator captures its gen at push_aggregation() entry and commits that captured
+        number after its await — it does NOT re-read `current_generation` — so a late
+        `record_committed(N)` for an already-forgotten N recreates an entry that lives only
+        in `_committed_contexts`, which a snapshot-keys-only sweep would never evict. Such a
+        recreated record is HARMLESS while it sits there (`_scrub` of a forgotten generation
+        is a no-op — its snapshot is gone, see `_scrub`'s None check); the union sweep here
+        evicts it on the next start. `is_aborted()` on a forgotten generation still returns
+        False, same as it always has for any generation nobody has marked — the pre-cleanup
+        default is preserved, not silently changed."""
         gen = next(self._counter)
+        stale = (set(self._snapshot_len) | set(self._committed_contexts) | self._aborted) - {gen}
+        for old_gen in stale:
+            self.forget(old_gen)
         self._current_generation = gen
         self._snapshot_len[gen] = len(context.messages)
         return gen
@@ -80,11 +103,10 @@ def make_guarded_assistant_aggregator(base_cls: type, guard: GenerationGuard) ->
     `guard` before committing a generation's text to the LLM context (race order a), and
     registers the commit with `guard` right after (so race order b can scrub it later).
 
-    NOTE: wiring an instance of the returned class into the live pipeline (in place of
-    `LLMContextAggregatorPair`'s built-in assistant aggregator) is integration work beyond
-    what M0's offline test suite exercises — GenerationGuard's own logic is fully unit
-    tested (test_context_guard.py); this factory is the documented next step for wiring it
-    into a live pipecat pipeline.
+    An instance of the returned class is wired into the live pipeline in app.py (built via
+    LLMContextAggregatorPair's own __init__ recipe, since the pair offers no subclass hook),
+    together with the two GenerationStartHooks around the switcher — see
+    test_pipeline_smoke.py for the wiring coverage.
     """
 
     class GuardedLLMAssistantAggregator(base_cls):  # type: ignore[misc]
@@ -94,7 +116,35 @@ def make_guarded_assistant_aggregator(base_cls: type, guard: GenerationGuard) ->
                 await self.reset()
                 return ""
             result = await super().push_aggregation()
+            # Unconditional on purpose, even when `result` is empty (a pure tool-call turn
+            # with no assistant text): LLMFullResponseEndFrame -- which triggers this
+            # push_aggregation -- is pushed unconditionally in the LLM service's `finally`,
+            # so this call always runs too. That is what keeps commit(N) ordered strictly
+            # before start_generation(N+1) in the tool-loop case (critique MAJOR-1).
             guard.record_committed(gen, self._context)
             return result
 
     return GuardedLLMAssistantAggregator
+
+
+class GenerationStartHook(FrameProcessor):
+    """Calls `guard.start_generation(frame.context)` when an `LLMContextFrame` passes
+    through in `direction` — the frame-flow trigger `GenerationGuard` itself has no way to
+    see on its own (it is pure core, no pipecat imports).
+
+    Two of these are wired around the cascade's LLMSwitcher, not one: the user turn's
+    LLMContextFrame travels DOWNSTREAM out of the user aggregator, but a tool-call's
+    re-inference travels UPSTREAM out of the assistant aggregator instead (pipecat's LLM
+    services terminate LLMContextFrame — they never re-push it) — a DOWNSTREAM-only hook
+    would miss every tool-loop turn, leaving `current_generation` stale for it."""
+
+    def __init__(self, guard: GenerationGuard, direction: FrameDirection) -> None:
+        super().__init__()
+        self._guard = guard
+        self._direction = direction
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMContextFrame) and direction == self._direction:
+            self._guard.start_generation(frame.context)
+        await self.push_frame(frame, direction)

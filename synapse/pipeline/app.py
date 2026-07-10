@@ -14,6 +14,7 @@ from pipecat.pipeline.llm_switcher import LLMSwitcher
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMAssistantAggregator, LLMUserAggregator
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 from pipecat.services.fish.tts import FishAudioTTSService
 
@@ -27,7 +28,7 @@ from synapse.config import SynapseConfig
 from synapse.dispatcher.tools import ALL_SCHEMAS, KoraBridge, ToolHandlers, register_all
 from synapse.journal import AlertKind, TurnJournal
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
-from synapse.pipeline.context_guard import GenerationGuard
+from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook, make_guarded_assistant_aggregator
 
 
 class SynapseVoicePipeline:
@@ -108,29 +109,35 @@ def build_pipeline(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseVoi
     context = LLMContext(tools=ALL_SCHEMAS)
     # S1: replicate LLMContextAggregatorPair's own __init__ recipe (user first, then the
     # assistant with a back-reference to it) so the assistant half can be the guarded
-    # subclass from item 18 -- LLMContextAggregatorPair itself always builds a plain
-    # LLMAssistantAggregator internally with no hook to substitute a subclass.
-    #
-    # NOTE (honest gap, not silently assumed away): nothing here yet calls
-    # `generation_guard.start_generation(context)` at the start of each turn's generation --
-    # doing that safely needs a frame-flow hook (e.g. a tiny FrameProcessor ahead of
-    # llm_switcher reacting to LLMContextFrame) that isn't verified against a live pipecat
-    # run in this offline-only M0 test suite. Wiring it in now, unverified, risks a WORSE bug
-    # than not wiring it: `current_generation` would stay at its initial value across turns,
-    # so a single error would permanently mark every future generation aborted. Left for the
-    # first change that can actually be run against live traffic. GenerationGuard's own
-    # logic is fully implemented and unit tested (test_context_guard.py) for when that
-    # wiring lands.
+    # subclass from make_guarded_assistant_aggregator -- LLMContextAggregatorPair itself
+    # always builds a plain LLMAssistantAggregator internally with no hook to substitute a
+    # subclass.
     user_aggregator = LLMUserAggregator(context)
-    assistant_aggregator = LLMAssistantAggregator(context, _paired_user_aggregator=user_aggregator)
+    GuardedAssistantAggregator = make_guarded_assistant_aggregator(LLMAssistantAggregator, generation_guard)
+    assistant_aggregator = GuardedAssistantAggregator(context, _paired_user_aggregator=user_aggregator)
 
-    tts = FishAudioTTSService(api_key=cfg.fish_audio_api_key or "", reference_id=cfg.fish_reference_id)
+    # Two GenerationStartHooks, not one, around llm_switcher (research §2.2): a user turn's
+    # LLMContextFrame travels DOWNSTREAM out of user_aggregator, but a tool-call's
+    # re-inference travels UPSTREAM out of assistant_aggregator instead -- LLM services
+    # terminate LLMContextFrame rather than re-pushing it, so a switcher itself never relays
+    # one either way. A DOWNSTREAM-only hook would miss every tool-loop turn, leaving
+    # `current_generation` stale for it and letting a stale scrub cut off already-committed
+    # tool-messages on the next error.
+    pre_hook = GenerationStartHook(generation_guard, FrameDirection.DOWNSTREAM)
+    post_hook = GenerationStartHook(generation_guard, FrameDirection.UPSTREAM)
+
+    tts = FishAudioTTSService(
+        api_key=cfg.fish_audio_api_key or "",
+        settings=FishAudioTTSService.Settings(model=cfg.fish_tts_model, voice=cfg.fish_reference_id),
+    )
 
     pipeline = Pipeline(
         [
             stt,
             user_aggregator,
+            pre_hook,
             llm_switcher,
+            post_hook,
             assistant_aggregator,
             arbiter,
             tts,

@@ -3,11 +3,21 @@ instances, each tagged with a {endpoint, model} label for the journal. Also Cost
 (§11.5): per-PAID-attempt increment+check (R9), not per-turn — a full-cascade turn (tier1
 free miss -> tier2 paid attempt -> tier3 paid attempt) costs up to 2, and an overshoot past
 the cap is bounded to <=1 call past the limit (documented in README).
+
+Р-14 request timeout: pipecat's `create_client` doesn't forward a constructor `timeout=` to
+AsyncOpenAI (it stops at `default_headers`); AnthropicLLMService does accept `client=` but
+building a whole client ourselves duplicates its construction recipe. Simplest correct fix
+for all three tiers uniformly: set `.timeout` post-construction directly on the SDK client --
+both AsyncOpenAI and AsyncAnthropic (openai/anthropic BaseClient) store it as a plain
+attribute, read fresh per request, not baked into a per-call kwarg. Without this, the SDK
+default (`httpx.Timeout(600, connect=5.0)`) applies, and a hung tier hangs the whole turn
+instead of failing over.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import httpx
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
@@ -27,6 +37,14 @@ def build_tier_services(cfg: SynapseConfig) -> tuple[list, list[TierLabel]]:
     tier2 = OpenRouterLLMService(api_key=cfg.openrouter_api_key, model=cfg.tier2_model)
     tier3 = AnthropicLLMService(api_key=cfg.anthropic_api_key or "unset", model=cfg.tier3_model)
     services = [tier1, tier2, tier3]
+
+    # connect=5.0 kept at the SDK default explicitly -- a bare `httpx.Timeout(N)` would also
+    # tighten connect to N, which is not what request_timeout_s is meant to bound (critique
+    # MINOR).
+    timeout = httpx.Timeout(cfg.request_timeout_s, connect=5.0)
+    for svc in services:
+        svc._client.timeout = timeout
+
     labels = [
         TierLabel(endpoint="google-ai-studio", model=cfg.tier1_model, paid=False),
         TierLabel(endpoint="openrouter", model=cfg.tier2_model, paid=True),

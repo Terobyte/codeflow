@@ -72,11 +72,12 @@ cp .env.example .env     # fill in GOOGLE_API_KEY / OPENROUTER_API_KEY / ANTHROP
 - **The console's MockLLM is a deterministic word-router**, not a real model — a real LLM in
   the console path is out of scope for M0 (running the cascade twice, once for voice and once
   for text, would let the two implementations drift).
-- **`GenerationGuard`'s guarded-context-aggregator factory (S1) is implemented and unit
-  tested** (`test_context_guard.py`, both race orders), but wiring an instance of it into the
-  live pipecat pipeline (replacing `LLMContextAggregatorPair`'s default assistant aggregator)
-  is not yet done in `pipeline/app.py` — the offline test suite doesn't exercise a live
-  cascade retry end-to-end. Documented follow-up, not a silent gap.
+- **`GenerationGuard` (S1) is wired into the live pipeline** (`pipeline/app.py`: guarded
+  assistant aggregator + two `GenerationStartHook`s around the cascade switcher) and unit
+  tested (`test_context_guard.py`, both race orders; `test_pipeline_smoke.py` for the
+  wiring), but two narrower windows remain open — a mid-tool-call context write that bypasses
+  the guard, and a late error from an already-superseded generation — both tracked as
+  follow-ups, not silently assumed away.
 - Prompt v3 (Приложение А) is included verbatim; the OWED additions (rules 7/8, the refined
   possibility "а", possibility "г") are project-status text per the design doc, not yet
   re-validated by a `confab_regression.py` run — `SynapseConfig.include_owed_prompt_rules`

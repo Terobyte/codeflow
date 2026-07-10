@@ -132,6 +132,14 @@ def _extract_http_info(exception: BaseException | None) -> tuple[int | None, dic
     response = getattr(exception, "response", None)
     headers = dict(response.headers) if response is not None and hasattr(response, "headers") else None
     body = getattr(exception, "body", None)
+    # A live Google OpenAI-compat 429 body is `[{"error": {...}}]`, not a mapping -- the
+    # openai SDK's own unwrap (`data = body.get("error", body) if is_mapping(body) else
+    # body`, openai/_client.py:674) leaves a non-mapping body as the whole list, so `e.body`
+    # here is that list, not the inner error dict. Unwrap it before the isinstance check
+    # below, or classify_error() sees `body=None` and RPD (a whole-day mute) degrades to the
+    # RPM fallback (60s) forever -- confirmed against a live 429 (Senior probes).
+    if isinstance(body, list) and body and isinstance(body[0], dict):
+        body = body[0]
     if not isinstance(body, dict):
         body = None
     return status, body, headers
