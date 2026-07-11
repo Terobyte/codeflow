@@ -2,7 +2,7 @@ import pytest
 from pipecat.frames.frames import TextFrame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameDirection
 
-from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
+from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor, default_sentence_splitter
 
 
 def fixed_splitter(text):
@@ -94,3 +94,16 @@ async def test_drain_pushes_speak_as_tts_speak_frame_out_of_context_and_dispatch
     speak_frame, _ = captured[1]
     assert isinstance(dispatcher_frame, TextFrame) and not isinstance(dispatcher_frame, TTSSpeakFrame)
     assert isinstance(speak_frame, TTSSpeakFrame) and speak_frame.append_to_context is False
+
+
+def test_default_splitter_preserves_whitespace_no_mashing():
+    # E10: streaming LLM fragments must re-concatenate with spaces intact -- the splitter must
+    # never drop characters, or pipecat's TTS re-joins them mashed ("хорошем темпе" -> "хорошемтемпе").
+    frags = ["Привет! ", "Это тест ", "синтеза речи."]
+    pieces: list[str] = []
+    for f in frags:
+        r = default_sentence_splitter(f)
+        assert "".join(r) == f  # per-fragment: no characters lost
+        pieces += r
+    assert "".join(pieces) == "".join(frags)  # cross-fragment: no mashing
+    assert default_sentence_splitter(" по рефакторингу ") == [" по рефакторингу "]

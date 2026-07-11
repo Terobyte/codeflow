@@ -33,13 +33,16 @@ def default_sentence_splitter(text: str) -> list[str]:
     while remaining:
         idx = match_endofsentence(remaining)
         if idx <= 0:
-            tail = remaining.strip()
-            if tail:
-                sentences.append(tail)
+            # incomplete streaming tail: keep verbatim so fragments re-concatenate
+            # downstream (pipecat TTS) with their spaces intact -- stripping here mashes
+            # adjacent fragments ("Задачапо рефакторингу"). Invariant: join(result) == text.
+            sentences.append(remaining)
             break
-        sentence, remaining = remaining[:idx].strip(), remaining[idx:].lstrip()
-        if sentence:
-            sentences.append(sentence)
+        end = idx
+        while end < len(remaining) and remaining[end].isspace():
+            end += 1
+        sentences.append(remaining[:end])  # sentence + its trailing whitespace, no strip
+        remaining = remaining[end:]
     return sentences
 
 
