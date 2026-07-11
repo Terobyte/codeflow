@@ -23,6 +23,7 @@ from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 from pipecat.services.fish.tts import FishAudioTTSService
 
 from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
+from synapse.bridge.kora import KoraRunner
 from synapse.bridge.state import SpeakLedger, TaskStore
 from synapse.cascade.breaker import CircuitBreaker
 from synapse.cascade.services import CostCap, build_tier_services
@@ -55,6 +56,7 @@ class SynapseHost:
         handlers: ToolHandlers,
         breaker: CircuitBreaker,
         cost_cap: CostCap,
+        kora_runner: KoraRunner | None = None,
     ) -> None:
         self.clock = clock
         self.cfg = cfg
@@ -68,6 +70,9 @@ class SynapseHost:
         self.handlers = handlers
         self.breaker = breaker
         self.cost_cap = cost_cap
+        # The real Kora producer (M1 slice 1), held on the host so its single in-flight task
+        # survives WebRTC reconnects like the rest of the long-lived state. None when disabled.
+        self.kora_runner = kora_runner
 
     async def monitor_forever(self) -> None:
         """R8: periodically drives speak_ledger.check()/store.liveness() so the Р-15г/Р-11
@@ -107,7 +112,21 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         arbiter_policy.push_speak(text)
         speak_ledger.register_speak_text(text, clock.now())
 
-    bridge = KoraBridge(store=store, confirm_flow=confirm_flow, clock=clock, on_speak=on_speak, cfg=cfg)
+    # Build the real Kora producer before the bridge so submit/confirm-COMMITTED can launch it
+    # and request_cancel can tear it down (M1 slice 1). Disabled → the old hollow behavior.
+    kora_runner = (
+        KoraRunner(cfg, store, speak_ledger, clock, journal, on_speak) if cfg.kora_enabled else None
+    )
+
+    bridge = KoraBridge(
+        store=store,
+        confirm_flow=confirm_flow,
+        clock=clock,
+        on_speak=on_speak,
+        cfg=cfg,
+        on_task_committed=kora_runner.start if kora_runner else None,
+        on_cancel=kora_runner.request_cancel if kora_runner else None,
+    )
     handlers = ToolHandlers(bridge, journal)
 
     # breaker needs only the tier COUNT, not the service instances themselves -- those are
@@ -131,6 +150,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         handlers=handlers,
         breaker=breaker,
         cost_cap=cost_cap,
+        kora_runner=kora_runner,
     )
 
 

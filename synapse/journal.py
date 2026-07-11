@@ -13,9 +13,12 @@ import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from synapse.clock import Clock
+
+if TYPE_CHECKING:
+    from synapse.bridge.state import KoraEvent
 
 
 class AlertKind(str, Enum):
@@ -26,6 +29,7 @@ class AlertKind(str, Enum):
     COST_CAP = "COST_CAP"
     CONFIRM_SELF_ATTEMPT = "CONFIRM_SELF_ATTEMPT"
     AUTH_FAILURE = "AUTH_FAILURE"
+    KORA_RUN_FAILED = "KORA_RUN_FAILED"
 
 
 @dataclass
@@ -107,6 +111,25 @@ class TurnJournal:
         if not called_status:
             self.alert(AlertKind.STATUS_WITHOUT_GROUNDING, {"llm_output": record.llm_output})
 
+    def record_kora_event(self, event: "KoraEvent") -> None:
+        """Standalone JSONL line for one mapped Kora event (M1 slice 1) — the full-fidelity
+        observability sink, in contrast to `store`, which keeps only the coarse lifecycle
+        (ALT-M1). Written flush-only, NOT fsync'd: this is high-volume (every SDK message)
+        and losing the tail on a crash is acceptable, unlike `alert` which is the §8 крит.5
+        evidence and stays fsync'd. Deliberately does NOT touch `_current` — a Kora event is
+        asynchronous to the dispatcher's turn, so it must not attach to a TurnRecord."""
+        self._write(
+            {
+                "kind": "kora_event",
+                "type": event.type,
+                "cls": event.cls.value,
+                "ts": event.ts,
+                "payload": event.payload,
+                "has_speak": event.speak_text is not None,
+            },
+            fsync=False,
+        )
+
     def end_turn(self) -> None:
         if self._current is None:
             return
@@ -114,10 +137,11 @@ class TurnJournal:
         self._write(row)
         self._current = None
 
-    def _write(self, row: dict[str, Any]) -> None:
+    def _write(self, row: dict[str, Any], fsync: bool = True) -> None:
         self._file.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         self._file.flush()
-        os.fsync(self._file.fileno())
+        if fsync:
+            os.fsync(self._file.fileno())
 
     def close(self) -> None:
         self._file.close()

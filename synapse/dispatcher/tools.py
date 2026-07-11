@@ -17,7 +17,13 @@ from typing import Any, Callable
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.services.llm_service import FunctionCallParams
 
-from synapse.bridge.confirm import ConfirmFlow, ConfirmResult, SubmitResult
+from synapse.bridge.confirm import (
+    ConfirmDecisionOutcome,
+    ConfirmFlow,
+    ConfirmOutcome,
+    ConfirmResult,
+    SubmitResult,
+)
 from synapse.bridge.state import TaskStore
 from synapse.clock import Clock
 from synapse.config import SynapseConfig
@@ -79,6 +85,11 @@ class KoraBridge:
     clock: Clock
     cfg: SynapseConfig
     on_speak: Callable[[str], None] | None = None
+    # M1 slice 1: a task entering RUNNING (submit-COMMITTED or confirm-COMMITTED) launches the
+    # real Kora producer; a request_cancel that actually flips the store fires on_cancel so the
+    # runner tears down Kora's subprocess, not just the slot. Both fire INSIDE ToolHandlers._do.
+    on_task_committed: Callable[[str, str], None] | None = None
+    on_cancel: Callable[[], None] | None = None
 
 
 def _submit_result_to_dict(res: SubmitResult) -> dict[str, Any]:
@@ -124,6 +135,10 @@ class ToolHandlers:
             speak_text = res.readback_text or res.reject_text
             if speak_text and self.bridge.on_speak:
                 self.bridge.on_speak(speak_text)
+            # A non-destructive submit commits straight to RUNNING → launch Kora now. (A
+            # destructive one only STAGES here; its launch waits for confirm_task below.)
+            if res.outcome == ConfirmOutcome.COMMITTED and self.bridge.on_task_committed and res.task_id:
+                self.bridge.on_task_committed(res.task_id, text)
             return _submit_result_to_dict(res)
 
         result, deduped = await self._guarded("submit_task", _do)
@@ -135,6 +150,12 @@ class ToolHandlers:
             res = self.bridge.confirm_flow.confirm(decision, self.bridge.clock.now())
             if res.text and self.bridge.on_speak:
                 self.bridge.on_speak(res.text)
+            # A confirmed destructive task just flipped to RUNNING → launch Kora. Read the task
+            # TEXT from the store (ConfirmResult.text is the SPEAK phrase, not the task text).
+            if res.outcome == ConfirmDecisionOutcome.COMMITTED and self.bridge.on_task_committed:
+                task = self.bridge.store.task
+                if task is not None:
+                    self.bridge.on_task_committed(task.id, task.text)
             return _confirm_result_to_dict(res)
 
         result, deduped = await self._guarded("confirm_task", _do)
@@ -150,6 +171,8 @@ class ToolHandlers:
     async def request_cancel(self) -> dict[str, Any]:
         async def _do() -> dict[str, Any]:
             ok = self.bridge.store.request_cancel()
+            if ok and self.bridge.on_cancel:
+                self.bridge.on_cancel()
             return {"outcome": "cancel_requested" if ok else "no_active_task"}
 
         result, deduped = await self._guarded("request_cancel", _do)

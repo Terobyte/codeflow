@@ -68,6 +68,22 @@ class SynapseConfig:
     journal_dir: str = "journals"
     include_owed_prompt_rules: bool = True
 
+    # Kora — real producer via Claude Agent SDK (M1 slice 1). `kora_enabled=False` restores the
+    # old hollow behavior for environments without the SDK/key. `kora_workspace_dir=None` →
+    # ~/synapse-kora-workspace. The gate + system_prompt (not cwd) are the safety boundary
+    # (§2.8/§2d): cwd is NOT a sandbox. `kora_cli_path=None` → SDK default; the nvm launcher is
+    # broken (version-mismatch), so a live run must point this at the native binary.
+    kora_enabled: bool = True
+    kora_workspace_dir: str | None = None
+    kora_model: str = "claude-sonnet-5"
+    kora_cli_path: str | None = None
+    kora_max_turns: int = 40
+    kora_max_budget_usd: float | None = 1.0
+    # Wall-clock watchdog (RISK-M7): asyncio.wait_for around the SDK stream so a hung CLI that
+    # never emits a ResultMessage can't strand the task RUNNING forever (max_turns/max_budget
+    # only fire on a ResultMessage).
+    kora_deadline_s: float = 900.0
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SynapseConfig":
         e = env if env is not None else os.environ
@@ -78,12 +94,25 @@ class SynapseConfig:
             deepgram_api_key=e.get("DEEPGRAM_API_KEY") or None,
             fish_audio_api_key=e.get("FISH_AUDIO_API_KEY") or None,
             fish_reference_id=e.get("FISH_REFERENCE_ID") or None,
+            kora_workspace_dir=e.get("KORA_WORKSPACE_DIR") or None,
+            kora_cli_path=e.get("KORA_CLI_PATH") or None,
         )
         # Unlike the api keys above, fish_tts_model has a real (non-None) default -- only
         # override it when the env var is actually set, so an unset FISH_TTS_MODEL keeps the
         # dataclass default instead of clobbering it with None.
         if e.get("FISH_TTS_MODEL"):
             kwargs["fish_tts_model"] = e["FISH_TTS_MODEL"]
+        # Same "override only when explicitly set" rule for the non-None Kora defaults.
+        if "KORA_ENABLED" in e:
+            kwargs["kora_enabled"] = e["KORA_ENABLED"].strip().lower() not in ("false", "0", "no", "")
+        if e.get("KORA_MODEL"):
+            kwargs["kora_model"] = e["KORA_MODEL"]
+        if e.get("KORA_MAX_TURNS"):
+            kwargs["kora_max_turns"] = int(e["KORA_MAX_TURNS"])
+        if "KORA_MAX_BUDGET_USD" in e and e["KORA_MAX_BUDGET_USD"].strip():
+            kwargs["kora_max_budget_usd"] = float(e["KORA_MAX_BUDGET_USD"])
+        if e.get("KORA_DEADLINE_S"):
+            kwargs["kora_deadline_s"] = float(e["KORA_DEADLINE_S"])
         return cls(**kwargs)
 
     def validate_voice_keys(self) -> None:
