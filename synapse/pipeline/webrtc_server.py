@@ -71,10 +71,15 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             async with lock:
                 if current["task"] is task:
                     current["task"] = None
+                host.unbind_output(task)  # M1 slice 2: stop the SPEAK injector targeting a dead task
 
         async with lock:
             old = current["task"]
             current["task"] = task
+            # M1 slice 2: bind the SPEAK injector to THIS task under the same lock that
+            # publishes it as current, so a racing offer can't leave the injector pointed at a
+            # preempted task. A preempting connection's later bind supersedes this one.
+            host.bind_output(task)
         if old is not None:
             await old.cancel(reason="preempted by new connection")
 
@@ -86,6 +91,7 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             async with lock:
                 if current["task"] is task:
                     current["task"] = None
+                host.unbind_output(task)  # M1 slice 2: no-op if a preempting task already rebound
             if session_id is not None:
                 active_sessions.pop(session_id, None)
 

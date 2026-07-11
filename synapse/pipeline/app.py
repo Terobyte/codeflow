@@ -13,7 +13,9 @@ runs live voice, including test_pipeline_smoke).
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.llm_switcher import LLMSwitcher
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -40,7 +42,14 @@ class SynapseHost:
     """Long-lived logical state, built ONCE by `build_host()` and shared by reference across
     every WebRTC reconnect (M1 host-singleton): task store, speak ledger, confirm flow, arbiter
     policy, breaker, cost cap. None of these are pipecat FrameProcessors, so nothing here is
-    tied to a single PipelineRunner run -- `SynapseSession` (per-connection) is."""
+    tied to a single PipelineRunner run -- `SynapseSession` (per-connection) is.
+
+    EXCEPTION (M1 slice 2): `_output_task` is the ONE field that is NOT long-lived -- it is a
+    per-connection bind-slot for the currently live PipelineTask, set by `bind_output()` on
+    connect and cleared by `unbind_output()` on disconnect/preempt. It exists so `speak()` can
+    inject Kora's proactive SPEAK straight into the running output task (out-of-band, no input
+    frame needed). Typed `Any` to avoid importing the pipecat worker type into this module --
+    the only surface used is `has_finished()`/`queue_frame()` (duck-typed)."""
 
     def __init__(
         self,
@@ -73,6 +82,52 @@ class SynapseHost:
         # The real Kora producer (M1 slice 1), held on the host so its single in-flight task
         # survives WebRTC reconnects like the rest of the long-lived state. None when disabled.
         self.kora_runner = kora_runner
+        # M1 slice 2 (the one NON-long-lived field, see class docstring): the currently live
+        # per-connection PipelineTask, or None when no client is connected.
+        self._output_task: Any = None
+
+    def bind_output(self, task: Any) -> None:
+        """Point the SPEAK injector at this connection's live output task. SYNCHRONOUS and
+        await-free: webrtc calls it while already holding its own lock, so the host must never
+        acquire a lock here (S6-style)."""
+        self._output_task = task
+
+    def unbind_output(self, task: Any) -> None:
+        """Clear the bind-slot IFF it still points at `task` -- a preempting connection's new
+        bind supersedes this one, so a late unbind of the superseded task is a harmless no-op
+        (the `is` check fails). SYNCHRONOUS and await-free (called under webrtc's lock)."""
+        if self._output_task is task:
+            self._output_task = None
+
+    async def push_speak_frame(self, text: str) -> None:
+        """Inject Kora's SPEAK straight into the running output task, out-of-band (no input
+        frame needed). Re-checks liveness: the task may have finished between `speak()`
+        scheduling this and it running. `queue_frame` on a finished task is a SILENT DROP
+        (worker.py: an unbounded put never raises/blocks, the drain task is gone), so the
+        `has_finished()` guard is what actually prevents a lost-in-the-void SPEAK."""
+        t = self._output_task
+        if t is not None and not t.has_finished():
+            await t.queue_frame(TTSSpeakFrame(text=text, append_to_context=False))
+
+    def speak(self, text: str) -> None:
+        """SPEAK entry point (called by on_speak). Registers the ledger ALWAYS (Р-15г: a
+        critical that DID get its SPEAK stops counting as an unpaired-critical alert), then:
+        - live output task + running loop -> schedule an out-of-band TTSSpeakFrame injection.
+          Does NOT also call arbiter_policy.push_speak (that would double the utterance -- the
+          injected frame itself travels through the arbiter downstream).
+        - live output task but NO running loop (e.g. a sync test path) -> arbiter fallback.
+        - no live output task -> arbiter fallback (frame-driven, drained when a frame flows)."""
+        self.speak_ledger.register_speak_text(text, self.clock.now())
+        t = self._output_task
+        if t is not None and not t.has_finished():
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                self.arbiter_policy.push_speak(text)
+                return
+            asyncio.ensure_future(self.push_speak_frame(text))
+        else:
+            self.arbiter_policy.push_speak(text)
 
     async def monitor_forever(self) -> None:
         """R8: periodically drives speak_ledger.check()/store.liveness() so the Р-15г/Р-11
@@ -104,13 +159,18 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
 
     arbiter_policy = ArbiterPolicy()
 
+    # Holder for the late-bound host: on_speak is handed to KoraBridge/KoraRunner BEFORE the
+    # SynapseHost is constructed (below), so the closure can't capture `host` directly. It reads
+    # `_h["host"]` at call time instead -- filled in just before build_host returns, always well
+    # before any SPEAK actually fires at runtime. (A method on host would force splitting the
+    # constructor, which touches the slice-0 host-singleton wiring -- avoided.)
+    _h: dict = {}
+
     def on_speak(text: str) -> None:
-        # SPEAK path (Р-5/Р-15): Kora's ready text goes straight to the TTS queue, no LLM.
-        # Р-15г (Bug 2): also satisfy the ledger so a critical event that DID get its SPEAK
-        # stops counting as an unpaired-critical alert. register_critical itself is wired only
-        # in the console runner until the WebSocket Kora bridge lands.
-        arbiter_policy.push_speak(text)
-        speak_ledger.register_speak_text(text, clock.now())
+        # SPEAK path (Р-5/Р-15/Р-15г): host.speak() registers the ledger ALWAYS, then makes the
+        # text audible -- injecting a TTSSpeakFrame into the live per-connection output task when
+        # one is bound (M1 slice 2 proactive push), else the frame-driven arbiter fallback.
+        _h["host"].speak(text)
 
     # Build the real Kora producer before the bridge so submit/confirm-COMMITTED can launch it
     # and request_cancel can tear it down (M1 slice 1). Disabled → the old hollow behavior.
@@ -137,7 +197,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     breaker = CircuitBreaker(len(_tier_probe), cfg.rpm_mute_s, cfg.rpd_reset_hour_utc)
     cost_cap = CostCap(cfg.max_paid_calls_per_day)
 
-    return SynapseHost(
+    host = SynapseHost(
         clock=clock,
         cfg=cfg,
         journal=journal,
@@ -152,6 +212,8 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         cost_cap=cost_cap,
         kora_runner=kora_runner,
     )
+    _h["host"] = host  # fills the on_speak holder -- must precede any runtime SPEAK
+    return host
 
 
 class SynapseSession:
