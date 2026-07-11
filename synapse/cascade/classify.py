@@ -61,6 +61,11 @@ def _classify_google_429(body: dict[str, Any]) -> tuple[ErrorKind | None, float 
                 elif "PerMinute" in metric:
                     quota_kind = ErrorKind.RPM
     if quota_kind is None:
+        # RetryInfo present but no QuotaFailure to name the class: we still know the provider's
+        # own delay -- keep it and default the class to RPM rather than discarding a valid
+        # retryDelay via the header fallback (Bug 5).
+        if retry_after is not None:
+            return ErrorKind.RPM, retry_after
         return None, None
     return quota_kind, retry_after
 

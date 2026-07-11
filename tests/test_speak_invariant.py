@@ -33,3 +33,17 @@ def test_speak_registered_after_the_fact_still_suppresses_alert():
     ledger.register_critical(ev)
     ledger.register_speak("e1", ts=1.0)
     assert ledger.check(now=1000.0, window_s=5.0) == []
+
+
+import pytest
+
+def test_critical_without_speak_alerts_only_once():
+    ledger = SpeakLedger()
+    ev = KoraEvent(id="e1", type="task_completed", cls=EventClass.CRITICAL, payload={}, speak_text=None, ts=0.0)
+    ledger.register_critical(ev)
+    assert ledger.check(now=4.9, window_s=5.0) == []
+    alerts1 = ledger.check(now=5.0, window_s=5.0)
+    assert len(alerts1) == 1
+    assert alerts1[0][0] == "CRITICAL_WITHOUT_SPEAK"
+    alerts2 = ledger.check(now=10.0, window_s=5.0)
+    assert alerts2 == []

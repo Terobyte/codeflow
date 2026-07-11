@@ -175,9 +175,14 @@ class TaskStore:
         return self._task
 
     def set_task_status(self, status: TaskStatus) -> None:
-        if self._task is not None:
-            self._task.status = status
-            self._persist()
+        if self._task is None:
+            return
+        if self._task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            # Terminal statuses are set only by Kora events (apply_event); a later
+            # set_task_status (e.g. confirm-flow RUNNING) must not resurrect a finished task (Bug 6).
+            return
+        self._task.status = status
+        self._persist()
 
     def clear_task(self) -> None:
         """Drops the current task entirely — used when a staged (never-sent-to-Kora)
@@ -314,6 +319,7 @@ class TaskStore:
 class _PendingCritical:
     event: KoraEvent
     spoken: bool = False
+    alerted: bool = False
 
 
 class SpeakLedger:
@@ -337,8 +343,9 @@ class SpeakLedger:
     def check(self, now: float, window_s: float) -> list[tuple[str, dict[str, Any]]]:
         alerts: list[tuple[str, dict[str, Any]]] = []
         for event_id, entry in self._pending.items():
-            if entry.spoken:
+            if entry.spoken or entry.alerted:
                 continue
             if now - entry.event.ts >= window_s:
+                entry.alerted = True
                 alerts.append(("CRITICAL_WITHOUT_SPEAK", {"event_id": event_id, "type": entry.event.type}))
         return alerts

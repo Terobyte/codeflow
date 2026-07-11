@@ -67,3 +67,20 @@ def test_no_response_is_timeout():
 def test_5xx_is_error():
     assert classify_error(500)[0] == ErrorKind.ERROR
     assert classify_error(503)[0] == ErrorKind.ERROR
+
+
+import pytest
+
+def test_google_429_retry_info_only_without_quota_failure():
+    body = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "45s"}
+            ],
+        }
+    }
+    kind, retry_after = classify_error(429, body, {})
+    assert kind == ErrorKind.RPM
+    assert retry_after == 45.0

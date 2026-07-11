@@ -90,3 +90,20 @@ def test_request_cancel_only_affects_active_task():
     store.start_task("t1", "задача", TaskStatus.RUNNING, now=0.0)
     assert store.request_cancel() is True
     assert store.task.status == TaskStatus.CANCEL_REQUESTED
+
+
+import pytest
+
+def test_set_task_status_noop_on_terminal_statuses():
+    clock = FakeClock(0.0)
+    store = TaskStore(clock)
+    
+    # COMPLETED status
+    store.start_task("t1", "задача", TaskStatus.COMPLETED, now=0.0)
+    store.set_task_status(TaskStatus.RUNNING)
+    assert store.task.status == TaskStatus.COMPLETED
+
+    # FAILED status
+    store.start_task("t2", "задача", TaskStatus.FAILED, now=0.0)
+    store.set_task_status(TaskStatus.RUNNING)
+    assert store.task.status == TaskStatus.FAILED
