@@ -9,9 +9,11 @@ def test_import_app_module_without_pyaudio():
     # that needs pyaudio/portaudio) at module load time (S4) -- if it did, this import would
     # raise ImportError in any environment without pyaudio installed.
     module = importlib.import_module("synapse.pipeline.app")
-    assert hasattr(module, "build_pipeline")
+    assert hasattr(module, "build_host")
+    assert hasattr(module, "build_session_pipeline")
     assert hasattr(module, "run")
-    assert hasattr(module, "SynapseVoicePipeline")
+    assert hasattr(module, "SynapseHost")
+    assert hasattr(module, "SynapseSession")
 
 
 def test_build_tier_services_with_fake_env_keys_no_network():
@@ -71,7 +73,7 @@ def test_build_pipeline_wires_guard_hooks_around_switcher_and_guarded_aggregator
     from pipecat.services.fish.tts import FishAudioTTSService
 
     from synapse.config import SynapseConfig
-    from synapse.pipeline.app import build_pipeline
+    from synapse.pipeline.app import build_host, build_session_pipeline
     from synapse.pipeline.context_guard import GenerationStartHook
 
     cfg = SynapseConfig(
@@ -83,8 +85,9 @@ def test_build_pipeline_wires_guard_hooks_around_switcher_and_guarded_aggregator
         fish_reference_id="fake-fish-ref",
         journal_dir=str(tmp_path),
     )
-    voice_pipeline = build_pipeline(cfg)
-    procs = voice_pipeline.pipeline.processors
+    host = build_host(cfg)
+    session = build_session_pipeline(host)
+    procs = session.pipeline.processors
 
     switcher_idx = next(i for i, p in enumerate(procs) if isinstance(p, LLMSwitcher))
     pre_hook, post_hook = procs[switcher_idx - 1], procs[switcher_idx + 1]
@@ -108,8 +111,7 @@ from synapse.dispatcher.tools import KoraBridge
 
 def test_pipeline_cascade_events_not_wired_to_journal(tmp_path):
     from synapse.config import SynapseConfig
-    from synapse.pipeline.app import build_pipeline
-    from pipecat.pipeline.llm_switcher import LLMSwitcher
+    from synapse.pipeline.app import build_host, build_session_pipeline
 
     cfg = SynapseConfig(
         google_api_key="fake-google-key",
@@ -120,10 +122,9 @@ def test_pipeline_cascade_events_not_wired_to_journal(tmp_path):
         fish_reference_id="fake-fish-ref",
         journal_dir=str(tmp_path),
     )
-    voice_pipeline = build_pipeline(cfg)
-    procs = voice_pipeline.pipeline.processors
-    switcher = next(p for p in procs if isinstance(p, LLMSwitcher))
-    strategy = switcher.strategy
+    host = build_host(cfg)
+    session = build_session_pipeline(host)
+    strategy = session.llm_switcher.strategy
 
     # Check that handlers list is not empty
     assert len(strategy._event_handlers["on_retry"].handlers) > 0
@@ -132,7 +133,7 @@ def test_pipeline_cascade_events_not_wired_to_journal(tmp_path):
 
 def test_voice_pipeline_speak_ledger_gap(tmp_path, monkeypatch):
     from synapse.config import SynapseConfig
-    from synapse.pipeline.app import build_pipeline
+    from synapse.pipeline.app import build_host
 
     captured_bridge = []
     original_init = KoraBridge.__init__
@@ -150,14 +151,14 @@ def test_voice_pipeline_speak_ledger_gap(tmp_path, monkeypatch):
         fish_reference_id="fake-fish-ref",
         journal_dir=str(tmp_path),
     )
-    voice_pipeline = build_pipeline(cfg)
+    host = build_host(cfg)
     bridge = captured_bridge[0]
 
     from synapse.bridge.state import KoraEvent, EventClass
     critical_ev = KoraEvent(id="e1", type="task_completed", cls=EventClass.CRITICAL, payload={}, speak_text="ok", ts=0.0)
-    voice_pipeline.speak_ledger.register_critical(critical_ev)
+    host.speak_ledger.register_critical(critical_ev)
 
-    assert "e1" in voice_pipeline.speak_ledger._pending
+    assert "e1" in host.speak_ledger._pending
     bridge.on_speak("ok")
     # In the expected (fixed) code, this should register speak and mark it spoken
-    assert voice_pipeline.speak_ledger._pending["e1"].spoken is True
+    assert host.speak_ledger._pending["e1"].spoken is True

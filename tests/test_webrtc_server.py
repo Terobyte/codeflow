@@ -23,7 +23,7 @@ def test_web_app_exposes_offer_routes_and_client_mount():
 
     from starlette.routing import Mount
 
-    app = build_web_app(cfg=object())  # cfg only used per-connection inside run_session
+    app = build_web_app(host=object())  # host only used per-connection inside run_session
     method_paths = {
         (route.path, method)
         for route in app.routes

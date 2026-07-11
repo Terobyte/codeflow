@@ -88,7 +88,7 @@ class SynapseConfig:
 
     def validate_voice_keys(self) -> None:
         """Hard-fail with the full list of missing keys (R5) — called when assembling the
-        voice pipeline (synapse.pipeline.app.build_pipeline). The console/text path never
+        voice pipeline host (synapse.pipeline.app.build_host). The console/text path never
         calls this and works with no keys at all."""
         missing = [
             name
