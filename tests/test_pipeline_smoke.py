@@ -91,9 +91,13 @@ def test_build_pipeline_wires_guard_hooks_around_switcher_and_guarded_aggregator
     assert isinstance(pre_hook, GenerationStartHook) and pre_hook._direction == FrameDirection.DOWNSTREAM
     assert isinstance(post_hook, GenerationStartHook) and post_hook._direction == FrameDirection.UPSTREAM
 
-    assistant = procs[switcher_idx + 2]
+    assistant = next(p for p in procs if isinstance(p, LLMAssistantAggregator))
     assert isinstance(assistant, LLMAssistantAggregator)
     assert type(assistant) is not LLMAssistantAggregator  # guarded subclass, not the flat base
 
     tts = next(p for p in procs if isinstance(p, FishAudioTTSService))
     assert tts._settings.model == cfg.fish_tts_model
+
+    # Regression guard (no-audio bug): assistant_aggregator terminates TextFrame/LLMTextFrame/
+    # LLMFullResponse* -- upstream of tts it starves synthesis. Must stay downstream of tts.
+    assert procs.index(assistant) > procs.index(tts)

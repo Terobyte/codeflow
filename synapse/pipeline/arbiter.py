@@ -108,4 +108,12 @@ class TTSArbiterProcessor(FrameProcessor):
 
     async def _drain(self) -> None:
         for item in self._policy.drain_all():
-            await self.push_frame(TextFrame(text=item.text), FrameDirection.DOWNSTREAM)
+            if item.source == "speak":
+                # SPEAK is Kora's operational readback (Р-5/Р-15), never LLM-authored text --
+                # keep it out of the LLM context (append_to_context=False) so it can't leak into
+                # a later generation now that assistant_aggregator sits downstream of tts.
+                await self.push_frame(
+                    TTSSpeakFrame(text=item.text, append_to_context=False), FrameDirection.DOWNSTREAM
+                )
+            else:
+                await self.push_frame(TextFrame(text=item.text), FrameDirection.DOWNSTREAM)

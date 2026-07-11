@@ -1,4 +1,8 @@
-from synapse.pipeline.arbiter import ArbiterPolicy
+import pytest
+from pipecat.frames.frames import TextFrame, TTSSpeakFrame
+from pipecat.processors.frame_processor import FrameDirection
+
+from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
 
 
 def fixed_splitter(text):
@@ -65,3 +69,28 @@ def test_drain_all_empties_the_queue():
     a.drain_all()
     assert len(a) == 0
     assert a.pop_next() is None
+
+
+@pytest.mark.asyncio
+async def test_drain_pushes_speak_as_tts_speak_frame_out_of_context_and_dispatcher_as_plain_text():
+    # No-audio-fix follow-up (Critic C, plan v2 item 3): assistant_aggregator now sits
+    # downstream of tts, so a plain TextFrame for SPEAK would leak Kora's operational readback
+    # into LLM context. _drain must push SPEAK as TTSSpeakFrame(append_to_context=False) and
+    # leave dispatcher text as plain TextFrame.
+    proc = TTSArbiterProcessor(ArbiterPolicy())
+    captured = []
+
+    async def fake_push_frame(frame, direction=FrameDirection.DOWNSTREAM):
+        captured.append((frame, direction))
+
+    proc.push_frame = fake_push_frame
+
+    proc._policy.push_dispatcher_text("Привет.")
+    proc._policy.push_speak("Подтверждаю.")
+    await proc._drain()
+
+    assert len(captured) == 2
+    dispatcher_frame, _ = captured[0]
+    speak_frame, _ = captured[1]
+    assert isinstance(dispatcher_frame, TextFrame) and not isinstance(dispatcher_frame, TTSSpeakFrame)
+    assert isinstance(speak_frame, TTSSpeakFrame) and speak_frame.append_to_context is False

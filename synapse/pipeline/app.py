@@ -131,6 +131,14 @@ def build_pipeline(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseVoi
         settings=FishAudioTTSService.Settings(model=cfg.fish_tts_model, voice=cfg.fish_reference_id),
     )
 
+    # assistant_aggregator MUST sit AFTER tts, not before it: LLMAssistantAggregator.process_frame
+    # terminates TextFrame/LLMTextFrame/LLMFullResponse* (it consumes them to build context and
+    # does NOT push them onward), so placed upstream of TTS it swallows the LLM's spoken text
+    # before arbiter/tts ever see it -> run_tts never fires -> silence. pipecat still forwards
+    # what the aggregator needs from downstream of TTS: TTSTextFrame (a TextFrame subclass) via
+    # push_text_frames (default True) rebuilds context from the spoken words, and
+    # LLMFullResponseEndFrame (also forwarded by default) still fires the commit/tool-loop
+    # re-inference trigger. This is pipecat's own canonical order (ref E6/E7 in run file).
     pipeline = Pipeline(
         [
             stt,
@@ -138,9 +146,9 @@ def build_pipeline(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseVoi
             pre_hook,
             llm_switcher,
             post_hook,
-            assistant_aggregator,
             arbiter,
             tts,
+            assistant_aggregator,
         ]
     )
 
