@@ -188,29 +188,23 @@ def build_pipeline(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseVoi
     )
 
 
-async def run() -> None:
-    """`python -m synapse.pipeline.app` — the only place LocalAudioTransport is imported
-    (S4)."""
+def run() -> None:
+    """`python -m synapse.pipeline.app` — boots the WebRTC demo server. The agent is now served
+    over pipecat SmallWebRTCTransport (see synapse.pipeline.webrtc_server), so the browser's own
+    WebRTC stack does acoustic echo cancellation and the old LocalAudioTransport (raw PortAudio,
+    no AEC, echo-loop) is gone. uvicorn/webrtc deps are lazy-imported here (S4) so importing this
+    module stays free of the `voice` extra."""
+    import uvicorn
     from dotenv import load_dotenv
-    from pipecat.pipeline.runner import PipelineRunner
-    from pipecat.pipeline.task import PipelineTask
-    from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+
+    from synapse.pipeline.webrtc_server import build_web_app
 
     load_dotenv()
     cfg = SynapseConfig.from_env()
-    voice_pipeline = build_pipeline(cfg)
-
-    transport = LocalAudioTransport(LocalAudioTransportParams(audio_in_enabled=True, audio_out_enabled=True))
-    full_pipeline = Pipeline([transport.input(), voice_pipeline.pipeline, transport.output()])
-    task = PipelineTask(full_pipeline)
-
-    monitor = asyncio.ensure_future(voice_pipeline.monitor_forever())
-    try:
-        runner = PipelineRunner()
-        await runner.run(task)
-    finally:
-        monitor.cancel()
+    cfg.validate_voice_keys()
+    app = build_web_app(cfg)
+    uvicorn.run(app, host="localhost", port=7860)
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    run()

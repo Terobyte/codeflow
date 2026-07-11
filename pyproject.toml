@@ -17,7 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
 record = ["sounddevice", "soundfile"]
-voice = ["pipecat-ai[local]"]
+voice = ["aiortc>=1.14", "opencv-python-headless>=5", "fastapi", "uvicorn", "pipecat-ai-prebuilt>=1.0.3"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
