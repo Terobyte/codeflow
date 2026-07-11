@@ -35,8 +35,9 @@ Or pipe your own scenario via stdin — each line is a JSON object:
 ```bash
 .venv/bin/pip install -e ".[voice]"
 brew install portaudio   # macOS — LocalAudioTransport needs pyaudio/portaudio
-cp .env.example .env     # fill in GOOGLE_API_KEY / OPENROUTER_API_KEY / ANTHROPIC_API_KEY /
-                          # DEEPGRAM_API_KEY / FISH_AUDIO_API_KEY / FISH_REFERENCE_ID
+cp .env.example .env     # fill in OPENROUTER_API_KEY / ANTHROPIC_API_KEY / DEEPGRAM_API_KEY /
+                          # FISH_AUDIO_API_KEY / FISH_REFERENCE_ID (GOOGLE_API_KEY optional,
+                          # not required for the cascade)
 .venv/bin/python -m synapse.pipeline.app
 ```
 

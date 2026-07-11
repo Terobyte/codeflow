@@ -12,10 +12,8 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class SynapseConfig:
     # Cascade tiers (Р-14).
-    tier1_model: str = "gemini-3.5-flash"
-    tier1_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    tier2_model: str = "google/gemini-3.5-flash"
-    tier3_model: str = "claude-haiku-4-5"
+    tier1_model: str = "google/gemini-3.5-flash"  # OpenRouter primary
+    tier2_model: str = "claude-haiku-4-5"  # Anthropic fallback
 
     google_api_key: str | None = None
     openrouter_api_key: str | None = None
@@ -95,7 +93,6 @@ class SynapseConfig:
         missing = [
             name
             for name, val in (
-                ("GOOGLE_API_KEY", self.google_api_key),
                 ("OPENROUTER_API_KEY", self.openrouter_api_key),
                 ("ANTHROPIC_API_KEY", self.anthropic_api_key),
                 ("DEEPGRAM_API_KEY", self.deepgram_api_key),

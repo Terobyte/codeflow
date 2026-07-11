@@ -24,10 +24,10 @@ def test_build_tier_services_with_fake_env_keys_no_network():
         anthropic_api_key="fake-anthropic-key",
     )
     services, labels = build_tier_services(cfg)
-    assert len(services) == 3
-    assert len(labels) == 3
-    assert [label.endpoint for label in labels] == ["google-ai-studio", "openrouter", "anthropic"]
-    assert [label.paid for label in labels] == [False, True, True]
+    assert len(services) == 2
+    assert len(labels) == 2
+    assert [label.endpoint for label in labels] == ["openrouter", "anthropic"]
+    assert [label.paid for label in labels] == [True, True]
 
 
 def test_build_tier_services_sets_request_timeout_on_every_client_no_network():
@@ -57,7 +57,7 @@ def test_validate_voice_keys_hard_fails_with_missing_key_list():
         cfg.validate_voice_keys()
         assert False, "expected RuntimeError for missing keys"
     except RuntimeError as e:
-        assert "GOOGLE_API_KEY" in str(e)
+        assert "OPENROUTER_API_KEY" in str(e)
         assert "FISH_REFERENCE_ID" in str(e)
 
 
