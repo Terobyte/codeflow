@@ -86,7 +86,11 @@ def build_pipeline(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseVoi
 
     def on_speak(text: str) -> None:
         # SPEAK path (Р-5/Р-15): Kora's ready text goes straight to the TTS queue, no LLM.
+        # Р-15г (Bug 2): also satisfy the ledger so a critical event that DID get its SPEAK
+        # stops counting as an unpaired-critical alert. register_critical itself is wired only
+        # in the console runner until the WebSocket Kora bridge lands.
         arbiter_policy.push_speak(text)
+        speak_ledger.register_speak_text(text, clock.now())
 
     bridge = KoraBridge(store=store, confirm_flow=confirm_flow, clock=clock, on_speak=on_speak, cfg=cfg)
     handlers = ToolHandlers(bridge, journal)
@@ -98,6 +102,26 @@ def build_pipeline(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseVoi
     strategy_type = build_strategy_type(breaker, labels, cost_cap, generation_guard, clock)
     llm_switcher = LLMSwitcher(services, strategy_type=strategy_type)
     register_all(llm_switcher, handlers)
+
+    # Cascade observability (Bug 3): the strategy exposes on_retry/on_tail_tier/on_all_failed
+    # so this module owns the journal wiring without strategy.py depending on the journal.
+    strategy = llm_switcher.strategy
+
+    @strategy.event_handler("on_retry")
+    async def _journal_retry(_strategy, next_idx):
+        if journal.current is not None:
+            journal.current.retry = True
+
+    @strategy.event_handler("on_tail_tier")
+    async def _journal_tail_tier(_strategy):
+        journal.alert(AlertKind.TAIL_TIER_ENTRY)
+
+    @strategy.event_handler("on_all_failed")
+    async def _journal_all_failed(_strategy, reason=None):
+        journal.alert(
+            AlertKind.COST_CAP if reason == "cost_cap" else AlertKind.ALL_TIERS_FAILED,
+            {"reason": reason},
+        )
 
     stt = DeepgramFluxSTTService(api_key=cfg.deepgram_api_key or "", model="flux-general-multi")
 

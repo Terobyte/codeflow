@@ -101,3 +101,63 @@ def test_build_pipeline_wires_guard_hooks_around_switcher_and_guarded_aggregator
     # Regression guard (no-audio bug): assistant_aggregator terminates TextFrame/LLMTextFrame/
     # LLMFullResponse* -- upstream of tts it starves synthesis. Must stay downstream of tts.
     assert procs.index(assistant) > procs.index(tts)
+
+
+import pytest
+from synapse.dispatcher.tools import KoraBridge
+
+def test_pipeline_cascade_events_not_wired_to_journal(tmp_path):
+    from synapse.config import SynapseConfig
+    from synapse.pipeline.app import build_pipeline
+    from pipecat.pipeline.llm_switcher import LLMSwitcher
+
+    cfg = SynapseConfig(
+        google_api_key="fake-google-key",
+        openrouter_api_key="fake-openrouter-key",
+        anthropic_api_key="fake-anthropic-key",
+        deepgram_api_key="fake-deepgram-key",
+        fish_audio_api_key="fake-fish-key",
+        fish_reference_id="fake-fish-ref",
+        journal_dir=str(tmp_path),
+    )
+    voice_pipeline = build_pipeline(cfg)
+    procs = voice_pipeline.pipeline.processors
+    switcher = next(p for p in procs if isinstance(p, LLMSwitcher))
+    strategy = switcher.strategy
+
+    # Check that handlers list is not empty
+    assert len(strategy._event_handlers["on_retry"].handlers) > 0
+    assert len(strategy._event_handlers["on_all_failed"].handlers) > 0
+
+
+def test_voice_pipeline_speak_ledger_gap(tmp_path, monkeypatch):
+    from synapse.config import SynapseConfig
+    from synapse.pipeline.app import build_pipeline
+
+    captured_bridge = []
+    original_init = KoraBridge.__init__
+    def mock_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        captured_bridge.append(self)
+    monkeypatch.setattr(KoraBridge, "__init__", mock_init)
+
+    cfg = SynapseConfig(
+        google_api_key="fake-google-key",
+        openrouter_api_key="fake-openrouter-key",
+        anthropic_api_key="fake-anthropic-key",
+        deepgram_api_key="fake-deepgram-key",
+        fish_audio_api_key="fake-fish-key",
+        fish_reference_id="fake-fish-ref",
+        journal_dir=str(tmp_path),
+    )
+    voice_pipeline = build_pipeline(cfg)
+    bridge = captured_bridge[0]
+
+    from synapse.bridge.state import KoraEvent, EventClass
+    critical_ev = KoraEvent(id="e1", type="task_completed", cls=EventClass.CRITICAL, payload={}, speak_text="ok", ts=0.0)
+    voice_pipeline.speak_ledger.register_critical(critical_ev)
+
+    assert "e1" in voice_pipeline.speak_ledger._pending
+    bridge.on_speak("ok")
+    # In the expected (fixed) code, this should register speak and mark it spoken
+    assert voice_pipeline.speak_ledger._pending["e1"].spoken is True

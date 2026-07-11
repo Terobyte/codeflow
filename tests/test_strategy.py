@@ -95,3 +95,64 @@ def test_control_pre_fix_would_have_blinded_classify_error_to_rpm_fallback():
     kind, retry_after = classify_error(429, pre_fix_body, {})
     assert kind == ErrorKind.RPM
     assert retry_after is None
+
+
+import asyncio
+
+import pytest
+from pipecat.processors.frame_processor import FrameProcessor
+from synapse.cascade.breaker import CircuitBreaker
+from synapse.cascade.services import CostCap, TierLabel
+from synapse.cascade.strategy import SynapseFailoverStrategy
+from synapse.clock import FakeClock
+from synapse.pipeline.context_guard import GenerationGuard
+from synapse.journal import AlertKind
+from pipecat.frames.frames import ErrorFrame
+
+class MockService(FrameProcessor):
+    def __init__(self, name="mock_service"):
+        super().__init__(name=name)  # FrameProcessor.name is a read-only property; set via ctor
+
+@pytest.mark.asyncio
+async def test_strategy_tail_tier_event_naming():
+    clock = FakeClock(0.0)
+    service1 = MockService("svc1")
+    service2 = MockService("svc2")
+    services = [service1, service2]
+    
+    breaker = CircuitBreaker(tier_count=2, rpm_mute_s=60.0, rpd_reset_hour_utc=8)
+    labels = [
+        TierLabel(endpoint="openrouter", model="m1", paid=True),
+        TierLabel(endpoint="anthropic", model="m2", paid=True),
+    ]
+    cost_cap = CostCap(max_paid_calls_per_day=3)
+    generation_guard = GenerationGuard()
+    
+    strategy = SynapseFailoverStrategy(
+        services,
+        breaker=breaker,
+        labels=labels,
+        cost_cap=cost_cap,
+        generation_guard=generation_guard,
+        clock=clock
+    )
+    
+    events_called = []
+    
+    try:
+        @strategy.event_handler("on_tail_tier")
+        async def _on_tail_tier(strat):
+            events_called.append("on_tail_tier")
+    except ValueError:
+        # If registering on_tail_tier raises ValueError (because it's not a registered event on the strategy)
+        # then the test should fail as expected.
+        pass
+        
+    exc_429 = FakeHTTPException(429, {}, {"Retry-After": "10"})
+    error_frame = ErrorFrame(error="429 from svc1", exception=exc_429, processor=service1)
+    
+    await strategy.handle_error(error_frame)
+    # pipecat dispatches event handlers as fire-and-forget tasks (is_sync=False), so the
+    # on_tail_tier side effect lands on the next loop tick -- yield once before asserting.
+    await asyncio.sleep(0)
+    assert "on_tail_tier" in events_called

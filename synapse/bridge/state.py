@@ -340,6 +340,14 @@ class SpeakLedger:
         if entry is not None:
             entry.spoken = True
 
+    def register_speak_text(self, text: str, ts: float) -> None:
+        """Mark every pending critical whose SPEAK text matches as spoken. The console runner
+        registers by event_id; the voice path only has Kora's ready text at on_speak time, so
+        match on speak_text (M0: register_critical wiring itself awaits the WebSocket Kora bridge)."""
+        for entry in self._pending.values():
+            if not entry.spoken and entry.event.speak_text == text:
+                entry.spoken = True
+
     def check(self, now: float, window_s: float) -> list[tuple[str, dict[str, Any]]]:
         alerts: list[tuple[str, dict[str, Any]]] = []
         for event_id, entry in self._pending.items():

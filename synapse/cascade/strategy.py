@@ -9,7 +9,7 @@ to `LLMSwitcher(llms, strategy_type=...)`.
 Selection is breaker-aware `first_available()`, not pipecat's default "just next" (Р-14);
 classify + mute the failing tier; mark the in-flight generation aborted BEFORE switching
 (S1, via GenerationGuard — covers both orders of the ErrorFrame/LLMFullResponseEndFrame
-race); CostCap gates every paid-tier attempt (R9); on_retry/on_tier3/on_all_failed are
+race); CostCap gates every paid-tier attempt (R9); on_retry/on_tail_tier/on_all_failed are
 exposed as pipecat event handlers so app.py can wire journal + arbiter without this module
 depending on either.
 """
@@ -49,7 +49,7 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
         self._generation_guard = generation_guard
         self._clock = clock
         self._register_event_handler("on_retry")
-        self._register_event_handler("on_tier3")
+        self._register_event_handler("on_tail_tier")
         self._register_event_handler("on_all_failed")
 
     def active_tier_index(self) -> int | None:
@@ -91,7 +91,7 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
         await self._call_event_handler("on_retry", next_idx)
         if next_idx == len(self._services) - 1:
             # Tail tier (Haiku, Р-14): alert only, never spoken — not an error for the ear.
-            await self._call_event_handler("on_tier3")
+            await self._call_event_handler("on_tail_tier")
         if self._cost_cap.tripped:
             for idx, label in enumerate(self._labels):
                 if label.paid:
