@@ -8,6 +8,7 @@ its turn must not erase the alert.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from synapse.clock import Clock
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from synapse.bridge.state import KoraEvent
@@ -100,7 +103,13 @@ class TurnJournal:
         }
         if self._current is not None:
             self._current.alerts.append(row)
-        self._write(row)
+        # B39: alert() is called from cascade event handlers, confirm, and the monitor — a raising
+        # os.fsync (disk full / fd closed) must NOT propagate into that machinery. Best-effort:
+        # persist if we can, log if we can't. The in-record copy above survives regardless.
+        try:
+            self._write(row)
+        except OSError as exc:
+            logger.warning("journal alert write failed (best-effort, alert not persisted): %r", exc)
 
     def check_grounding(self, record: TurnRecord, has_active_task: bool) -> None:
         if not has_active_task:

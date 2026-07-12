@@ -116,6 +116,17 @@ Deferred: B13-cluster→W3 (voice turn-lifecycle wiring); B15/B35/B36→W4 (arbi
 
 ---
 
+## Wave 3 — DONE (2026-07-12). FIXED red→green: **B13(partial), B21, B39, B36** (4 bugs, +4 tests, suite 189→193).
+Test: `tests/test_bughunt_w3.py`.
+- **B13** — voice STT `on_end_of_turn` now calls `journal.begin_turn` + `handlers.begin_turn` → the R1 dedup latch is ARMED in voice (no more double-execute of mutating tools on a cascade retry) + tool audit records. REMAINING (carry): closing the turn with `check_grounding`/`end_turn` (capturing assistant text + turn-end in the frame flow) needs live-mic verification — B13-grounding→carry.
+- **B21** — gate deny detail is category-only (`secret_path`/`outside_workspace`), no absolute path handed to the injectable agent via `permissionDecisionReason`.
+- **B39** — `journal.alert()` is best-effort (OSError from fsync logged, not propagated) — all bare-alert callsites (cascade handlers, confirm) now safe.
+- **B36** — arbiter SPEAK queue is FIFO among equal-priority speaks (older critical readback no longer delayed behind a newer one).
+- **B24** — CARRIED (needs a setup-window-exception red test; not landed untested).
+Deferred to W4/W5: B15/B35 (arbiter drain / context scrub), B31/B12/B40/B41/B24, B13-grounding.
+
+---
+
 ## Wave 1 — DONE (2026-07-12). FIXED red→green: **B1, B2, B3, B4, B5, B6, B8, B9, B14** (9 bugs, +9 regression tests, suite 173→182). B7 REJECTED by-design. B11 known-residual (no-exfil backstop).
 Tests: `tests/test_bughunt_w1_state.py` (B1/B3/B14), `test_bughunt_w1_app_config.py` (B2/B4/B6/B9), `test_bughunt_w1_dispatch_webrtc.py` (B5/B8).
 Carried to later waves: B10, B12, B13, B15, B16, B17-B29.

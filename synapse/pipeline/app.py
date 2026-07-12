@@ -289,6 +289,14 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
 
     @stt.event_handler("on_end_of_turn")
     async def _on_end_of_turn(service, transcript: str) -> None:
+        # B13: the voice path must OPEN a journal turn like the console path does — otherwise
+        # `handlers._current_turn_id` stays None and the R1 dedup latch is DEAD in voice (an
+        # intra-turn cascade retry re-executes a mutating tool, incl. a destructive confirm_task),
+        # and `record_tool_call` no-ops so the tool audit is empty. (Closing the turn with
+        # check_grounding/end_turn — capturing the assistant text + turn end in the frame flow —
+        # is the remaining grounding-wiring work, needs live-mic verification.)
+        record = host.journal.begin_turn(transcript)
+        host.handlers.begin_turn(record.turn_id)
         # R3: every user turn must reach confirm_flow.note_user_turn() before the LLM runs.
         host.confirm_flow.note_user_turn(transcript, host.clock.now())
 

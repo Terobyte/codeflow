@@ -395,13 +395,14 @@ class KoraRunner:
             return False, "path resolution failed", "path_error"
         # Secret containment runs on the FULL resolved path, BEFORE the in-workspace allow, so a
         # secret living inside the workspace (workspace/.env, workspace/.ssh/id_rsa) is still
-        # denied. Log the full resolved path (matches the gate's existing full-path logging);
-        # the secret VALUE is never read → never logged.
+        # denied. B21: the deny detail is category-only — it becomes the agent-facing
+        # `permissionDecisionReason`, and a prompt-injectable Кора must not be handed the resolved
+        # absolute path (home dir / username / secret-file layout disclosure oracle).
         if _is_secret_path(resolved):
-            return False, f"secret_path: {resolved}", "secret_path"
+            return False, "secret_path", "secret_path"
         if resolved.is_relative_to(ws_resolved):
             return True, str(resolved), "allow"
-        return False, f"outside_workspace: {resolved}", "outside_workspace"
+        return False, "outside_workspace", "outside_workspace"
 
     async def _pretool_hook(self, input_data: dict[str, Any], tool_use_id: Any, context: Any) -> dict[str, Any]:
         # The ONE gate (slice-4 repair): a PreToolUse hook fires for EVERY tool Кора invokes,

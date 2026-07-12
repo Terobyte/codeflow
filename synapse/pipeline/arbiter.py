@@ -67,13 +67,17 @@ class ArbiterPolicy:
             self._queue.append(QueueItem(source="dispatcher", text=sentence))
 
     def push_speak(self, text: str) -> None:
+        new = QueueItem(source="speak", text=text)
+        # B36: SPEAK jumps ahead of the dispatcher TAIL (survivor = the sentence already playing
+        # is kept), but multiple pending SPEAKs stay FIFO among themselves — the older critical
+        # readback must not be delayed behind a newer one.
         if self._queue and self._queue[0].source == "dispatcher":
             survivor = self._queue[0]
-            rest = [item for item in self._queue[1:] if item.source != "dispatcher"]
-            self._queue = [survivor, QueueItem(source="speak", text=text)] + rest
+            rest_speaks = [item for item in self._queue[1:] if item.source != "dispatcher"]
+            self._queue = [survivor] + rest_speaks + [new]
         else:
-            kept = [item for item in self._queue if item.source != "dispatcher"]
-            self._queue = [QueueItem(source="speak", text=text)] + kept
+            kept_speaks = [item for item in self._queue if item.source != "dispatcher"]
+            self._queue = kept_speaks + [new]
 
     def flush_dispatcher(self) -> None:
         self._queue = [item for item in self._queue if item.source != "dispatcher"]
