@@ -37,6 +37,12 @@ def classify_error(
         return ErrorKind.RPM, _retry_after_header(headers)
     if status >= 500:
         return ErrorKind.ERROR, None
+    # B33: a non-rate-limit 4xx (400/404/413 — malformed/oversized request, e.g. context-window
+    # exceeded) is a deterministic client error, not a tier-health signal. Muting the tier 60s
+    # would blind a healthy tier (and failover to a tier that returns the same 4xx), so classify
+    # it CLIENT: the breaker won't mute it and the strategy fails the turn instead of looping.
+    if 400 <= status < 500:
+        return ErrorKind.CLIENT, None
     return ErrorKind.ERROR, None
 
 

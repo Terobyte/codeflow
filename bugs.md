@@ -80,6 +80,42 @@ Prior hunt archived: `bugs-archive-2026-07-11.md`.
 
 ---
 
+---
+
+# Wave 2 hunt (2026-07-12) — cascade/money, arbiter, journal-wiring, persistence
+
+## CRIT
+- **B30** `services.py:80`/`breaker.py:48`/`strategy.py:95-98` — CostCap/breaker **never reset** (`reset()`/`reset_tier()` have zero non-test callers). One cap trip `hard_mute`s all paid tiers → every future turn `_fail_all` «связь с мозгом потеряна» **permanently** until process restart. Named `_per_day` but is per-process-lifetime. FIX-W2.
+- **B31** `strategy.py:82`/`service_switcher.py:60` — `record_paid_attempt` fires ONLY in `_advance` (failover), never for the PRIMARY tier0 call → cost cap under-counts the majority of spend; a runaway loop on a *working* tier0 has zero cost protection. carry (fix needs a primary-call hook).
+- **B13-cluster** (CONFIRMED, worse than described) `app.py:288` STT `on_end_of_turn` calls only `note_user_turn` — voice NEVER calls `journal.begin_turn`/`handlers.begin_turn`/`end_turn`/`check_grounding`. Consequences in the PRODUCTION voice path: (a) STATUS_WITHOUT_GROUNDING gate vacuous (§8 крит.5 protects nothing); (b) `record_tool_call` no-ops → empty tool audit; (c) **R1 dedup latch DEAD (`_current_turn_id` stays None) → a cascade retry can DOUBLE-EXECUTE a mutating tool incl. destructive `confirm_task`**; (d) zero turn records on disk; (e) `on_retry` journal no-op. ONE root cause (no begin_turn in voice). FIX-W3 (focused wiring wave).
+
+## MAJOR
+- **B32** `breaker.py:39,56`/`classify.py:37` — `Retry-After: 0` (or negative) → `mute_until==now` → tier not muted → `first_available` returns the just-failed tier → failover-to-self livelock on the dead tier, draining the cap. FIX-W2 (floor the mute).
+- **B33** `classify.py:38-40`/`breaker.py:38-39` — every non-429/401/403 4xx (400/404/413, e.g. context-window-exceeded) → `ERROR` → mutes healthy tiers 60s → both tiers muted → «связь потеряна» on a benign deterministic bad request. FIX-W2 (don't mute the tier on a non-rate-limit client error).
+- **B15** (CONFIRMED REAL, live bound-output path) `arbiter.py:86-88,104-113` — eager `_drain()` after every frame empties the queue, so an injected `TTSSpeakFrame` always hits an empty queue → survivor/drop-tail dead, `flush_dispatcher` never called live → Р-5 SPEAK-preemption defeated (SPEAK lands behind already-flushed dispatcher sentences). carry-W4.
+- **B18** (CONFIRMED, HIGH) `state.py:344-354` — `_load` catches only `(JSONDecodeError, OSError)`; a valid-JSON-non-dict (`null`/`[]`) → `AttributeError`, an old-schema task/event → `KeyError`/`ValueError` → all UNCAUGHT → `build_host` crashes on EVERY boot until the file is deleted. FIX-W2.
+- **B37** `confirm.py:127-129` — `_Staged(**persisted)` → `TypeError` on staged-schema drift → second `build_host` crash vector on the same restart. FIX-W2 (with B18).
+- **B38** `kora.py:493` — `answers = {q["question"]: ...}` hard subscript (vs `.get` at :449) → `KeyError` on a malformed/hallucinated AskUserQuestion missing `"question"` → task FAILED AFTER the user's answer was consumed and discarded (slice-3 parking-lot path, now proven). FIX-W2.
+- **B35** `context_guard.py:71-93`/`strategy.py:66` — `mark_aborted` scrubs already-COMMITTED tool messages if a non-fatal ErrorFrame lands in the window between `record_committed(N)` and the tool-loop's `start_generation(N+1)` → orphaned `tool_result`/missing `tool_use` → context corruption / provider 400. PLAUSIBLE, narrow. carry-W4.
+
+## MINOR / MED
+- **B36** `arbiter.py:69-76` — multiple pending SPEAKs prepend newest-first (LIFO) → older critical readback delayed behind newer. carry.
+- **B39** `app.py:277,281`/`confirm.py:182` — `journal.alert()` called BARE (fsync can raise) in cascade `on_tail_tier`/`on_all_failed` + confirm self-attempt, unlike the B2-guarded monitor → an fsync failure there propagates into pipecat machinery. carry.
+- **B40** `tools.py:173,216`/`journal.py:112` — dispatcher journal logs full user `text` (submit/answer_kora) + full `llm_output` in cleartext, contradicting kora.py's keys-only privacy posture → a spoken secret lands fsync'd. carry.
+- **B41** `classify.py:76-79` — HTTP-date-form `Retry-After` → `float()` ValueError → silently degrades to 60s default (ignores provider's real window). carry (MINOR).
+
+## Verdicts on carried leads
+- **B23** (strategy `_advance` returns None): NOT A BUG — unreachable defensive code (`_advance` always passes a service in `self.services`; `_set_active_if_available` returns None only for a non-member). No fix.
+- **B17** (CANCEL_REQUESTED never terminalizes): REAL but BENIGN/by-design — `has_active_task()` excludes CANCEL_REQUESTED so the slot is free and reclaimed on next submit; only cosmetic status/liveness residue. WON'T-FIX v1.
+- **B12** (liveness decorative, no stale alert): REAL. carry-W5.
+
+## Wave 2 — DONE (2026-07-12). FIXED red→green: **B18, B37, B38, B32, B33, B30** (6 bugs, +7 regression tests, suite 182→189).
+Tests: `tests/test_bughunt_w2_persistence.py` (B18/B37/B38), `test_bughunt_w2_cascade.py` (B32/B33/B30).
+Key fix notes: B30 = `CostCap.maybe_reset(now)` daily recovery + DROPPED the permanent `hard_mute`-on-cost-cap in strategy (that was the brick). B33 = new `ErrorKind.CLIENT` (breaker never mutes it, strategy fails the turn). Verdicts: B23 not-a-bug, B17 won't-fix (benign).
+Deferred: B13-cluster→W3 (voice turn-lifecycle wiring); B15/B35/B36→W4 (arbiter/context frame-ordering); B31/B12/B39/B40/B41→W5.
+
+---
+
 ## Wave 1 — DONE (2026-07-12). FIXED red→green: **B1, B2, B3, B4, B5, B6, B8, B9, B14** (9 bugs, +9 regression tests, suite 173→182). B7 REJECTED by-design. B11 known-residual (no-exfil backstop).
 Tests: `tests/test_bughunt_w1_state.py` (B1/B3/B14), `test_bughunt_w1_app_config.py` (B2/B4/B6/B9), `test_bughunt_w1_dispatch_webrtc.py` (B5/B8).
 Carried to later waves: B10, B12, B13, B15, B16, B17-B29.

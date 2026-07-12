@@ -348,10 +348,22 @@ class TaskStore:
             data = json.loads(self._state_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return
-        task_data = data.get("task")
-        self._task = _task_from_dict(task_data) if task_data else None
-        self._last_event_ts = data.get("last_event_ts")
-        self._staged = data.get("staged")
+        # B18: a corrupt or old-schema state.json must NOT crash boot — persisted state is a
+        # best-effort restart aid (R6), not a hard dependency. A non-dict payload, a missing/renamed
+        # field, or a bad enum value → treat as "no persisted state" instead of propagating a
+        # crash out of TaskStore.__init__ → build_host on every boot until the file is deleted.
+        if not isinstance(data, dict):
+            return
+        try:
+            task_data = data.get("task")
+            self._task = _task_from_dict(task_data) if isinstance(task_data, dict) else None
+            self._last_event_ts = data.get("last_event_ts")
+            staged = data.get("staged")
+            self._staged = staged if isinstance(staged, dict) else None
+        except (KeyError, ValueError, TypeError):
+            self._task = None
+            self._last_event_ts = None
+            self._staged = None
 
 
 @dataclass

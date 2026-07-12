@@ -19,6 +19,9 @@ class ErrorKind(str, Enum):
     TIMEOUT = "TIMEOUT"
     ERROR = "ERROR"
     AUTH = "AUTH"
+    # B33: a non-rate-limit client error (400/404/413 — bad/oversized request, not a tier-health
+    # signal). It must NOT mute an otherwise-healthy tier; the strategy fails the turn instead.
+    CLIENT = "CLIENT"
 
 
 class CircuitBreaker:
@@ -30,13 +33,19 @@ class CircuitBreaker:
         self._hard_muted: set[int] = set()
 
     def mute(self, tier_idx: int, kind: ErrorKind, now: float, retry_after_s: float | None = None) -> None:
+        if kind == ErrorKind.CLIENT:
+            return  # B33: a client-side bad request is not a tier-health signal — never mute.
         if kind == ErrorKind.AUTH:
             self.hard_mute(tier_idx)
             return
         if kind == ErrorKind.RPD:
             until = self._next_rpd_reset(now)
         else:  # RPM, TIMEOUT, ERROR
-            until = now + (retry_after_s if retry_after_s is not None else self._rpm_mute_s)
+            # B32: a Retry-After of 0 (or negative) would set mute_until == now → the tier is
+            # immediately re-selectable → a failover-to-self livelock on the dead tier that drains
+            # the cost cap. Floor a non-positive retry-after to the default window.
+            effective = retry_after_s if (retry_after_s is not None and retry_after_s > 0) else self._rpm_mute_s
+            until = now + effective
         current = self._muted_until.get(tier_idx)
         if current is None or until > current:
             self._muted_until[tier_idx] = until

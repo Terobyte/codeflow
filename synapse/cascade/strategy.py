@@ -22,7 +22,7 @@ from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
 from pipecat.pipeline.service_switcher import ServiceSwitcherStrategyFailover
 from pipecat.processors.frame_processor import FrameProcessor
 
-from synapse.cascade.breaker import CircuitBreaker
+from synapse.cascade.breaker import CircuitBreaker, ErrorKind
 from synapse.cascade.classify import classify_error
 from synapse.cascade.services import CostCap, TierLabel
 from synapse.clock import Clock
@@ -59,6 +59,9 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
 
     async def handle_error(self, error: ErrorFrame) -> FrameProcessor | None:
         now = self._clock.now()
+        # B30: recover a "per day" cost cap when the reset hour has rolled over — the failover
+        # path is one of the two drivers (the other is monitor_forever) of the daily un-trip.
+        self._cost_cap.maybe_reset(now)
         current_idx = self.active_tier_index()
 
         # S1: mark the in-flight generation aborted BEFORE switching tiers, covering both
@@ -67,6 +70,11 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
 
         status, body, headers = _extract_http_info(getattr(error, "exception", None))
         kind, retry_after = classify_error(status, body, headers)
+        # B33: a deterministic client error (400/404/413) fails the turn — muting a healthy tier
+        # or looping the same bad request across tiers helps nobody.
+        if kind == ErrorKind.CLIENT:
+            await self._fail_all()
+            return None
         if current_idx is not None:
             self._breaker.mute(current_idx, kind, now, retry_after)
 
@@ -79,7 +87,7 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
             return None
 
         if self._labels[next_idx].paid:
-            allowed = self._cost_cap.record_paid_attempt()
+            allowed = self._cost_cap.record_paid_attempt(now)
             if not allowed:
                 await self._fail_all("cost_cap")
                 return None
@@ -92,10 +100,10 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
         if next_idx == len(self._services) - 1:
             # Tail tier (Haiku, Р-14): alert only, never spoken — not an error for the ear.
             await self._call_event_handler("on_tail_tier")
-        if self._cost_cap.tripped:
-            for idx, label in enumerate(self._labels):
-                if label.paid:
-                    self._breaker.hard_mute(idx)
+        # B30: NO hard_mute-on-cost-cap here. The `record_paid_attempt` gate above already blocks
+        # paid failover once tripped; permanently hard-muting the tiers is what bricked the whole
+        # cascade forever (hard_mute clears only via a manual reset_tier nobody calls). Recovery
+        # is now the cost cap's own daily maybe_reset (monitor + failover path).
         return result
 
     async def _fail_all(self, reason: str | None = None) -> None:

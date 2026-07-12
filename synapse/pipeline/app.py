@@ -157,6 +157,8 @@ class SynapseHost:
                 for kind, detail in self.speak_ledger.check(now, self.cfg.critical_speak_window_s):
                     self.journal.alert(AlertKind(kind), detail)
                 self.store.liveness(now, self.cfg.stale_after_s, self.cfg.unreachable_after_s)
+                # B30: drive the cost cap's daily recovery even when idle (no failover turns).
+                self.cost_cap.maybe_reset(now)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -219,7 +221,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # discarded immediately after counting.
     _tier_probe, _ = build_tier_services(cfg)
     breaker = CircuitBreaker(len(_tier_probe), cfg.rpm_mute_s, cfg.rpd_reset_hour_utc)
-    cost_cap = CostCap(cfg.max_paid_calls_per_day)
+    cost_cap = CostCap(cfg.max_paid_calls_per_day, cfg.rpd_reset_hour_utc)
 
     host = SynapseHost(
         clock=clock,

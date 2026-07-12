@@ -490,7 +490,14 @@ class KoraRunner:
                 self._store.clear_awaiting()
         # Verbatim (§2.9): the user's reply goes UNTOUCHED into every question key, label or
         # free-form alike (§2b — the CLI does not validate it against the options).
-        answers = {q["question"]: answer_text for q in questions}
+        # B38: a malformed/hallucinated AskUserQuestion may omit "question" — skip such entries
+        # (use .get, like _build_question_prompt) instead of KeyError-ing AFTER the user already
+        # answered, which would fail the task and discard the reply.
+        answers = {
+            q["question"]: answer_text
+            for q in questions
+            if isinstance(q, dict) and q.get("question")
+        }
         self._journal.record_kora_event(
             KoraEvent(
                 id=f"kora-answer-{int(self._clock.now() * 1000)}",

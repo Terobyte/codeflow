@@ -126,7 +126,13 @@ class ConfirmFlow:
         self._staged: _Staged | None = None
         persisted = store.staged
         if persisted:
-            self._staged = _Staged(**persisted)
+            # B37: a staged blob written by a different schema version must be DROPPED, not crash
+            # boot — `_Staged(**persisted)` TypeErrors on an unexpected/missing key. Best-effort
+            # restore, same contract as the store's own B18 persistence hardening.
+            try:
+                self._staged = _Staged(**persisted)
+            except (TypeError, ValueError):
+                self._staged = None
 
     @property
     def staged(self) -> _Staged | None:

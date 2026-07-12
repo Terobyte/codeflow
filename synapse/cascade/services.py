@@ -51,10 +51,12 @@ def build_tier_services(cfg: SynapseConfig) -> tuple[list, list[TierLabel]]:
 
 
 class CostCap:
-    def __init__(self, max_paid_calls_per_day: int | None) -> None:
+    def __init__(self, max_paid_calls_per_day: int | None, rpd_reset_hour_utc: int = 0) -> None:
         self._max = max_paid_calls_per_day
+        self._reset_hour = rpd_reset_hour_utc
         self._count = 0
         self._tripped = False
+        self._reset_day: int | None = None  # the day-bucket the current count belongs to
 
     @property
     def tripped(self) -> bool:
@@ -64,10 +66,32 @@ class CostCap:
     def count(self) -> int:
         return self._count
 
-    def record_paid_attempt(self) -> bool:
+    def _day_bucket(self, now: float) -> int:
+        # Number of whole days since epoch, with the boundary shifted to rpd_reset_hour_utc so it
+        # matches the breaker's RPD reset semantics.
+        return int((now - self._reset_hour * 3600) // 86400)
+
+    def maybe_reset(self, now: float) -> bool:
+        """B30: a "per day" cap must recover when the reset hour rolls over — otherwise one trip
+        hard-blocks the cascade for the whole process lifetime. Establishes the day on first call;
+        resets count+trip when the day-bucket advances. Returns True iff it reset."""
+        bucket = self._day_bucket(now)
+        if self._reset_day is None:
+            self._reset_day = bucket
+            return False
+        if bucket > self._reset_day:
+            self._count = 0
+            self._tripped = False
+            self._reset_day = bucket
+            return True
+        return False
+
+    def record_paid_attempt(self, now: float | None = None) -> bool:
         """Call once per paid-tier attempt. Returns True if this attempt may proceed, False
         if the cap was already tripped before this call (so the overshoot is bounded to the
-        single attempt that trips it)."""
+        single attempt that trips it). Pass `now` so a day rollover un-trips the cap first."""
+        if now is not None:
+            self.maybe_reset(now)
         if self._max is None:
             return True
         if self._tripped:
