@@ -71,6 +71,7 @@ class TurnJournal:
         self._file = self._path.open("a", encoding="utf-8")
         self._current: TurnRecord | None = None
         self._turn_counter = 0
+        self._closed = False
 
     @property
     def path(self) -> Path:
@@ -150,10 +151,16 @@ class TurnJournal:
         self._current = None
 
     def _write(self, row: dict[str, Any], fsync: bool = True) -> None:
+        if self._closed:
+            # B28: the journal is a host singleton; monitor/KoraRunner tasks are not part of the
+            # ASGI lifecycle and may fire a late write after shutdown ran close(). A closed journal
+            # is a silent no-op, not a ValueError bubbling out of record_tool_call/alert.
+            return
         self._file.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         self._file.flush()
         if fsync:
             os.fsync(self._file.fileno())
 
     def close(self) -> None:
+        self._closed = True
         self._file.close()

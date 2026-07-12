@@ -145,3 +145,19 @@ Test: `tests/test_bughunt_w4.py`.
 ## Wave 1 — DONE (2026-07-12). FIXED red→green: **B1, B2, B3, B4, B5, B6, B8, B9, B14** (9 bugs, +9 regression tests, suite 173→182). B7 REJECTED by-design. B11 known-residual (no-exfil backstop).
 Tests: `tests/test_bughunt_w1_state.py` (B1/B3/B14), `test_bughunt_w1_app_config.py` (B2/B4/B6/B9), `test_bughunt_w1_dispatch_webrtc.py` (B5/B8).
 Carried to later waves: B10, B12, B13, B15, B16, B17-B29.
+
+---
+
+## Wave 5 — DONE (2026-07-12). FIXED red→green: **B10, B19, B20, B22, B25, B26, B27, B28, B29** (9 bugs, +34 tests, suite 196→230). Tero L-run (3 критика: 2 BLOCKER пойманы до кода), judge SHIP ×3 прогона + 4 независимые пробы.
+Test: `tests/test_bughunt_w5.py` (+ санкционированная дельта `FakeRequest.body()` в w1-тесте).
+Key fix notes:
+- **B10** — `_MAX_TOOL_PASSES=5` bounded-цикл вместо жёстких 2 пассов; dedup-латч совместим (ключ name+turn_id+args). Бag был спящим: MockLLM структурно не чейнит.
+- **B19** — liveness-shortcut awaiting гейтится `(task is None or RUNNING)` — cancel-окно закрыто, замороженный no-task тест жив.
+- **B20** — hoist ТОЛЬКО `register_critical` (тихий дроп CRITICAL слепил Р-15г-вотчдог); SPEAK остался структурно lifecycle-only = NO-EXFIL сохранён; + тест-инвариант на всю таблицу `_message_to_events`.
+- **B22** — денилист += `*.env`-ветка (prod.env), `secrets.{yaml,yml,json,toml}`, `token(s).txt`, `apikey/api_key.txt`, `service-account.json`, `.pgpass`, `{settings.local,local.settings}.json`, суффиксы `.keystore`/`.jks`; негативы (`secrets.py`, `id_rsa.pub`, `.env.example`) не задеты. Симлинк/`..`-обход проверен: не работает (resolve() до проверок).
+- **B25** — /start: пустое тело = легитимный bare-handshake (200), непустой мусор = 400; catch `(JSONDecodeError, UnicodeDecodeError, RecursionError)` — последние два были живыми 500 (40КБ `[[[…` / `\x80`-байты); non-dict JSON = 400 (был AttributeError→500).
+- **B26** — `KORA_ENABLED=""` = unset → дефолт (конвенция `_num`).
+- **B27** — affirm/deny = subset-матч (чистая реплика), «да, скачай отчёт» больше не глотается confirm'ом.
+- **B28** — `TurnJournal._closed`-гвард в `_write` (поздние записи фоновых тасок = no-op, не ValueError) + ленивый shutdown-хук в `build_web_app` (через `app.router.add_event_handler` — Starlette 1.3.1 убрал app-уровневый алиас).
+- **B29** — `monitor.cancel()` + await с consume CancelledError.
+Остаток после волны 5 (все — design-tension / инфра, автономно НЕ закрываемы): **B15** (arbiter drain vs SPEAK-preemption — продукт+акустика), **B35** (GenerationGuard scrub — латентный, трогать вслепую рискованнее), **B13-grounding** (закрытие голосового хода — live-mic), **B31** (primary tier0 вне cost-cap — нужен pipecat-хук), **B16** (auth сигналинга — слайс 5, закрывается Tailscale-границей), **B40** won't-fix. Новое в parking lot рана: history-шейп loop.py (role:tool без assistant-анонса — чинить ДО подключения реального LLM к диспетчеру), size-cap /start, TOCTOU гейта (вне threat model v1).

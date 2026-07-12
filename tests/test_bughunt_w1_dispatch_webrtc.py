@@ -136,6 +136,9 @@ async def test_b8_bare_start_does_not_leak_active_sessions():
         async def json(self):
             return {}
 
+        async def body(self) -> bytes:
+            return b""
+
     n = 1000
     for _ in range(n):
         await start_bot(FakeRequest())  # bare /start, never followed by an offer

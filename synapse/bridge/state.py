@@ -244,7 +244,10 @@ class TaskStore:
         # E5 (MAJOR-R1): while parked on a user answer, Kora is ALIVE — blocked on the human, not
         # dead. Report OK FIRST so a long human wait never trips a false STALE/UNREACHABLE (which
         # would make the dispatcher say «нет сигнала» on the happy path).
-        if self._awaiting_answer:
+        # B19: gated on the task actually RUNNING (mirrors render_state/snapshot) — after
+        # request_cancel flips status, a stale _awaiting_answer flag must not keep reporting OK.
+        # No-task+awaiting stays OK (transient set_awaiting window, see test_answer_kora §4).
+        if self._awaiting_answer and (self._task is None or self._task.status == TaskStatus.RUNNING):
             return Liveness.OK
         if self._last_event_ts is None:
             return Liveness.OK

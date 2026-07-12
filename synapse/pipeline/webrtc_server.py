@@ -11,10 +11,11 @@ app.py top (S4).
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -43,6 +44,18 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     per-connection `SynapseSession` (`run_session`) wired to `host`, and preempts whichever
     session was previously active (DoD-2: exactly one live client)."""
     app = FastAPI()
+
+    # B28: the journal fd lives as long as the host; close it when uvicorn shuts down (the
+    # only live-path close — console.py closes its own). Looked up lazily inside the handler:
+    # unit tests build this app around stub hosts with no real journal, and must not trip at
+    # build time. Late writes after close are silent no-ops (B28 guard in TurnJournal._write).
+    # Registered on app.router: Starlette 1.x removed the app-level add_event_handler alias;
+    # FastAPI keeps the identical API on APIRouter, run by its default lifespan at shutdown.
+    async def _close_journal() -> None:
+        host.journal.close()
+
+    app.router.add_event_handler("shutdown", _close_journal)
+
     handler = SmallWebRTCRequestHandler()
     # Р-6: the prebuilt RTVI client (pipecat-ai-prebuilt 1.0.3) uses the "start bot, then connect"
     # handshake -- it POSTs /start FIRST to open a session, THEN sends the SDP offer to
@@ -96,6 +109,12 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         finally:
             if monitor is not None:
                 monitor.cancel()
+                # B29: consume the cancellation — a cancelled-but-never-awaited task leaks a
+                # pending exception ("Task was destroyed but it is pending" on teardown).
+                try:
+                    await monitor
+                except asyncio.CancelledError:
+                    pass
             async with lock:
                 if current["task"] is task:
                     current["task"] = None
@@ -117,9 +136,20 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def start_bot(request: Request):
         # RTVI connect handshake: open a session, hand the browser its ICE config, and (via the
         # returned sessionId) tell it which /sessions/<id>/api/offer to POST the SDP offer to next.
-        try:
-            data = await request.json()
-        except Exception:
+        # B25: distinguish an EMPTY body (bare /start is a legitimate handshake — the RTVI
+        # prebuilt client always POSTs a flat JSON object, but curl/manual flows may not) from a
+        # MALFORMED one: garbage must be a diagnosable 400, not a silent empty handshake.
+        # json.loads raises more than JSONDecodeError on hostile input (UnicodeDecodeError on bad
+        # bytes, RecursionError on deep nesting) — catch exactly that set; endpoint is unauthenticated.
+        raw = await request.body()
+        if raw:
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+                return JSONResponse({"error": "malformed JSON body"}, status_code=400)
+            if not isinstance(data, dict):
+                return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+        else:
             data = {}
         session_id = str(uuid.uuid4())
         active_sessions[session_id] = data.get("body", {})

@@ -103,8 +103,11 @@ class SynapseConfig:
         if e.get("FISH_TTS_MODEL"):
             kwargs["fish_tts_model"] = e["FISH_TTS_MODEL"]
         # Same "override only when explicitly set" rule for the non-None Kora defaults.
-        if "KORA_ENABLED" in e:
-            kwargs["kora_enabled"] = e["KORA_ENABLED"].strip().lower() not in ("false", "0", "no", "")
+        # B26: empty value = unset -> keep the dataclass default (same "override only when
+        # explicitly set" rule as FISH_TTS_MODEL/_num above), never an active False.
+        raw_enabled = e.get("KORA_ENABLED", "").strip().lower()
+        if raw_enabled:
+            kwargs["kora_enabled"] = raw_enabled not in ("false", "0", "no")
         if e.get("KORA_MODEL"):
             kwargs["kora_model"] = e["KORA_MODEL"]
         # B4: a malformed numeric env var must fall back to the dataclass default, never crash

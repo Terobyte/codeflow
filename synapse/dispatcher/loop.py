@@ -28,6 +28,13 @@ class LLMClient(Protocol):
         ...
 
 
+# B10: tool passes per user turn are BOUNDED. The old shape was strictly two passes and
+# silently dropped any tool_calls the second completion returned; a chaining LLM
+# (get_task_status -> request_cancel) lost the follow-up. Loop until the model stops
+# calling tools, capped so a pathological LLM can't spin forever (industry default 5-20).
+_MAX_TOOL_PASSES = 5
+
+
 class DispatcherTurnLoop:
     def __init__(
         self,
@@ -63,15 +70,18 @@ class DispatcherTurnLoop:
 
         text, tool_calls = await self._complete()
         record.llm_output = text
-
-        if tool_calls:
+        passes = 0
+        # Р-2: a tool turn needs at least one more completion with the tool results in context —
+        # that call produces the text the dispatcher actually says. B10: keep going while the
+        # model keeps chaining tools, bounded by _MAX_TOOL_PASSES; on cap exhaustion the tail
+        # tool_calls are dropped (same behavior the old 2-pass shape had on pass 2).
+        while tool_calls and passes < _MAX_TOOL_PASSES:
             for call in tool_calls:
                 await self._dispatch_tool(call)
-            # Р-2: status-turn (and any tool turn) is two passes — one more call with the
-            # tool results in context, to get the text the dispatcher actually says.
-            text, _ = await self._complete()
+            text, tool_calls = await self._complete()
             if text:
                 record.llm_output = text
+            passes += 1
 
         if text:
             self._history.append({"role": "assistant", "content": text})

@@ -67,20 +67,28 @@ _SAFE_META_TOOLS = frozenset({"ToolSearch", "TodoWrite"})
 # case-INSENSITIVE (Read(".ENV") opens .env bytes while resolve() preserves the typed case),
 # so every comparison below is CASEFOLDED. The secret VALUE is never read → never logged.
 _SECRET_DIR_SEGMENTS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".git"})
+# B22: exact-name matches accept rare false positives (a fixture literally named token.txt goes
+# dark) — deny-only precedent set by "credentials".
 _SECRET_FILE_NAMES = frozenset(
-    {"credentials", "credentials.json", ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".dockercfg", ".htpasswd", ".envrc"}
+    {
+        "credentials", "credentials.json", ".netrc", ".git-credentials", ".npmrc", ".pypirc",
+        ".dockercfg", ".htpasswd", ".envrc",
+        "secrets.yaml", "secrets.yml", "secrets.json", "secrets.toml", "token.txt", "tokens.txt",
+        "apikey.txt", "api_key.txt", "service-account.json", ".pgpass", "settings.local.json",
+        "local.settings.json",
+    }
 )
 _SECRET_FILE_STEMS = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk"})
-_SECRET_FILE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")  # str.endswith accepts a tuple
+_SECRET_FILE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks")  # str.endswith accepts a tuple
 # Commit-safe templates that share the `.env.` prefix but carry no secret value.
 _ENV_TEMPLATE_SUFFIXES = frozenset({".example", ".sample", ".template", ".dist", ".md"})
 
 
 def _is_secret_path(p: Path) -> bool:
     """True when the resolved path names a secret file OR sits under a secret dir segment.
-    ALL comparisons are casefolded (BLOCKER-1: case-insensitive APFS). `.env` and any
-    `.env.<x>` are secret EXCEPT commit-safe templates (`.env.example`/`.sample`/…); plain
-    `environment.py`/`prevent.py`/`env.py` never match (exact `.env` / `.env.`-prefix only)."""
+    ALL comparisons are casefolded (BLOCKER-1: case-insensitive APFS). `.env`, any
+    `.env.<x>` except commit-safe templates, and any `*.env`; plain `environment.py`/`env.py`
+    still never match."""
     if {seg.casefold() for seg in p.parts} & _SECRET_DIR_SEGMENTS:
         return True
     name = p.name.casefold()
@@ -88,6 +96,10 @@ def _is_secret_path(p: Path) -> bool:
         return True
     if name.startswith(".env."):
         return name[4:] not in _ENV_TEMPLATE_SUFFIXES
+    if name.endswith(".env"):
+        # B22: prod.env / dev.env — any *.env basename is an env file; .env.example-style
+        # templates don't end with ".env" so the exemption above is untouched.
+        return True
     if name in _SECRET_FILE_NAMES:
         return True
     if name in _SECRET_FILE_STEMS:
@@ -201,19 +213,29 @@ def apply_event_to_store(
     lifecycle — a lifecycle event via `store.apply_event` (which appends to task.events + sets
     the terminal status), everything else via `store.heartbeat` (liveness only, no append). This
     keeps the dispatcher's [СОСТОЯНИЕ]/snapshot from rendering all N of Kora's internal tool
-    calls, which would blow up lean context and cost O(N²) re-serialization."""
+    calls, which would blow up lean context and cost O(N²) re-serialization.
+
+    Speak dispatch deliberately diverges from FakeKora.emit: lifecycle-only (NO-EXFIL backstop),
+    while critical registration mirrors it for ALL events."""
     journal.record_kora_event(event)
     if event.type in _LIFECYCLE_TYPES:
         store.apply_event(event)
-        # Never fires this slice (nothing is critical), but the pairing is a Р-15г safety clone.
-        if event.cls == EventClass.CRITICAL:
-            speak_ledger.register_critical(event)
+        # NO-EXFIL (slice 4): speak stays STRUCTURALLY lifecycle-only — a non-lifecycle event's
+        # speak_text must never reach TTS even if a future producer sets one (workspace content
+        # is injectable; completion-SPEAK is templated from task_text, never from Kora output).
         if event.speak_text:
             if on_speak is not None:
                 on_speak(event.speak_text)
             speak_ledger.register_speak(event.id, event.ts)
     else:
         store.heartbeat(event.ts)
+    # B20: critical registration is hoisted OUT of the lifecycle gate. A CRITICAL event that
+    # only heartbeats the store must still arm the ledger — otherwise the Р-15г
+    # CRITICAL_WITHOUT_SPEAK watchdog is blind to it (silent drop). Speak being structurally
+    # lifecycle-only, a non-lifecycle CRITICAL now trips that alert LOUDLY instead of vanishing.
+    # Deliberate, documented divergence from FakeKora.emit (see class docstring).
+    if event.cls == EventClass.CRITICAL:
+        speak_ledger.register_critical(event)
 
 
 class KoraRunner:

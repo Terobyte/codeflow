@@ -39,9 +39,12 @@ class MockLLM:
         text = last.get("content", "") or ""
         words = _words(text)
 
-        if words & _DENY_WORDS:
+        # B27: confirm/deny only when the WHOLE utterance is confirmation words — «да, скачай отчёт»
+        # must route to submit, not swallow the task as a confirm. Status/cancel/submit stay on
+        # intersection: they carry payload words by nature.
+        if words and words <= _DENY_WORDS:
             return "", [ToolCall("confirm_task", {"decision": "deny"})]
-        if words & _AFFIRM_WORDS:
+        if words and words <= _AFFIRM_WORDS:
             return "", [ToolCall("confirm_task", {"decision": "confirm"})]
         if words & _STATUS_WORDS:
             return "", [ToolCall("get_task_status", {})]
