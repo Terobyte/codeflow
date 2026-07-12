@@ -1,10 +1,12 @@
 """M1 slice 3 (E5) — answer_kora: Кора переспрашивает уточнение mid-task.
 
 The whole E5 loop runs with NO network / NO SDK CLI: the interactive gate branch
-(`KoraRunner._handle_question`) is driven by calling `_gate("AskUserQuestion", ...)` directly
-and resolving the parked future via `provide_answer` — exactly the shape slice-1's live probe
-proved (§2b). `PermissionResultAllow`/`FunctionSchema` touch the installed packages for the
-dataclasses only, never a subprocess/API.
+(`KoraRunner._handle_question`) is driven by calling the PreToolUse hook
+`_pretool_hook({"tool_name": "AskUserQuestion", "tool_input": ...}, None, None)` directly and
+resolving the parked future via `provide_answer` — exactly the shape slice-1's live probe proved
+(§2b). Slice-4 re-homed the gate from `can_use_tool` (which never fired for read-only tools)
+onto the PreToolUse hook, so AskUserQuestion now returns a hook dict whose
+`hookSpecificOutput.updatedInput.answers` carries the verbatim reply. No subprocess/API.
 """
 from __future__ import annotations
 
@@ -73,6 +75,12 @@ def _one_question(q="Какой формат?", labels=("JSON", "HTML")):
     return {"questions": [{"question": q, "header": "формат", "options": [{"label": x} for x in labels], "multiSelect": False}]}
 
 
+def _ask(runner, tool_input):
+    # slice-4: AskUserQuestion flows through the PreToolUse hook (not can_use_tool). Returns the
+    # coroutine so callers await it or wrap it in a task, exactly as they did with `_gate`.
+    return runner._pretool_hook({"tool_name": "AskUserQuestion", "tool_input": tool_input}, None, None)
+
+
 # =========================================================================================
 # 1. Gate interactive branch — parks the stream, speaks the question, resolves verbatim
 # =========================================================================================
@@ -82,7 +90,7 @@ async def test_gate_question_speaks_sets_awaiting_blocks_then_resolves_verbatim(
     runner, store, journal, ws, speaks = make_runner(tmp_path)
     store.start_task("tk", "создай файл", TaskStatus.RUNNING, 0.0)
 
-    gate = asyncio.create_task(runner._gate("AskUserQuestion", _one_question(), None))
+    gate = asyncio.create_task(_ask(runner, _one_question()))
     await asyncio.sleep(0)  # let _handle_question run up to `await fut`
 
     # spoken prompt carries the question text + labels + the free-form invitation (on_speak ONLY).
@@ -100,9 +108,10 @@ async def test_gate_question_speaks_sets_awaiting_blocks_then_resolves_verbatim(
     assert store.awaiting_answer is False  # R5: cleared SYNCHRONOUSLY, before set_result
 
     result = await gate
-    assert result.behavior == "allow"
-    assert result.updated_input["answers"]["Какой формат?"] == "простой текст"
-    assert result.updated_input["questions"] == _one_question()["questions"]
+    hso = result["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "allow"
+    assert hso["updatedInput"]["answers"]["Какой формат?"] == "простой текст"
+    assert hso["updatedInput"]["questions"] == _one_question()["questions"]
     assert runner._pending_answer is None  # finally nulled the slot
 
 
@@ -110,7 +119,7 @@ async def test_question_journaled_keys_only_no_text(tmp_path):
     runner, store, journal, ws, speaks = make_runner(tmp_path)
     store.start_task("tk", "t", TaskStatus.RUNNING, 0.0)
 
-    gate = asyncio.create_task(runner._gate("AskUserQuestion", _one_question(q="СЕКРЕТНЫЙ-ВОПРОС"), None))
+    gate = asyncio.create_task(_ask(runner, _one_question(q="СЕКРЕТНЫЙ-ВОПРОС")))
     await asyncio.sleep(0)
     runner.provide_answer("ответ")
     await gate
@@ -133,12 +142,12 @@ async def test_answer_applied_to_all_question_keys(tmp_path):
         ]
     }
 
-    gate = asyncio.create_task(runner._gate("AskUserQuestion", tool_input, None))
+    gate = asyncio.create_task(_ask(runner, tool_input))
     await asyncio.sleep(0)
     runner.provide_answer("один ответ")
     result = await gate
 
-    assert result.updated_input["answers"] == {"q1": "один ответ", "q2": "один ответ"}
+    assert result["hookSpecificOutput"]["updatedInput"]["answers"] == {"q1": "один ответ", "q2": "один ответ"}
 
 
 # =========================================================================================
@@ -150,7 +159,7 @@ async def test_cancel_of_parked_question_clears_own_flag(tmp_path):
     runner, store, journal, ws, speaks = make_runner(tmp_path)
     store.start_task("tk", "t", TaskStatus.RUNNING, 0.0)
 
-    gate = asyncio.create_task(runner._gate("AskUserQuestion", _one_question(), None))
+    gate = asyncio.create_task(_ask(runner, _one_question()))
     await asyncio.sleep(0)
     assert store.awaiting_answer is True
 
@@ -166,12 +175,12 @@ async def test_superseded_run_finally_does_not_clobber_successor(tmp_path):
     runner, store, journal, ws, speaks = make_runner(tmp_path)
     store.start_task("tk", "t", TaskStatus.RUNNING, 0.0)
 
-    first = asyncio.create_task(runner._gate("AskUserQuestion", _one_question(q="q1"), None))
+    first = asyncio.create_task(_ask(runner, _one_question(q="q1")))
     await asyncio.sleep(0)
     fut1 = runner._pending_answer
 
     # a successor run parks its own question, overwriting the slot (the superseding-run scenario).
-    second = asyncio.create_task(runner._gate("AskUserQuestion", _one_question(q="q2"), None))
+    second = asyncio.create_task(_ask(runner, _one_question(q="q2")))
     await asyncio.sleep(0)
     fut2 = runner._pending_answer
     assert fut1 is not fut2
@@ -186,7 +195,7 @@ async def test_superseded_run_finally_does_not_clobber_successor(tmp_path):
 
     assert runner.provide_answer("ответ на q2") is True
     result = await second
-    assert result.updated_input["answers"]["q2"] == "ответ на q2"
+    assert result["hookSpecificOutput"]["updatedInput"]["answers"]["q2"] == "ответ на q2"
     assert store.awaiting_answer is False
 
 
@@ -204,13 +213,13 @@ def test_provide_answer_no_pending_returns_false(tmp_path):
 async def test_provide_answer_idempotent_second_call_false(tmp_path):
     runner, store, journal, ws, speaks = make_runner(tmp_path)
     store.start_task("tk", "t", TaskStatus.RUNNING, 0.0)
-    gate = asyncio.create_task(runner._gate("AskUserQuestion", _one_question(), None))
+    gate = asyncio.create_task(_ask(runner, _one_question()))
     await asyncio.sleep(0)
 
     assert runner.provide_answer("первый") is True
     assert runner.provide_answer("второй") is False  # already resolved
     result = await gate
-    assert result.updated_input["answers"]["Какой формат?"] == "первый"
+    assert result["hookSpecificOutput"]["updatedInput"]["answers"]["Какой формат?"] == "первый"
 
 
 # =========================================================================================

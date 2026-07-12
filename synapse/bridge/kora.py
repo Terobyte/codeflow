@@ -53,6 +53,50 @@ _PATH_KEY = {
 # workspace); a mutating tool with no path is fail-closed (Deny) — never let it default out.
 _READ_SEARCH_TOOLS = frozenset({"Glob", "Grep", "LS"})
 
+# Non-file tools that reach the network / a shell — named only for the gate's deny CATEGORY
+# (they are already denied by the _PATH_KEY miss; naming does not change the outcome).
+_EGRESS_TOOLS = frozenset({"Bash", "WebFetch", "WebSearch"})
+
+# Non-file meta tools Кора legitimately needs (ToolSearch to load tools, TodoWrite to plan) —
+# allowed explicitly BEFORE the egress/non_file fail-closed deny. Everything else non-file stays
+# denied (Bash/WebFetch/WebSearch/Task/Skill/unknown): Кора edits files, no shell/net this slice.
+_SAFE_META_TOOLS = frozenset({"ToolSearch", "TodoWrite"})
+
+# Slice-4 secret containment (§2.8, BLOCKER-1): a secret INSIDE the workspace is still a
+# secret — deny it for every file tool BEFORE the in-workspace allow. macOS APFS is
+# case-INSENSITIVE (Read(".ENV") opens .env bytes while resolve() preserves the typed case),
+# so every comparison below is CASEFOLDED. The secret VALUE is never read → never logged.
+_SECRET_DIR_SEGMENTS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".git"})
+_SECRET_FILE_NAMES = frozenset(
+    {"credentials", "credentials.json", ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".dockercfg", ".htpasswd", ".envrc"}
+)
+_SECRET_FILE_STEMS = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk"})
+_SECRET_FILE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")  # str.endswith accepts a tuple
+# Commit-safe templates that share the `.env.` prefix but carry no secret value.
+_ENV_TEMPLATE_SUFFIXES = frozenset({".example", ".sample", ".template", ".dist", ".md"})
+
+
+def _is_secret_path(p: Path) -> bool:
+    """True when the resolved path names a secret file OR sits under a secret dir segment.
+    ALL comparisons are casefolded (BLOCKER-1: case-insensitive APFS). `.env` and any
+    `.env.<x>` are secret EXCEPT commit-safe templates (`.env.example`/`.sample`/…); plain
+    `environment.py`/`prevent.py`/`env.py` never match (exact `.env` / `.env.`-prefix only)."""
+    if {seg.casefold() for seg in p.parts} & _SECRET_DIR_SEGMENTS:
+        return True
+    name = p.name.casefold()
+    if name == ".env":
+        return True
+    if name.startswith(".env."):
+        return name[4:] not in _ENV_TEMPLATE_SUFFIXES
+    if name in _SECRET_FILE_NAMES:
+        return True
+    if name in _SECRET_FILE_STEMS:
+        return True
+    if name.endswith(_SECRET_FILE_SUFFIXES):
+        return True
+    return False
+
+
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 
@@ -293,11 +337,15 @@ class KoraRunner:
 
     def _build_options(self, task_id: str, text: str) -> Any:
         """Builds ClaudeAgentOptions with the slice-1 security posture (§2c/§2d): cwd=workspace,
-        permission_mode='default', allowed_tools=[] (a tool in allowed_tools SHADOWS
-        can_use_tool — proven by CanUseToolShadowedWarning), setting_sources=[] (user/project
-        settings also shadow the gate), can_use_tool=self._gate as the authoritative boundary.
-        SDK import is lazy so the module loads without the package."""
+        permission_mode='default', allowed_tools=[] (a tool in allowed_tools SHADOWS the gate —
+        proven by CanUseToolShadowedWarning), setting_sources=[] (user/project settings also
+        shadow the gate). The authoritative boundary is a PreToolUse HOOK, not can_use_tool
+        (slice-4 repair): can_use_tool is a PERMISSION-PROMPT callback that fires ONLY for
+        permission-requiring tools — Read/Glob/Bash bypassed it and a secret leaked — whereas a
+        PreToolUse hook fires for EVERY tool, so the gate runs on all of them. SDK import is lazy
+        so the module loads without the package."""
         from claude_agent_sdk import ClaudeAgentOptions
+        from claude_agent_sdk.types import HookMatcher
 
         workspace = self._workspace()
         workspace.mkdir(parents=True, exist_ok=True)
@@ -307,7 +355,7 @@ class KoraRunner:
             allowed_tools=[],
             disallowed_tools=[],
             setting_sources=[],
-            can_use_tool=self._gate,
+            hooks={"PreToolUse": [HookMatcher(hooks=[self._pretool_hook], timeout=None)]},
             model=self._cfg.kora_model,
             cli_path=self._cfg.kora_cli_path,
             max_turns=self._cfg.kora_max_turns,
@@ -315,19 +363,27 @@ class KoraRunner:
             system_prompt=self._system_prompt(workspace, text),
         )
 
-    def _gate_decision(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str | None]:
-        """Pure fail-closed containment decision (RISK-M6). Returns (allowed, detail). A
-        non-file tool is denied outright; a mutating file tool with no/blank path is denied; a
-        path is allowed only when its resolved form is inside the workspace via
-        Path.resolve().is_relative_to (NOT startswith — that would leak the sibling /ws-evil)."""
+    def _gate_decision(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str | None, str]:
+        """Pure fail-closed containment decision (RISK-M6, slice-4 hardened). Returns
+        (allowed, detail, category) — an EXPLICIT category, never string-parsed by the caller.
+        A non-file tool is denied (egress/non_file_tool); a mutating file tool with no/blank
+        path is denied (missing_path); a resolved secret path is denied for ALL file tools even
+        inside the workspace (secret_path, checked BEFORE the in-workspace allow); a path is
+        allowed only when its resolved form is inside the workspace via
+        Path.resolve().is_relative_to (NOT startswith — that would leak the sibling /ws-evil),
+        else outside_workspace. Categories: allow/secret_path/outside_workspace/missing_path/
+        egress/non_file_tool/path_error."""
         key = _PATH_KEY.get(tool_name)
         if key is None:
-            return False, f"tool {tool_name} not permitted (slice 1)"
+            if tool_name in _SAFE_META_TOOLS:
+                return True, None, "allow_meta"
+            cat = "egress" if tool_name in _EGRESS_TOOLS else "non_file_tool"
+            return False, f"{cat}: {tool_name}", cat
         raw = (tool_input or {}).get(key)
         if not isinstance(raw, str) or not raw.strip():
             if tool_name in _READ_SEARCH_TOOLS:
-                return True, None  # defaults to cwd, which is inside the workspace
-            return False, f"{tool_name}: missing/blank {key}"
+                return True, None, "allow"  # defaults to cwd, which is inside the workspace
+            return False, f"missing_path: {tool_name}", "missing_path"
         workspace = self._workspace()
         p = Path(raw)
         if not p.is_absolute():
@@ -336,34 +392,50 @@ class KoraRunner:
             resolved = p.resolve()
             ws_resolved = workspace.resolve()
         except (OSError, RuntimeError, ValueError):
-            return False, "path resolution failed"
+            return False, "path resolution failed", "path_error"
+        # Secret containment runs on the FULL resolved path, BEFORE the in-workspace allow, so a
+        # secret living inside the workspace (workspace/.env, workspace/.ssh/id_rsa) is still
+        # denied. Log the full resolved path (matches the gate's existing full-path logging);
+        # the secret VALUE is never read → never logged.
+        if _is_secret_path(resolved):
+            return False, f"secret_path: {resolved}", "secret_path"
         if resolved.is_relative_to(ws_resolved):
-            return True, str(resolved)
-        return False, f"path escapes workspace: {resolved}"
+            return True, str(resolved), "allow"
+        return False, f"outside_workspace: {resolved}", "outside_workspace"
 
-    async def _gate(self, tool_name: str, tool_input: dict[str, Any], ctx: Any = None) -> Any:
-        # E5 (§2b): AskUserQuestion is Kora asking the USER something mid-task. It has no path key
-        # → the fail-closed policy below would Deny it. Intercept FIRST and turn it into the
-        # interactive block that parks the stream until the dispatcher delivers the answer.
-        if tool_name == "AskUserQuestion":
-            return await self._handle_question(tool_input)
+    async def _pretool_hook(self, input_data: dict[str, Any], tool_use_id: Any, context: Any) -> dict[str, Any]:
+        # The ONE gate (slice-4 repair): a PreToolUse hook fires for EVERY tool Кора invokes,
+        # unlike can_use_tool which only fired for permission-requiring tools (Read/Glob/Bash
+        # slipped past it and a secret leaked). It returns an EXPLICIT allow/deny hook dict per
+        # tool — a bare {} would be "no-decision" and headless-BLOCK mutating tools.
+        name = input_data.get("tool_name")
+        tinput = input_data.get("tool_input") or {}
+        # E5 (§2b): AskUserQuestion is Кора asking the USER something mid-task. It has no path key
+        # → the fail-closed policy would Deny it. Intercept FIRST and turn it into the interactive
+        # block that parks the stream until the dispatcher delivers the answer.
+        if name == "AskUserQuestion":
+            return await self._handle_question(tinput)
 
-        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
-
-        allowed, detail = self._gate_decision(tool_name, tool_input)
+        allowed, detail, category = self._gate_decision(name, tinput)
         self._journal.record_kora_event(
             KoraEvent(
                 id=f"kora-gate-{int(self._clock.now() * 1000)}",
                 type="gate_allow" if allowed else "gate_deny",
                 cls=EventClass.NARRATABLE,
-                payload={"tool": tool_name, "detail": detail},
+                payload={"tool": name, "detail": detail, "category": category},
                 speak_text=None,
                 ts=self._clock.now(),
             )
         )
         if allowed:
-            return PermissionResultAllow()
-        return PermissionResultDeny(message=detail or "denied")
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": detail or category,
+            }
+        }
 
     @staticmethod
     def _build_question_prompt(questions: list[dict[str, Any]]) -> str:
@@ -387,8 +459,6 @@ class KoraRunner:
         `updated_input.answers` (the SDK applies it and Kora continues the SAME task — 0 slice-1
         rework). ALL cleanup of the future + store flag is localized here under an identity guard
         so a superseded run never touches a successor's question (MAJOR-C1)."""
-        from claude_agent_sdk import PermissionResultAllow  # lazy (S4/P5)
-
         questions = (tool_input or {}).get("questions") or []
         spoken = self._build_question_prompt(questions)
         # Keys-only journaling (P4/R4): the count, never the question text (matches slice-1 logging).
@@ -431,7 +501,13 @@ class KoraRunner:
                 ts=self._clock.now(),
             )
         )
-        return PermissionResultAllow(updated_input={"questions": questions, "answers": answers})
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": {"questions": questions, "answers": answers},
+            }
+        }
 
     def _default_client_factory(self, opts: Any) -> Any:
         from claude_agent_sdk import ClaudeSDKClient

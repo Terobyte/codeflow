@@ -17,9 +17,11 @@ import pytest
 
 from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
 from synapse.bridge.kora import (
+    _PATH_KEY,
     KoraRunner,
     _completion_text,
     _failure_text,
+    _is_secret_path,
     _message_to_events,
     apply_event_to_store,
 )
@@ -351,41 +353,167 @@ async def test_stale_run_does_not_write_into_a_different_task(tmp_path):
 
 
 # =========================================================================================
-# 5. Gate — fail-closed workspace containment (RISK-M6)
+# 5. Gate policy — fail-closed workspace containment (RISK-M6). These exercise the PURE
+# `_gate_decision` predicate (allowed, detail, category); the PreToolUse-hook delivery that
+# wraps it is covered in Section 5c.
 # =========================================================================================
 
 
-async def test_gate_allows_inside_workspace(tmp_path):
+def test_gate_allows_inside_workspace(tmp_path):
     runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
-    assert (await runner._gate("Write", {"file_path": str(ws / "a.txt")}, None)).behavior == "allow"
-    assert (await runner._gate("Write", {"file_path": "rel/inside.txt"}, None)).behavior == "allow"  # relative → cwd
+    assert runner._gate_decision("Write", {"file_path": str(ws / "a.txt")})[0] is True
+    assert runner._gate_decision("Write", {"file_path": "rel/inside.txt"})[0] is True  # relative → cwd
 
 
-async def test_gate_denies_sibling_directory(tmp_path):
+def test_gate_denies_sibling_directory(tmp_path):
     runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
     sibling = ws.parent / (ws.name + "-evil") / "a.txt"  # /ws-evil is NOT under /ws (startswith would leak it)
-    assert (await runner._gate("Write", {"file_path": str(sibling)}, None)).behavior == "deny"
+    allowed, _detail, category = runner._gate_decision("Write", {"file_path": str(sibling)})
+    assert allowed is False and category == "outside_workspace"
 
 
-async def test_gate_denies_home_escape(tmp_path):
+def test_gate_denies_home_escape(tmp_path):
     runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
-    res = await runner._gate("Write", {"file_path": os.path.expanduser("~/synapse_escape_probe.txt")}, None)
-    assert res.behavior == "deny"
+    allowed, _detail, category = runner._gate_decision("Write", {"file_path": os.path.expanduser("~/synapse_escape_probe.txt")})
+    assert allowed is False and category == "outside_workspace"
 
 
-async def test_gate_denies_missing_path_for_mutating_tool(tmp_path):
+def test_gate_denies_missing_path_for_mutating_tool(tmp_path):
     runner, *_ = make_runner(tmp_path)
-    assert (await runner._gate("Write", {}, None)).behavior == "deny"  # fail-closed
+    allowed, _detail, category = runner._gate_decision("Write", {})  # fail-closed
+    assert allowed is False and category == "missing_path"
 
 
-async def test_gate_allows_missing_path_for_read_search(tmp_path):
+def test_gate_allows_missing_path_for_read_search(tmp_path):
     runner, *_ = make_runner(tmp_path)
-    assert (await runner._gate("Glob", {}, None)).behavior == "allow"  # defaults to cwd ∈ workspace
+    assert runner._gate_decision("Glob", {})[0] is True  # defaults to cwd ∈ workspace
 
 
-async def test_gate_denies_non_file_tools(tmp_path):
+def test_gate_denies_non_file_tools(tmp_path):
     runner, *_ = make_runner(tmp_path)
-    assert (await runner._gate("Bash", {"command": "rm -rf /"}, None)).behavior == "deny"
+    allowed, _detail, category = runner._gate_decision("Bash", {"command": "rm -rf /"})
+    assert allowed is False and category == "egress"
+
+
+def test_gate_allows_safe_meta_tools(tmp_path):
+    # ToolSearch (load tools) + TodoWrite (planning) are the only non-file tools allowed —
+    # everything else non-file stays fail-closed (slice-4 §5b Plan v3 item 4).
+    runner, *_ = make_runner(tmp_path)
+    assert runner._gate_decision("ToolSearch", {"query": "x"}) == (True, None, "allow_meta")
+    assert runner._gate_decision("TodoWrite", {"todos": []}) == (True, None, "allow_meta")
+
+
+# =========================================================================================
+# 5b. Gate secret containment (slice 4, §2.8) — a secret INSIDE the workspace is still a
+# secret: denied for every file tool BEFORE the in-workspace allow, casefold-proof (APFS is
+# case-insensitive), while commit-safe `.env` templates and `.py` names that merely CONTAIN
+# "env" stay allowed. Deny reasons are journaled with an explicit category.
+# =========================================================================================
+
+
+# Every file tool the gate recognizes → must deny a secret regardless of which one Kora picks.
+_FILE_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "LS", "NotebookEdit")
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [".env", "sub/.env.local", ".ssh/id_rsa", "server.pem", "server.key", ".aws/credentials", ".npmrc", ".git/config", "id_ecdsa"],
+)
+def test_gate_denies_secret_inside_workspace_for_every_file_tool(tmp_path, rel):
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    for tool in _FILE_TOOLS:
+        allowed, _detail, category = runner._gate_decision(tool, {_PATH_KEY[tool]: str(ws / rel)})
+        assert allowed is False and category == "secret_path", f"{tool} on in-workspace secret {rel!r} must be denied"
+
+
+def test_gate_secret_denial_is_casefold_proof(tmp_path):
+    # BLOCKER-1: macOS APFS is case-insensitive, so Read(".ENV") opens the same bytes as .env.
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    for rel in (".ENV", ".SSH/id_rsa", "SERVER.PEM"):
+        assert runner._gate_decision("Read", {"file_path": str(ws / rel)})[0] is False, f"{rel!r} must be denied (case-insensitive fs)"
+
+
+def test_gate_allows_commit_safe_env_templates(tmp_path):
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    for rel in (".env.example", ".env.sample", ".env.template", ".env.dist"):
+        assert runner._gate_decision("Read", {"file_path": str(ws / rel)})[0] is True, f"{rel!r} is a commit-safe template → allowed"
+
+
+def test_gate_does_not_false_positive_on_env_substring_names(tmp_path):
+    # The pattern must be exact `.env` / `.env.`-prefix, never the substring "env".
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    for rel in ("environment.py", "prevent.py", "env.py", "main.py"):
+        assert runner._gate_decision("Read", {"file_path": str(ws / rel)})[0] is True, f"{rel!r} is not a secret → allowed"
+
+
+# =========================================================================================
+# 5c. PreToolUse hook delivery (slice-4 repair) — the ONE gate now fires for EVERY tool. The
+# hook wraps `_gate_decision`, journals the gate_allow/gate_deny event, and returns an EXPLICIT
+# permissionDecision so headless never falls back to a no-decision block.
+# =========================================================================================
+
+
+async def _decision(runner, tool, inp):
+    res = await runner._pretool_hook({"tool_name": tool, "tool_input": inp}, None, None)
+    return res["hookSpecificOutput"]["permissionDecision"]
+
+
+async def test_pretool_hook_returns_explicit_permission_decisions(tmp_path):
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    # file inside workspace → allow; secret inside workspace → deny; egress → deny; meta → allow.
+    assert await _decision(runner, "Write", {"file_path": str(ws / "a.txt")}) == "allow"
+    assert await _decision(runner, "Read", {"file_path": str(ws / ".env")}) == "deny"
+    assert await _decision(runner, "Bash", {"command": "ls"}) == "deny"
+    assert await _decision(runner, "ToolSearch", {"query": "x"}) == "allow"
+    assert await _decision(runner, "TodoWrite", {"todos": []}) == "allow"
+
+
+async def test_pretool_hook_deny_carries_reason(tmp_path):
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    res = await runner._pretool_hook({"tool_name": "Read", "tool_input": {"file_path": str(ws / ".env")}}, None, None)
+    hso = res["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    assert hso["permissionDecision"] == "deny"
+    assert hso["permissionDecisionReason"]  # non-empty (detail or category)
+
+
+async def test_gate_journals_explicit_deny_categories(tmp_path):
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    sibling = ws.parent / (ws.name + "-evil") / "a.txt"
+    cases = [
+        (("Read", {"file_path": str(ws / ".env")}), "secret_path"),
+        (("Bash", {"command": "ls"}), "egress"),
+        (("WebFetch", {"url": "http://example.com"}), "egress"),
+        (("Task", {"description": "x"}), "non_file_tool"),
+        (("Write", {}), "missing_path"),
+        (("Write", {"file_path": str(sibling)}), "outside_workspace"),
+    ]
+    for (tool, inp), _expected in cases:
+        assert await _decision(runner, tool, inp) == "deny"
+    deny_rows = [r for r in _journal_rows(journal) if r["kind"] == "kora_event" and r["type"] == "gate_deny"]
+    assert [r["payload"]["category"] for r in deny_rows] == [expected for _, expected in cases]
+
+
+async def test_gate_journals_allow_category(tmp_path):
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    await runner._pretool_hook({"tool_name": "Grep", "tool_input": {}}, None, None)  # missing-path read/search → allow
+    allow_rows = [r for r in _journal_rows(journal) if r["kind"] == "kora_event" and r["type"] == "gate_allow"]
+    assert allow_rows and allow_rows[-1]["payload"]["category"] == "allow"
+
+
+def test_is_secret_path_predicate_unit():
+    # Direct predicate coverage independent of resolve(): segments, stems, suffixes, templates.
+    from pathlib import Path
+
+    assert _is_secret_path(Path("/ws/.env"))
+    assert _is_secret_path(Path("/ws/deep/.ssh/id_rsa"))
+    assert _is_secret_path(Path("/ws/.git-credentials"))
+    assert _is_secret_path(Path("/ws/id_ed25519"))
+    assert _is_secret_path(Path("/ws/key.p12"))
+    assert _is_secret_path(Path("/ws/.ENV"))  # casefold
+    assert not _is_secret_path(Path("/ws/.env.example"))
+    assert not _is_secret_path(Path("/ws/environment.py"))
+    assert not _is_secret_path(Path("/ws/env.py"))
 
 
 # =========================================================================================
@@ -400,7 +528,11 @@ def test_build_options_security_posture(tmp_path):
     assert opts.permission_mode == "default"
     assert opts.allowed_tools == []  # empty → the gate is authoritative (no shadowing)
     assert opts.setting_sources == []  # no user/project settings shadow the gate
-    assert opts.can_use_tool == runner._gate  # bound method: same __self__/__func__
+    # slice-4 repair: the boundary is a PreToolUse HOOK (fires for EVERY tool), NOT can_use_tool
+    # (which only fired for permission-requiring tools and let Read/Glob/Bash bypass the gate).
+    assert opts.can_use_tool is None
+    matcher = opts.hooks["PreToolUse"][0]
+    assert matcher.hooks == [runner._pretool_hook]  # bound method: same __self__/__func__
     assert str(ws) in opts.system_prompt  # LOAD-BEARING: prompt must name the workspace
 
 
