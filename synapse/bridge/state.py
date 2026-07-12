@@ -150,6 +150,12 @@ class TaskStore:
         self._task: TaskState | None = None
         self._last_event_ts: float | None = None
         self._staged: dict[str, Any] | None = None
+        # M1 slice 3 (E5): a purely TRANSIENT flag — set while Kora's stream is blocked in the
+        # gate on an AskUserQuestion, cleared the moment the answer is delivered/cancelled. NOT
+        # persisted (like the live SDK stream it tracks): a dead runner post-restart must never
+        # strand a stale «Кора ждёт ответа». Carries NO question text/options (Р-8/Р-15
+        # redaction — the question is voiced only via on_speak, never rendered into [СОСТОЯНИЕ]).
+        self._awaiting_answer: bool = False
         self._state_path: Path | None = Path(journal_dir) / "state.json" if journal_dir else None
         if self._state_path is not None:
             self._load()
@@ -161,6 +167,21 @@ class TaskStore:
     @property
     def staged(self) -> dict[str, Any] | None:
         return self._staged
+
+    @property
+    def awaiting_answer(self) -> bool:
+        return self._awaiting_answer
+
+    def set_awaiting(self) -> None:
+        """Kora's stream is now parked in the gate waiting for the user's answer (E5). TRANSIENT
+        — deliberately does NOT call `_persist`: this tracks a live SDK stream that cannot
+        survive a restart, so it must never be written to state.json (P10)."""
+        self._awaiting_answer = True
+
+    def clear_awaiting(self) -> None:
+        """The answer was delivered or the parked run was cancelled/superseded. TRANSIENT — no
+        `_persist`, same contract as `set_awaiting`."""
+        self._awaiting_answer = False
 
     def has_active_task(self) -> bool:
         return self._task is not None and self._task.status in (
@@ -217,6 +238,11 @@ class TaskStore:
         self._persist()
 
     def liveness(self, now: float, stale_after_s: float, unreachable_after_s: float) -> Liveness:
+        # E5 (MAJOR-R1): while parked on a user answer, Kora is ALIVE — blocked on the human, not
+        # dead. Report OK FIRST so a long human wait never trips a false STALE/UNREACHABLE (which
+        # would make the dispatcher say «нет сигнала» on the happy path).
+        if self._awaiting_answer:
+            return Liveness.OK
         if self._last_event_ts is None:
             return Liveness.OK
         age = now - self._last_event_ts
@@ -239,8 +265,12 @@ class TaskStore:
             f"Начата: {_fmt_ts(t.started_ts)}",
             f"Последний сигнал: {_fmt_ts(t.last_event_ts)}",
             f"Связь с Корой: {live.value}",
-            "События:",
         ]
+        # E5 (MAJOR-R4): REDACTED marker only — the question text/options are voiced by Kora via
+        # on_speak (Р-8/Р-15 compliant), NEVER rendered here. Gated on RUNNING (R6).
+        if self._awaiting_answer and t.status == TaskStatus.RUNNING:
+            lines.append("Кора ждёт твоего ответа на свой вопрос (детали озвучены голосом).")
+        lines.append("События:")
         if not t.events:
             lines.append("  (пока нет)")
         for ev in t.events:
@@ -270,6 +300,8 @@ class TaskStore:
                 ],
             },
             "liveness": live.value,
+            # E5: bool only, gated RUNNING (R6) — no question text leaks (Р-8/Р-15, MAJOR-R4).
+            "awaiting_answer": self._awaiting_answer and t.status == TaskStatus.RUNNING,
         }
 
     def render_state_template(self, now: float, stale_after_s: float, unreachable_after_s: float) -> str:
@@ -277,6 +309,10 @@ class TaskStore:
         live = self.liveness(now, stale_after_s, unreachable_after_s)
         if live != Liveness.OK:
             return CANON_PHRASE_STALE_KORA
+        # E5 (MAJOR-R1): deterministic truth on the cost-cap hard-stop path — a parked question
+        # is not a stalled task. Checked before the generic status phrases below.
+        if self._awaiting_answer:
+            return "Кора ждёт твоего ответа на свой вопрос."
         if self._task is None:
             return "Активных задач нет."
         status_phrases = {

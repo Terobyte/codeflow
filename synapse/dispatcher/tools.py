@@ -66,7 +66,23 @@ REQUEST_CANCEL_SCHEMA = FunctionSchema(
     required=[],
 )
 
-ALL_SCHEMAS = [SUBMIT_TASK_SCHEMA, CONFIRM_TASK_SCHEMA, GET_TASK_STATUS_SCHEMA, REQUEST_CANCEL_SCHEMA]
+ANSWER_KORA_SCHEMA = FunctionSchema(
+    name="answer_kora",
+    description=(
+        "Передать Коре ответ пользователя на её уточняющий вопрос — дословно, без переписывания. "
+        "Использовать только когда [СОСТОЯНИЕ] показывает, что Кора ждёт ответа на свой вопрос."
+    ),
+    properties={"text": {"type": "string", "description": "Реплика пользователя дословно."}},
+    required=["text"],
+)
+
+ALL_SCHEMAS = [
+    SUBMIT_TASK_SCHEMA,
+    CONFIRM_TASK_SCHEMA,
+    GET_TASK_STATUS_SCHEMA,
+    REQUEST_CANCEL_SCHEMA,
+    ANSWER_KORA_SCHEMA,
+]
 
 
 @dataclass
@@ -90,6 +106,10 @@ class KoraBridge:
     # runner tears down Kora's subprocess, not just the slot. Both fire INSIDE ToolHandlers._do.
     on_task_committed: Callable[[str, str], None] | None = None
     on_cancel: Callable[[], None] | None = None
+    # M1 slice 3 (E5): deliver the user's reply to a parked AskUserQuestion, verbatim. Wired to
+    # KoraRunner.provide_answer; returns True iff a question was actually pending. Fires INSIDE
+    # ToolHandlers._do (answer_kora), like the other on_* callbacks.
+    on_answer: Callable[[str], bool] | None = None
 
 
 def _submit_result_to_dict(res: SubmitResult) -> dict[str, Any]:
@@ -179,6 +199,15 @@ class ToolHandlers:
         self._journal.record_tool_call("request_cancel", {}, {**result, "deduped": deduped})
         return result
 
+    async def answer_kora(self, text: str) -> dict[str, Any]:
+        async def _do() -> dict[str, Any]:
+            ok = self.bridge.on_answer(text) if self.bridge.on_answer else False
+            return {"outcome": "answer_delivered" if ok else "no_pending_question"}
+
+        result, deduped = await self._guarded("answer_kora", _do)
+        self._journal.record_tool_call("answer_kora", {"text": text}, {**result, "deduped": deduped})
+        return result
+
 
 def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
     """Wraps each pure handler as a pipecat function-call callback (S7: the result is
@@ -204,7 +233,13 @@ def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
         result = await handlers.request_cancel()
         await params.result_callback(result)
 
+    async def _answer_kora(params: FunctionCallParams) -> None:
+        result = await handlers.answer_kora(**params.arguments)
+        await params.result_callback(result)
+
     llm_or_switcher.register_function("submit_task", _submit_task, cancel_on_interruption=False)
     llm_or_switcher.register_function("confirm_task", _confirm_task, cancel_on_interruption=False)
     llm_or_switcher.register_function("request_cancel", _request_cancel, cancel_on_interruption=False)
+    # E5 (S5): barge-in must NOT drop the answer — losing it would strand Kora blocked forever.
+    llm_or_switcher.register_function("answer_kora", _answer_kora, cancel_on_interruption=False)
     llm_or_switcher.register_function("get_task_status", _get_task_status, cancel_on_interruption=True)

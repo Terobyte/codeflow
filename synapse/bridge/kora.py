@@ -196,6 +196,12 @@ class KoraRunner:
         self._on_speak = on_speak
         self._client_factory = client_factory or self._default_client_factory
         self._active: asyncio.Task[None] | None = None
+        # M1 slice 3 (E5): while Kora's stream is blocked in the gate on an AskUserQuestion, this
+        # holds the future the dispatcher's answer_kora resolves. None whenever no question is
+        # parked. Its ENTIRE lifecycle (null + store-flag clear) lives inside `_handle_question`'s
+        # try/finally under an identity guard, so a superseding run never clobbers the successor's
+        # question (MAJOR-C1); `_run`'s finally stays terminalize-only.
+        self._pending_answer: asyncio.Future[str] | None = None
 
     # --- launch / cancel (host-facing) -----------------------------------------------------
 
@@ -219,6 +225,19 @@ class KoraRunner:
         «отмени задачу» actually stops Kora, not just frees the slot."""
         if self._active is not None and not self._active.done():
             self._active.cancel()
+
+    def provide_answer(self, text: str) -> bool:
+        """Host-facing (wired to the dispatcher's answer_kora tool via KoraBridge.on_answer):
+        deliver the user's reply, verbatim, to the parked AskUserQuestion. Clears the store's
+        awaiting flag SYNCHRONOUSLY BEFORE `set_result` (R5) so there is no resume-gap window in
+        which [СОСТОЯНИЕ] still shows «ждёт ответа» after the answer was accepted. Returns True
+        iff a question was actually pending — False lets the tool report `no_pending_question`."""
+        fut = self._pending_answer
+        if fut is not None and not fut.done():
+            self._store.clear_awaiting()
+            fut.set_result(text)
+            return True
+        return False
 
     # --- run / stream ----------------------------------------------------------------------
 
@@ -323,6 +342,12 @@ class KoraRunner:
         return False, f"path escapes workspace: {resolved}"
 
     async def _gate(self, tool_name: str, tool_input: dict[str, Any], ctx: Any = None) -> Any:
+        # E5 (§2b): AskUserQuestion is Kora asking the USER something mid-task. It has no path key
+        # → the fail-closed policy below would Deny it. Intercept FIRST and turn it into the
+        # interactive block that parks the stream until the dispatcher delivers the answer.
+        if tool_name == "AskUserQuestion":
+            return await self._handle_question(tool_input)
+
         from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
         allowed, detail = self._gate_decision(tool_name, tool_input)
@@ -339,6 +364,74 @@ class KoraRunner:
         if allowed:
             return PermissionResultAllow()
         return PermissionResultDeny(message=detail or "denied")
+
+    @staticmethod
+    def _build_question_prompt(questions: list[dict[str, Any]]) -> str:
+        """Voice the primary question + its option labels + the free-form invitation (§2b: the
+        user may pick a label OR answer in their own words — the CLI does not validate
+        answer ∈ labels). This text goes to on_speak ONLY, never into [СОСТОЯНИЕ] (Р-8/Р-15)."""
+        if not questions:
+            return "Кора задаёт уточняющий вопрос. Ответь своими словами."
+        q = questions[0]
+        text = str(q.get("question") or "").strip()
+        labels = [str(o.get("label", "")).strip() for o in (q.get("options") or []) if o.get("label")]
+        parts = [text] if text else []
+        if labels:
+            parts.append("Варианты: " + ", ".join(labels) + ".")
+        parts.append("Или ответь своими словами.")
+        return " ".join(parts)
+
+    async def _handle_question(self, tool_input: dict[str, Any]) -> Any:
+        """The E5 interactive gate branch (§2b). Parks Kora's stream on a future until the
+        dispatcher's answer_kora resolves it, then returns the answer verbatim into
+        `updated_input.answers` (the SDK applies it and Kora continues the SAME task — 0 slice-1
+        rework). ALL cleanup of the future + store flag is localized here under an identity guard
+        so a superseded run never touches a successor's question (MAJOR-C1)."""
+        from claude_agent_sdk import PermissionResultAllow  # lazy (S4/P5)
+
+        questions = (tool_input or {}).get("questions") or []
+        spoken = self._build_question_prompt(questions)
+        # Keys-only journaling (P4/R4): the count, never the question text (matches slice-1 logging).
+        self._journal.record_kora_event(
+            KoraEvent(
+                id=f"kora-question-{int(self._clock.now() * 1000)}",
+                type="kora_question_asked",
+                cls=EventClass.NARRATABLE,
+                payload={"num_questions": len(questions)},
+                speak_text=None,
+                ts=self._clock.now(),
+            )
+        )
+        # Order matters: the future must exist BEFORE the awaiting flag becomes visible, so the
+        # dispatcher (which only routes to answer_kora after seeing awaiting in [СОСТОЯНИЕ]) can
+        # never resolve a not-yet-created future.
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._pending_answer = fut
+        self._store.set_awaiting()
+        if self._on_speak is not None:  # P6 None-guard
+            self._on_speak(spoken)
+        try:
+            answer_text = await fut
+        finally:
+            # Identity guard (MAJOR-C1): only clean up if THIS invocation still owns the slot. A
+            # superseding run that overwrote `_pending_answer` must keep its own state intact.
+            if self._pending_answer is fut:
+                self._pending_answer = None
+                self._store.clear_awaiting()
+        # Verbatim (§2.9): the user's reply goes UNTOUCHED into every question key, label or
+        # free-form alike (§2b — the CLI does not validate it against the options).
+        answers = {q["question"]: answer_text for q in questions}
+        self._journal.record_kora_event(
+            KoraEvent(
+                id=f"kora-answer-{int(self._clock.now() * 1000)}",
+                type="kora_question_answered",
+                cls=EventClass.NARRATABLE,
+                payload={"num_questions": len(questions)},
+                speak_text=None,
+                ts=self._clock.now(),
+            )
+        )
+        return PermissionResultAllow(updated_input={"questions": questions, "answers": answers})
 
     def _default_client_factory(self, opts: Any) -> Any:
         from claude_agent_sdk import ClaudeSDKClient

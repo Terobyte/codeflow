@@ -186,6 +186,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         cfg=cfg,
         on_task_committed=kora_runner.start if kora_runner else None,
         on_cancel=kora_runner.request_cancel if kora_runner else None,
+        on_answer=kora_runner.provide_answer if kora_runner else None,
     )
     handlers = ToolHandlers(bridge, journal)
 
