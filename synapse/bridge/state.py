@@ -331,6 +331,21 @@ class TaskStore:
         }
         return status_phrases[self._task.status]
 
+    def resync_greeting(self, now: float, stale_after_s: float, unreachable_after_s: float) -> str | None:
+        # M1 slice 5 (§2.7): deterministic "welcome back" prefix for the reconnect resync greeting
+        # (no LLM — R2-крит: the first thing spoken after a dead zone can't ride the slowest
+        # path). `None` on a virgin host (no task ever started): "с возвращением" would be a lie
+        # with nothing to resync to. Otherwise delegates the status suffix to
+        # `render_state_template` rather than re-deriving the awaiting/stale tri-state priority a
+        # third time (A4 disposition) — this inherits that method's already-tested behavior.
+        if self._task is None:
+            return None
+        text = self._task.text
+        if len(text) > 60:
+            text = text[:60] + "…"
+        suffix = self.render_state_template(now, stale_after_s, unreachable_after_s)
+        return f"С возвращением. Задача «{text}»: {suffix}"
+
     def _persist(self) -> None:
         if self._state_path is None:
             return
@@ -401,6 +416,18 @@ class SpeakLedger:
         for entry in self._pending.values():
             if not entry.spoken and entry.event.speak_text == text:
                 entry.spoken = True
+
+    def unspoken(self, now: float, min_age_s: float) -> list[KoraEvent]:
+        # M1 slice 5 (§2.7): undelivered criticals to replay on a reconnect resync. `min_age_s`
+        # excludes an event still fresh enough that its ORGANIC on_speak may just be in flight
+        # (R2 disposition) — replaying it too would double-voice the same critical. `alerted`
+        # does NOT exclude: the Р-15г watchdog having already logged the miss doesn't mean the
+        # user ever actually heard it, and the voice still owes them the fact.
+        return [
+            e.event
+            for e in self._pending.values()
+            if not e.spoken and e.event.speak_text and now - e.event.ts >= min_age_s
+        ]
 
     def check(self, now: float, window_s: float) -> list[tuple[str, dict[str, Any]]]:
         alerts: list[tuple[str, dict[str, Any]]] = []

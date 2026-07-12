@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -34,6 +35,22 @@ from synapse.pipeline.app import SynapseHost, build_session_pipeline
 # B8: hard cap on pending (started-but-not-yet-offered) handshake sessions — bounds the
 # memory a bare-/start flood can claim. Generous for a single-client demo.
 _MAX_PENDING_SESSIONS = 128
+
+# M1 slice 5 (§2.2): our own committed PWA assets (manifest/icons/watchdog script) — separate
+# from the prebuilt bundle's own dist/ directory, which we read from but never write to.
+_STATIC_DIR = Path(__file__).parent / "static"
+
+# M1 slice 5 (§2.2): meta injected into the prebuilt bundle's <head> so /client installs as a
+# PWA (manifest + apple-touch-icon + A2HS meta) and picks up the reconnect watchdog, without
+# forking pipecat_ai_prebuilt's dist/ (a fork would need re-diffing on every pipecat upgrade).
+_PWA_HEAD = (
+    '<link rel="manifest" href="./manifest.webmanifest">'
+    '<link rel="apple-touch-icon" href="./apple-touch-icon.png">'
+    '<meta name="apple-mobile-web-app-capable" content="yes">'
+    '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
+    '<meta name="theme-color" content="#0b0f14">'
+    '<script defer src="./reconnect.js"></script>'
+)
 
 
 def build_web_app(host: SynapseHost) -> FastAPI:
@@ -78,6 +95,28 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         )
         full = Pipeline([transport.input(), session.pipeline, transport.output()])
         task = PipelineTask(full, idle_timeout_secs=None)  # M3: never auto-drop a connected demo session
+
+        greeted = False
+
+        @transport.event_handler("on_client_connected")
+        async def _on_client_connected(_transport, _client):
+            # M1 slice 5 (§2.7): resync greeting — once per run_session. pipecat re-emits
+            # "connected" on ICE self-heals of the SAME connection (no dedup upstream), and the
+            # host-level arbiter would let each re-greet truncate Kora's live turn — hence the latch.
+            # Deterministic, no LLM (R2-крит).
+            nonlocal greeted
+            if greeted:
+                return
+            greeted = True
+            greeting = host.store.resync_greeting(
+                host.clock.now(), host.cfg.stale_after_s, host.cfg.unreachable_after_s
+            )
+            if greeting:
+                await host.push_speak_frame(greeting)
+            # Undelivered criticals replay via speak() (Р-15г ledger stays honest); min_age keeps a
+            # just-emitted critical (organic speak still in flight) from double-voicing.
+            for ev in host.speak_ledger.unspoken(host.clock.now(), min_age_s=5.0):
+                host.speak(ev.speak_text)
 
         @transport.event_handler("on_client_disconnected")
         async def _on_client_disconnected(_transport, _client):
@@ -192,6 +231,66 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     @app.get("/")
     async def index():
         return RedirectResponse(url="/client/")
+
+    # M1 slice 5 (§2.2): PWA wrapper around the prebuilt bundle. `PipecatPrebuiltUI` (mounted
+    # below) is a `StaticFiles(directory=dist, html=True)` whose asset paths are RELATIVE
+    # (`./assets/...`), so serving a patched index.html from a route registered BEFORE the mount
+    # doesn't break asset loading — Starlette matches routes in registration order, so these win
+    # over the mount's own handling of the same paths. We wrap instead of forking dist/ (a fork
+    # would need re-diffing on every pipecat_ai_prebuilt upgrade). `html=True` StaticFiles serves
+    # BOTH "/client/" (its own index-serving fallback) and "/client/index.html" (the literal
+    # path) for the same file, so both are patched here or the second would still serve the
+    # unpatched original.
+    dist_index_path = Path(PipecatPrebuiltUI.directory) / "index.html"
+    dist_html = dist_index_path.read_text(encoding="utf-8")
+    patched_index = dist_html.replace("</head>", _PWA_HEAD + "</head>")
+    if patched_index == dist_html:
+        # B6: a silent no-op anchor replace must never pass as "patched" — dist/index.html's
+        # shape changing out from under us (a pipecat_ai_prebuilt upgrade) must fail loudly at
+        # build time, not silently ship a client with no manifest link.
+        raise RuntimeError("PWA head injection failed: no </head> anchor in dist/index.html")
+    _patched_index_bytes = patched_index.encode("utf-8")
+    _manifest_bytes = (_STATIC_DIR / "manifest.webmanifest").read_bytes()
+    _reconnect_js_bytes = (_STATIC_DIR / "reconnect.js").read_bytes()
+    _icon_192_bytes = (_STATIC_DIR / "icon-192.png").read_bytes()
+    _icon_512_bytes = (_STATIC_DIR / "icon-512.png").read_bytes()
+    _apple_touch_icon_bytes = (_STATIC_DIR / "apple-touch-icon.png").read_bytes()
+
+    @app.get("/client/")
+    async def client_index():
+        return Response(content=_patched_index_bytes, media_type="text/html")
+
+    @app.get("/client/index.html")
+    async def client_index_html():
+        return Response(content=_patched_index_bytes, media_type="text/html")
+
+    @app.get("/client/manifest.webmanifest")
+    async def client_manifest():
+        return Response(content=_manifest_bytes, media_type="application/manifest+json")
+
+    @app.get("/client/reconnect.js")
+    async def client_reconnect_js():
+        return Response(content=_reconnect_js_bytes, media_type="text/javascript")
+
+    @app.get("/client/icon-192.png")
+    async def client_icon_192():
+        return Response(content=_icon_192_bytes, media_type="image/png")
+
+    @app.get("/client/icon-512.png")
+    async def client_icon_512():
+        return Response(content=_icon_512_bytes, media_type="image/png")
+
+    @app.get("/client/apple-touch-icon.png")
+    async def client_apple_touch_icon():
+        return Response(content=_apple_touch_icon_bytes, media_type="image/png")
+
+    # M1 slice 5 (§2.7): truth-based signal for reconnect.js — NOT a wall clock (R3/R4: iOS
+    # suspends page timers while locked/backgrounded, so elapsed-time heuristics false-positive
+    # on every ordinary wake). `current["task"]` is None the instant no client is actively bound
+    # (torn down or preempted), so this reflects real server state instead of a guess.
+    @app.get("/client/session-alive")
+    async def session_alive():
+        return JSONResponse({"active": current["task"] is not None})
 
     app.mount("/client", PipecatPrebuiltUI, name="client")
     return app
