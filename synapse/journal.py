@@ -33,6 +33,9 @@ class AlertKind(str, Enum):
     CONFIRM_SELF_ATTEMPT = "CONFIRM_SELF_ATTEMPT"
     AUTH_FAILURE = "AUTH_FAILURE"
     KORA_RUN_FAILED = "KORA_RUN_FAILED"
+    # B12 (Р-11): Kora's liveness degraded to stale/unreachable between turns — surfaced once on
+    # the transition so a Kora that dies silently doesn't just read "running" until the next turn.
+    KORA_UNREACHABLE = "KORA_UNREACHABLE"
 
 
 @dataclass

@@ -127,6 +127,21 @@ Deferred to W4/W5: B15/B35 (arbiter drain / context scrub), B31/B12/B40/B41/B24,
 
 ---
 
+## Wave 4 — DONE (2026-07-12). FIXED red→green: **B12, B41, B24** (3 bugs, +3 tests, suite 193→196).
+Test: `tests/test_bughunt_w4.py`.
+- **B12** — new `AlertKind.KORA_UNREACHABLE`; monitor emits it ONCE on the OK→stale/unreachable transition (Р-11 between-turns liveness no longer decorative).
+- **B41** — `_retry_after_header` parses RFC-1123 HTTP-date form (`email.utils.parsedate_to_datetime`) → real seconds, not a silent 60s default.
+- **B24** — run_session's setup-window ops (old.cancel + monitor spawn) moved inside the cleanup try → a raise there no longer leaks the bind slot / current publish / active_sessions entry.
+
+## DESIGN-TENSION CARRIES (not fixed autonomously — need Тero + live mic):
+- **B15** — arbiter eager per-frame `_drain` defeats SPEAK preemption. A genuine latency-vs-preemption tradeoff: drain-as-you-go gives low-latency streaming TTS; buffering so SPEAK can drop the dispatcher tail would regress that. Product decision + acoustic validation needed.
+- **B35** — GenerationGuard `mark_aborted` keyed on `current_generation` can scrub committed tool messages in a narrow window; latent (a failing gen can't be superseded yet). Touching the delicate guard blind is riskier than the bug.
+- **B13-grounding** — closing the voice turn (check_grounding + end_turn with captured assistant text) needs frame-timing work + live-mic verification.
+- **B31** — primary tier0 paid call not cost-counted (only failover attempts are); needs a pipecat-internal primary-call hook.
+- **B40** — dispatcher journal logs full user task text: WON'T-FIX (the task text is legitimately needed in the local audit; journal never leaves the Mac).
+
+---
+
 ## Wave 1 — DONE (2026-07-12). FIXED red→green: **B1, B2, B3, B4, B5, B6, B8, B9, B14** (9 bugs, +9 regression tests, suite 173→182). B7 REJECTED by-design. B11 known-residual (no-exfil backstop).
 Tests: `tests/test_bughunt_w1_state.py` (B1/B3/B14), `test_bughunt_w1_app_config.py` (B2/B4/B6/B9), `test_bughunt_w1_dispatch_webrtc.py` (B5/B8).
 Carried to later waves: B10, B12, B13, B15, B16, B17-B29.

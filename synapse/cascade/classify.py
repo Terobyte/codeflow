@@ -10,7 +10,9 @@ pair the CircuitBreaker understands. Pure function, no I/O (Р-14).
 """
 from __future__ import annotations
 
+import email.utils
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from synapse.cascade.breaker import ErrorKind
@@ -80,7 +82,19 @@ def _retry_after_header(headers: dict[str, str]) -> float | None:
     for key, value in headers.items():
         if key.lower() == "retry-after":
             try:
-                return float(value)
-            except ValueError:
+                return float(value)  # delta-seconds form
+            except (ValueError, TypeError):
+                pass
+            # B41: HTTP-date form (RFC 1123, "Wed, 21 Oct 2025 07:28:00 GMT") → seconds until that
+            # instant, instead of silently discarding the provider's window and defaulting to 60s.
+            try:
+                when = email.utils.parsedate_to_datetime(value)
+            except (ValueError, TypeError):
                 return None
+            if when is None:
+                return None
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            delta = (when - datetime.now(timezone.utc)).total_seconds()
+            return delta if delta > 0 else None
     return None

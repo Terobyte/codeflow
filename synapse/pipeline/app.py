@@ -27,7 +27,7 @@ from pipecat.services.fish.tts import FishAudioTTSService
 
 from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
 from synapse.bridge.kora import KoraRunner
-from synapse.bridge.state import SpeakLedger, TaskStore
+from synapse.bridge.state import Liveness, SpeakLedger, TaskStore
 from synapse.cascade.breaker import CircuitBreaker
 from synapse.cascade.services import CostCap, build_tier_services
 from synapse.cascade.strategy import build_strategy_type
@@ -147,6 +147,7 @@ class SynapseHost:
     async def monitor_forever(self) -> None:
         """R8: periodically drives speak_ledger.check()/store.liveness() so the Р-15г/Р-11
         invariants fire even between turns, not only incidentally when a turn happens to run."""
+        last_live = Liveness.OK
         while True:
             await asyncio.sleep(self.cfg.heartbeat_interval_s)
             # B2: one transient failure in the loop body (e.g. journal.alert's os.fsync raising)
@@ -156,7 +157,13 @@ class SynapseHost:
                 now = self.clock.now()
                 for kind, detail in self.speak_ledger.check(now, self.cfg.critical_speak_window_s):
                     self.journal.alert(AlertKind(kind), detail)
-                self.store.liveness(now, self.cfg.stale_after_s, self.cfg.unreachable_after_s)
+                live = self.store.liveness(now, self.cfg.stale_after_s, self.cfg.unreachable_after_s)
+                # B12 (Р-11): liveness's result was previously discarded and no stale/unreachable
+                # alert existed — a Kora dying between turns was invisible. Surface it ONCE on the
+                # OK→degraded transition (not every tick).
+                if live != last_live and live != Liveness.OK:
+                    self.journal.alert(AlertKind.KORA_UNREACHABLE, {"liveness": live.value})
+                last_live = live
                 # B30: drive the cost cap's daily recovery even when idle (no failover turns).
                 self.cost_cap.maybe_reset(now)
             except asyncio.CancelledError:

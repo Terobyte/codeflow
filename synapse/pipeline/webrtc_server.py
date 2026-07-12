@@ -84,14 +84,18 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             # publishes it as current, so a racing offer can't leave the injector pointed at a
             # preempted task. A preempting connection's later bind supersedes this one.
             host.bind_output(task)
-        if old is not None:
-            await old.cancel(reason="preempted by new connection")
-
-        monitor = asyncio.ensure_future(host.monitor_forever())
+        # B24: old.cancel + monitor spawn moved INSIDE the try — a raise in this setup window used
+        # to skip the finally, leaking the bind slot, the current["task"] publish, and the
+        # active_sessions entry. `monitor` is None-guarded so a raise before it spawns is safe.
+        monitor = None
         try:
+            if old is not None:
+                await old.cancel(reason="preempted by new connection")
+            monitor = asyncio.ensure_future(host.monitor_forever())
             await PipelineRunner(handle_sigint=False).run(task)  # M2: leave SIGINT to uvicorn
         finally:
-            monitor.cancel()
+            if monitor is not None:
+                monitor.cancel()
             async with lock:
                 if current["task"] is task:
                     current["task"] = None
