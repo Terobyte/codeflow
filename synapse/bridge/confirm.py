@@ -166,6 +166,18 @@ class ConfirmFlow:
                 outcome=ConfirmDecisionOutcome.REJECTED,
                 text="Подтверждать нечего — нет задачи, ожидающей подтверждения.",
             )
+        # B1 (CRIT): a `request_cancel` while a destructive task is PENDING_CONFIRMATION flips the
+        # STORE to CANCEL_REQUESTED but leaves this dangling `_staged`. A confirm must NEVER
+        # resurrect a task the user cancelled — verify the store still holds THIS staged task in
+        # PENDING_CONFIRMATION; any divergence (cancelled, gone, superseded) drops the stale confirm.
+        task = self._store.task
+        if task is None or task.id != self._staged.task_id or task.status != TaskStatus.PENDING_CONFIRMATION:
+            self._staged = None
+            self._store.set_staged(None)
+            return ConfirmResult(
+                outcome=ConfirmDecisionOutcome.REJECTED,
+                text="Эта задача уже не ждёт подтверждения.",
+            )
         if self._staged.awaiting_user_turn:
             self._journal.alert(AlertKind.CONFIRM_SELF_ATTEMPT, {"task_id": self._staged.task_id})
             return ConfirmResult(

@@ -19,6 +19,9 @@ from synapse.dispatcher.tools import ALL_SCHEMAS, ToolCall, ToolHandlers
 from synapse.journal import TurnJournal, TurnRecord
 from synapse.prompt import build_system_prompt
 
+# B5: the authoritative set of dispatchable tool names — dispatch never resolves anything else.
+_VALID_TOOL_NAMES = frozenset(s.name for s in ALL_SCHEMAS)
+
 
 class LLMClient(Protocol):
     async def complete(self, messages: list[dict[str, Any]], tools: list[Any]) -> tuple[str, list[ToolCall]]:
@@ -87,7 +90,10 @@ class DispatcherTurnLoop:
         return await self._llm.complete(messages, ALL_SCHEMAS)
 
     async def _dispatch_tool(self, call: ToolCall) -> Any:
-        handler = getattr(self._handlers, call.name, None)
+        # B5: dispatch ONLY the declared tools. A hallucinated/adversarial name that collides with
+        # a real ToolHandlers method (e.g. `begin_turn`) must NOT be `getattr`'d and invoked —
+        # validate against the ALL_SCHEMAS allowlist first, not just "is it an attribute".
+        handler = getattr(self._handlers, call.name, None) if call.name in _VALID_TOOL_NAMES else None
         if handler is None:
             result: Any = {"error": f"unknown tool {call.name}"}
         else:

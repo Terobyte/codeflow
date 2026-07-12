@@ -107,12 +107,26 @@ class SynapseConfig:
             kwargs["kora_enabled"] = e["KORA_ENABLED"].strip().lower() not in ("false", "0", "no", "")
         if e.get("KORA_MODEL"):
             kwargs["kora_model"] = e["KORA_MODEL"]
-        if e.get("KORA_MAX_TURNS"):
-            kwargs["kora_max_turns"] = int(e["KORA_MAX_TURNS"])
-        if "KORA_MAX_BUDGET_USD" in e and e["KORA_MAX_BUDGET_USD"].strip():
-            kwargs["kora_max_budget_usd"] = float(e["KORA_MAX_BUDGET_USD"])
-        if e.get("KORA_DEADLINE_S"):
-            kwargs["kora_deadline_s"] = float(e["KORA_DEADLINE_S"])
+        # B4: a malformed numeric env var must fall back to the dataclass default, never crash
+        # the whole app at startup. Parse defensively; only override kwargs on a clean parse.
+        def _num(key: str, parse):
+            raw = e.get(key)
+            if raw is None or not str(raw).strip():
+                return None
+            try:
+                return parse(raw)
+            except (ValueError, TypeError):
+                return None
+
+        turns = _num("KORA_MAX_TURNS", int)
+        if turns is not None:
+            kwargs["kora_max_turns"] = turns
+        budget = _num("KORA_MAX_BUDGET_USD", float)
+        if budget is not None:
+            kwargs["kora_max_budget_usd"] = budget
+        deadline = _num("KORA_DEADLINE_S", float)
+        if deadline is not None:
+            kwargs["kora_deadline_s"] = deadline
         return cls(**kwargs)
 
     def validate_voice_keys(self) -> None:

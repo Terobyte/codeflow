@@ -30,6 +30,10 @@ from pipecat_ai_prebuilt.frontend import PipecatPrebuiltUI
 
 from synapse.pipeline.app import SynapseHost, build_session_pipeline
 
+# B8: hard cap on pending (started-but-not-yet-offered) handshake sessions — bounds the
+# memory a bare-/start flood can claim. Generous for a single-client demo.
+_MAX_PENDING_SESSIONS = 128
+
 
 def build_web_app(host: SynapseHost) -> FastAPI:
     """FastAPI app: POST/PATCH /api/offer drive pipecat's SmallWebRTC signaling, the prebuilt
@@ -115,6 +119,13 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             data = {}
         session_id = str(uuid.uuid4())
         active_sessions[session_id] = data.get("body", {})
+        # B8: a /start with no follow-up offer is only popped via run_session's finally (reached
+        # only by a completed offer), so a bare-/start flood (tab-close, ICE fail, curl loop)
+        # would grow this unbounded. Cap it, evicting the oldest pending handshake (dict preserves
+        # insertion order). The demo has ~1 concurrent client, so a legit /start→offer is never
+        # evicted before its offer arrives.
+        while len(active_sessions) > _MAX_PENDING_SESSIONS:
+            active_sessions.pop(next(iter(active_sessions)))
         result: dict = {"sessionId": session_id}
         if data.get("enableDefaultIceServers"):
             result["iceConfig"] = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}

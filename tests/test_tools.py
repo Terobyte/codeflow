@@ -47,11 +47,12 @@ async def test_dedup_latch_makes_same_turn_retry_a_noop(tmp_path):
     handlers, store, journal, speaks = make_handlers(tmp_path)
     handlers.begin_turn("t1")
     r1 = await handlers.submit_task(text="удали старое")
-    # simulate an intra-turn cascade retry re-invoking the SAME tool call with different args
-    r2 = await handlers.submit_task(text="удали совсем другое")
+    # B14: a real intra-turn cascade retry re-invokes the SAME tool call with the SAME args — that
+    # is the case the dedup latch exists for, and it must return the first result as a no-op.
+    # (A DIFFERENT-args same-name call must NOT dedup — proven separately in test_b14.)
+    r2 = await handlers.submit_task(text="удали старое")
     assert r1 == r2
     assert sum(1 for s in speaks if "удали старое" in s) == 1
-    assert sum(1 for s in speaks if "другое" in s) == 0
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ runs live voice, including test_pipeline_smoke).
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from pipecat.frames.frames import TTSSpeakFrame
@@ -36,6 +37,8 @@ from synapse.dispatcher.tools import ALL_SCHEMAS, KoraBridge, ToolHandlers, regi
 from synapse.journal import AlertKind, TurnJournal
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
 from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook, make_guarded_assistant_aggregator
+
+logger = logging.getLogger(__name__)
 
 
 class SynapseHost:
@@ -125,19 +128,39 @@ class SynapseHost:
             except RuntimeError:
                 self.arbiter_policy.push_speak(text)
                 return
-            asyncio.ensure_future(self.push_speak_frame(text))
+            fut = asyncio.ensure_future(self.push_speak_frame(text))
+            # B9: without a done-callback, a raise inside push_speak_frame (queue_frame on a task
+            # torn down mid-emit) is never retrieved AND the ledger was already marked spoken
+            # (line above) — so the dropped critical produces neither audio nor a
+            # CRITICAL_WITHOUT_SPEAK alert. Surface the failure instead of swallowing it.
+            fut.add_done_callback(self._on_speak_frame_done)
         else:
             self.arbiter_policy.push_speak(text)
+
+    def _on_speak_frame_done(self, fut: "asyncio.Future[Any]") -> None:
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+        if exc is not None:
+            logger.warning("push_speak_frame injection failed; SPEAK dropped: %r", exc)
 
     async def monitor_forever(self) -> None:
         """R8: periodically drives speak_ledger.check()/store.liveness() so the Р-15г/Р-11
         invariants fire even between turns, not only incidentally when a turn happens to run."""
         while True:
             await asyncio.sleep(self.cfg.heartbeat_interval_s)
-            now = self.clock.now()
-            for kind, detail in self.speak_ledger.check(now, self.cfg.critical_speak_window_s):
-                self.journal.alert(AlertKind(kind), detail)
-            self.store.liveness(now, self.cfg.stale_after_s, self.cfg.unreachable_after_s)
+            # B2: one transient failure in the loop body (e.g. journal.alert's os.fsync raising)
+            # must NOT permanently kill this task — it is the SOLE voice-path driver of the Р-15г
+            # CRITICAL_WITHOUT_SPEAK check. Log and keep looping; only CancelledError stops it.
+            try:
+                now = self.clock.now()
+                for kind, detail in self.speak_ledger.check(now, self.cfg.critical_speak_window_s):
+                    self.journal.alert(AlertKind(kind), detail)
+                self.store.liveness(now, self.cfg.stale_after_s, self.cfg.unreachable_after_s)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("monitor_forever iteration failed; continuing")
 
 
 def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:

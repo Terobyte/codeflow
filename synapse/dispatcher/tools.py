@@ -129,6 +129,10 @@ def _confirm_result_to_dict(res: ConfirmResult) -> dict[str, Any]:
 class _DedupEntry:
     turn_id: str
     result: dict[str, Any]
+    # B14: the dedup latch exists for an intra-turn cascade RETRY that re-issues the SAME call.
+    # Keying on tool name alone silently collapsed two DIFFERENT same-name calls in one turn
+    # (submit "A" then submit "B" → B returned A's result). Include the arguments in the match.
+    args: dict[str, Any]
 
 
 class ToolHandlers:
@@ -141,12 +145,16 @@ class ToolHandlers:
     def begin_turn(self, turn_id: str) -> None:
         self._current_turn_id = turn_id
 
-    async def _guarded(self, name: str, fn: Callable[[], Any]) -> tuple[dict[str, Any], bool]:
+    async def _guarded(
+        self, name: str, args: dict[str, Any], fn: Callable[[], Any]
+    ) -> tuple[dict[str, Any], bool]:
         entry = self._dedup.get(name)
-        if entry is not None and entry.turn_id == self._current_turn_id:
+        # B14: a dedup hit requires SAME turn AND SAME args — a retry re-issues identical args;
+        # a genuinely different same-name call must execute, not return the prior result.
+        if entry is not None and entry.turn_id == self._current_turn_id and entry.args == args:
             return entry.result, True
         result = await fn()
-        self._dedup[name] = _DedupEntry(turn_id=self._current_turn_id or "", result=result)
+        self._dedup[name] = _DedupEntry(turn_id=self._current_turn_id or "", result=result, args=args)
         return result, False
 
     async def submit_task(self, text: str) -> dict[str, Any]:
@@ -161,7 +169,7 @@ class ToolHandlers:
                 self.bridge.on_task_committed(res.task_id, text)
             return _submit_result_to_dict(res)
 
-        result, deduped = await self._guarded("submit_task", _do)
+        result, deduped = await self._guarded("submit_task", {"text": text}, _do)
         self._journal.record_tool_call("submit_task", {"text": text}, {**result, "deduped": deduped})
         return result
 
@@ -178,7 +186,7 @@ class ToolHandlers:
                     self.bridge.on_task_committed(task.id, task.text)
             return _confirm_result_to_dict(res)
 
-        result, deduped = await self._guarded("confirm_task", _do)
+        result, deduped = await self._guarded("confirm_task", {"decision": decision}, _do)
         self._journal.record_tool_call("confirm_task", {"decision": decision}, {**result, "deduped": deduped})
         return result
 
@@ -195,7 +203,7 @@ class ToolHandlers:
                 self.bridge.on_cancel()
             return {"outcome": "cancel_requested" if ok else "no_active_task"}
 
-        result, deduped = await self._guarded("request_cancel", _do)
+        result, deduped = await self._guarded("request_cancel", {}, _do)
         self._journal.record_tool_call("request_cancel", {}, {**result, "deduped": deduped})
         return result
 
@@ -204,7 +212,7 @@ class ToolHandlers:
             ok = self.bridge.on_answer(text) if self.bridge.on_answer else False
             return {"outcome": "answer_delivered" if ok else "no_pending_question"}
 
-        result, deduped = await self._guarded("answer_kora", _do)
+        result, deduped = await self._guarded("answer_kora", {"text": text}, _do)
         self._journal.record_tool_call("answer_kora", {"text": text}, {**result, "deduped": deduped})
         return result
 

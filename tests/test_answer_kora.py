@@ -323,7 +323,9 @@ async def test_answer_kora_dedup_within_turn(tmp_path):
     handlers.begin_turn(record.turn_id)
 
     r1 = await handlers.answer_kora(text="раз")
-    r2 = await handlers.answer_kora(text="два")  # same turn → deduped, on_answer NOT called again
+    # B14: a genuine same-turn retry re-issues the SAME text → deduped, on_answer NOT called again.
+    # (A different answer in the same turn — a correction — must NOT dedup; see test_b14.)
+    r2 = await handlers.answer_kora(text="раз")
 
     assert r1 == r2
     assert calls == ["раз"]

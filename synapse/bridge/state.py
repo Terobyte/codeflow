@@ -233,7 +233,10 @@ class TaskStore:
             self._task.events.append(event)
             self._task.last_event_ts = event.ts
             new_status = self._EVENT_STATUS.get(event.type)
-            if new_status is not None:
+            # B3: never overwrite a terminal status — a second ResultMessage / a task_failed after
+            # task_completed (the SDK stream loop has no break) must not flip COMPLETED→FAILED or
+            # resurrect a finished task to RUNNING. Mirrors the guard in set_task_status (Bug 6).
+            if new_status is not None and self._task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                 self._task.status = new_status
         self._persist()
 

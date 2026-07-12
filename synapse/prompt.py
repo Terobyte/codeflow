@@ -61,16 +61,29 @@ OWED_RULE_9 = (
 )
 
 
+def _require_replace(text: str, anchor: str, replacement: str) -> str:
+    """B6: anchor-insertion must FAIL LOUD, not silently drop the OWED safety rules. A plain
+    `str.replace` is a no-op when its anchor drifts (a stray edit to PROMPT_V3), which would
+    strip rules 7/8/9 + possibilities г/д from the system prompt with no error while
+    `include_owed_prompt_rules` still reports True. Raise instead."""
+    if anchor not in text:
+        raise ValueError(f"prompt anchor drifted — OWED insertion would silently no-op: {anchor!r}")
+    return text.replace(anchor, replacement)
+
+
 def _apply_owed_additions(base: str) -> str:
-    text = base.replace(
+    text = _require_replace(
+        base,
         "а) принять новую задачу и передать её Коре;",
         OWED_POSSIBILITY_A_REFINED,
     )
-    text = text.replace(
+    text = _require_replace(
+        text,
         "в) передать Коре запрос на отмену задачи.",
         "в) передать Коре запрос на отмену задачи;\n" + OWED_POSSIBILITY_G + "\n" + OWED_POSSIBILITY_D,
     )
-    text = text.replace(
+    text = _require_replace(
+        text,
         "6. Не предлагай и не изображай действий вне списка возможностей. Если просят "
         "недоступное — скажи, что этого не умеешь, и предложи доступное (например, передать "
         "запрос Коре).",
