@@ -68,7 +68,7 @@ _SAFE_META_TOOLS = frozenset({"ToolSearch", "TodoWrite"})
 # secret — deny it for every file tool BEFORE the in-workspace allow. macOS APFS is
 # case-INSENSITIVE (Read(".ENV") opens .env bytes while resolve() preserves the typed case),
 # so every comparison below is CASEFOLDED. The secret VALUE is never read → never logged.
-_SECRET_DIR_SEGMENTS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".git"})
+_SECRET_DIR_SEGMENTS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".git", ".config", "keychains"})
 # B22: exact-name matches accept rare false positives (a fixture literally named token.txt goes
 # dark) — deny-only precedent set by "credentials".
 _SECRET_FILE_NAMES = frozenset(
@@ -78,6 +78,9 @@ _SECRET_FILE_NAMES = frozenset(
         "secrets.yaml", "secrets.yml", "secrets.json", "secrets.toml", "token.txt", "tokens.txt",
         "apikey.txt", "api_key.txt", "service-account.json", ".pgpass", "settings.local.json",
         "local.settings.json",
+        # UI v2 S12: запись в шелл-конфиг = persistence; ".config"-сегмент принимает редкие
+        # false positives (deny-only, прецедент B22).
+        ".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile",
     }
 )
 _SECRET_FILE_STEMS = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk"})
