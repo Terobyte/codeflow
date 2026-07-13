@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Синапс</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0b0f14">
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./reconnect.js"></script>
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Синапс</h1>
+    <div id="kora-dot" title="Кора: статус неизвестен"></div>
+  </header>
+  <main>
+    <button id="agent-btn" type="button">🎙 Открыть агента</button>
+    <p id="conn-status">не подключено</p>
+    <section id="threads-section" hidden>
+      <h2>Треды</h2>
+      <ul id="threads-list"></ul>
+    </section>
+    <section id="projects-section" hidden>
+      <h2>Проекты</h2>
+      <ul id="projects-list"></ul>
+    </section>
+    <p class="links"><a href="./logs">лента Коры</a> · <a href="./dev/">dev-консоль</a></p>
+  </main>
+  <audio id="bot-audio" autoplay playsinline></audio>
+</body>
+</html>
