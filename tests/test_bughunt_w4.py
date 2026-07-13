@@ -1,7 +1,7 @@
 """Bug-hunt wave-4 RED regression tests — monitor liveness alert, HTTP-date Retry-After,
 WebRTC setup-window cleanup leak.
 
-Frozen tree per bugs.md (Wave 3 done at 193 tests). One test per bug ID; each asserts the
+Frozen tree per bugs-archive-2026-07-12.md (Wave 3 done at 193 tests). One test per bug ID; each asserts the
 *post-fix* behavior, so all three FAIL RED against the current (unfixed) code, and each is
 written to fail AT ITS OWN ASSERTION — never on import/collection/fixture.
 

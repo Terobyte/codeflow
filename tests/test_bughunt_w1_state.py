@@ -1,7 +1,7 @@
 """Wave-1 bug-hunt regression tests (B1, B3, B14).
 
 Each test asserts the CORRECT post-fix behavior, so it is RED on the frozen `a8dd919` tree
-and turns green once the fix lands. See bugs.md for the full analysis of each ID.
+and turns green once the fix lands. See bugs-archive-2026-07-12.md for the full analysis of each ID.
 """
 import pytest
 

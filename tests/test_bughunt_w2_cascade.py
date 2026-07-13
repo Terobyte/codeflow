@@ -1,7 +1,7 @@
 """Wave-2 bug-hunt regression tests — cascade money/breaker layer.
 
 FAILING (red) tests that pin the intended POST-FIX behavior for three Wave-2 defects
-documented in bugs.md (Wave 2 section):
+documented in bugs-archive-2026-07-12.md (Wave 2 section):
 
 - B32  breaker.py:39  — `Retry-After: 0` (or negative) leaves the dead tier instantly
        selectable (`until == now`), causing a failover-to-self livelock. Fix floors the

@@ -1,6 +1,6 @@
 """Bug-hunt wave-1 RED regression tests — dispatcher + WebRTC teardown/leak.
 
-Frozen tree `a8dd919` (see bugs.md). One test per bug ID; each asserts the *post-fix*
+Frozen tree `a8dd919` (see bugs-archive-2026-07-12.md). One test per bug ID; each asserts the *post-fix*
 behavior, so all three FAIL RED against the current (unfixed) code. They are written to fail
 at their OWN assertion, not on import/collection/fixture.
 

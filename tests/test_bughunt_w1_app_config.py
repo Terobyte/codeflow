@@ -1,6 +1,6 @@
 """Wave-1 bug-hunt regression tests (FAILING/red until the fixes land).
 
-One test per bug ID from bugs.md, each asserting POST-FIX behavior so it fails RED against
+One test per bug ID from bugs-archive-2026-07-12.md, each asserting POST-FIX behavior so it fails RED against
 tree `a8dd919`:
 
   B4 -- config.from_env: a malformed KORA_MAX_TURNS must fall back to the default, not crash.

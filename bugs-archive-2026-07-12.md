@@ -1,4 +1,7 @@
-# Synapse — bug hunt (M1 slices 0-4), 2026-07-12
+# Synapse — bug hunt (M1 slices 0-4), 2026-07-12 — АРХИВ
+
+**Охота завершена: 5 волн, 31 фикс, суита 173→230 (финальный коммит `6f663e0`).**
+Незакрытый остаток (B15/B35/B13-grounding/B31/B11/B16) перенесён в `plan.md` §4 — здесь только история.
 
 Tree frozen at `a8dd919` (173 tests green). 6 parallel hunters × distinct lenses. IDs immutable.
 Severity: CRIT = crash/data-loss/security · MAJOR = wrong behavior on real input · MINOR = edge.

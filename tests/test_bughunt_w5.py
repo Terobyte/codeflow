@@ -2,7 +2,7 @@
 critical-registration hoist, secret-path coverage, WebRTC /start body parsing, config empty-env
 handling, MockLLM affirm/deny word-set overreach, journal close-guard, monitor-task leak.
 
-Frozen tree per bugs.md (Wave 4 done at 196 tests). One (or a small cluster of) test(s) per bug
+Frozen tree per bugs-archive-2026-07-12.md (Wave 4 done at 196 tests). One (or a small cluster of) test(s) per bug
 ID; each asserts the *post-fix* behavior, written to fail AT ITS OWN ASSERTION on unpatched code
 — never on import/collection/fixture.
 
