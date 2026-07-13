@@ -422,7 +422,7 @@ class KoraRunner:
         # the /client/logs feed freezes while the traffic light (a separate path) keeps working.
         if self._log_sink is not None:
             try:
-                self._log_sink({"ts": self._clock.now(), "kind": "task", "text": text})
+                self._log_sink({"ts": self._clock.now(), "kind": "task", "text": text, "task_id": task_id})
             except Exception:  # noqa: BLE001
                 pass
         async with self._client_factory(opts) as client:
@@ -436,7 +436,7 @@ class KoraRunner:
                 if self._log_sink is not None:
                     try:
                         for entry in _message_to_log_entries(msg, ts):
-                            self._log_sink(entry)
+                            self._log_sink({**entry, "task_id": task_id})
                     except Exception:  # noqa: BLE001
                         pass
                 for event in _message_to_events(msg, task_id, text, ts, seq_gen):

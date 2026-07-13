@@ -229,9 +229,19 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # персистит метаданные синхронно в точках переходов (находка G).
     threads = ThreadStore(clock, Path(cfg.journal_dir) / "threads", feed_max=cfg.thread_feed_max)
     voice_thread: dict = {"id": None}
+
+    def _kora_log_sink(entry: dict) -> None:
+        # Горячий кэш live-стрима (ring) + правда на диске (S3). Исключения глотает
+        # вызывающая сторона (_stream) — display-путь не валит ран по конструкции.
+        kora_log.append(entry)
+        tid = entry.get("task_id")
+        th = threads.thread_for_task(tid) if tid else None
+        if th is not None:
+            threads.append_feed(th.id, entry)
+
     kora_runner = (
         KoraRunner(cfg, store, speak_ledger, clock, journal, on_speak,
-                   log_sink=kora_log.append, on_run_finished=threads.set_outcome)
+                   log_sink=_kora_log_sink, on_run_finished=threads.set_outcome)
         if cfg.kora_enabled
         else None
     )

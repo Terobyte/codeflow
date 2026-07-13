@@ -119,3 +119,27 @@ async def test_voice_submit_gets_auto_thread(tmp_path):
     task_id, thread_id = started[0]
     assert threads.thread_for_task(task_id).id == thread_id
     assert threads.get(thread_id).title.startswith("создай файл")
+
+
+async def test_feed_writer_persists_kora_entries_by_task(tmp_path):
+    clock = FakeClock()
+    store = TaskStore(clock)
+    threads = ThreadStore(clock, tmp_path / "threads")
+    th = threads.create("тред")
+    threads.append_task(th.id, "t1")
+
+    def sink(entry: dict) -> None:  # копия wiring-а build_host
+        tid = entry.get("task_id")
+        target = threads.thread_for_task(tid) if tid else None
+        if target is not None:
+            threads.append_feed(target.id, entry)
+
+    cfg = SynapseConfig(kora_workspace_dir=str(tmp_path / "ws"))
+    runner = KoraRunner(cfg, store, SpeakLedger(), clock,
+                        TurnJournal(str(tmp_path / "j"), clock), None,
+                        client_factory=_OkClient, log_sink=sink)
+    store.start_task("t1", "задача", TaskStatus.RUNNING, 0.0)
+    await runner._run("t1", "задача", RunSpec(thread_id=th.id))
+
+    feed = ThreadStore(FakeClock(), tmp_path / "threads").read_feed(th.id)  # рестарт
+    assert feed and feed[0]["kind"] == "task" and feed[0]["task_id"] == "t1"
