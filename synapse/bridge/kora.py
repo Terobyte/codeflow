@@ -314,6 +314,7 @@ class KoraRunner:
         on_speak: Callable[[str], None] | None,
         client_factory: Callable[[Any], Any] | None = None,
         log_sink: Callable[[dict[str, Any]], None] | None = None,
+        on_run_finished: Callable[[str, str], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._store = store
@@ -325,6 +326,8 @@ class KoraRunner:
         # Display-only feed for the /client/logs page — kora status UI (tero run 2026-07-12).
         # None → feature unwired (tests, console); the runner never depends on it.
         self._log_sink = log_sink
+        # UI-2 (находка G): колбэк исхода запуска → тред. None → feature unwired (тесты без тредов).
+        self._on_run_finished = on_run_finished
         self._active: asyncio.Task[None] | None = None
         # M1 slice 3 (E5): while Kora's stream is blocked in the gate on an AskUserQuestion, this
         # holds the future the dispatcher's answer_kora resolves. None whenever no question is
@@ -398,6 +401,16 @@ class KoraRunner:
                 self._run_root = None
                 self._run_model = None
             self._terminalize_if_running(task_id)
+            # UI-2 (находка G): исход запуска → тред. Источник — терминальный статус стора
+            # ПОСЛЕ terminalize; чужой task в сторе (суперсид) → исход не наш, молчим.
+            if self._on_run_finished is not None and spec.thread_id:
+                task = self._store.task
+                if task is not None and task.id == task_id:
+                    outcome = {
+                        TaskStatus.COMPLETED: "completed",
+                        TaskStatus.FAILED: "failed",
+                    }.get(task.status, "cancelled")
+                    self._on_run_finished(spec.thread_id, outcome)
 
     async def _stream(self, task_id: str, text: str) -> None:
         opts = self._build_options(task_id, text)

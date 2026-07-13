@@ -50,3 +50,72 @@ def test_corrupt_thread_json_is_skipped_not_fatal(tmp_path):
     (tmp_path / "broken.json").write_text("{oops", encoding="utf-8")
     ts = ThreadStore(FakeClock(), tmp_path, feed_max=5)
     assert ts.list() == []
+
+
+import asyncio  # noqa: E402
+
+from synapse.bridge.kora import KoraRunner  # noqa: E402
+from synapse.bridge.runspec import RunSpec  # noqa: E402
+from synapse.bridge.state import SpeakLedger, TaskStatus, TaskStore  # noqa: E402
+from synapse.config import SynapseConfig  # noqa: E402
+from synapse.journal import TurnJournal  # noqa: E402
+
+
+class _OkClient:
+    """Скриптованный клиент: один ResultMessage-подобный no-op — ран завершается сам."""
+    def __init__(self, opts): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *exc): return False
+    async def query(self, text): pass
+    async def receive_response(self):
+        if False:
+            yield None
+
+
+async def test_run_finished_reports_thread_outcome(tmp_path):
+    clock = FakeClock()
+    store = TaskStore(clock)
+    outcomes = []
+    cfg = SynapseConfig(kora_workspace_dir=str(tmp_path / "ws"))
+    runner = KoraRunner(cfg, store, SpeakLedger(), clock, TurnJournal(str(tmp_path / "j"), clock),
+                        None, client_factory=_OkClient,
+                        on_run_finished=lambda thread_id, outcome: outcomes.append((thread_id, outcome)))
+    store.start_task("t1", "задача", TaskStatus.RUNNING, 0.0)
+    await runner._run("t1", "задача", RunSpec(thread_id="th9"))
+    # пустой стрим без task_completed → терминализация в FAILED → исход failed
+    assert outcomes == [("th9", "failed")]
+
+
+from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier  # noqa: E402
+from synapse.dispatcher.tools import KoraBridge, ToolHandlers  # noqa: E402
+
+
+async def test_voice_submit_gets_auto_thread(tmp_path):
+    clock = FakeClock()
+    store = TaskStore(clock)
+    journal = TurnJournal(str(tmp_path / "j"), clock)
+    cfg = SynapseConfig()
+    classifier = KeywordClassifier(cfg.destructive_keywords)
+    confirm = ConfirmFlow(store, clock, classifier, journal, cfg.affirm_words,
+                          cfg.deny_words, cfg.max_rereadbacks, cfg.confirm_timeout_s)
+    threads = ThreadStore(clock, tmp_path / "threads")
+    voice_thread = {"id": None}
+    started = []
+
+    def _committed(task_id, text):
+        th = threads.get(voice_thread["id"]) if voice_thread["id"] else None
+        if th is None:
+            th = threads.create(title=text)
+            voice_thread["id"] = th.id
+        threads.append_task(th.id, task_id)
+        started.append((task_id, th.id))
+
+    bridge = KoraBridge(store=store, confirm_flow=confirm, clock=clock, cfg=cfg,
+                        on_task_committed=_committed)
+    handlers = ToolHandlers(bridge, journal)
+    handlers.begin_turn("turn-1")
+    res = await handlers.submit_task(text="создай файл заметок")
+    assert res["outcome"] == "committed"
+    task_id, thread_id = started[0]
+    assert threads.thread_for_task(task_id).id == thread_id
+    assert threads.get(thread_id).title.startswith("создай файл")

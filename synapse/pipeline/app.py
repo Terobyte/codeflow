@@ -26,8 +26,11 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 from pipecat.services.fish.tts import FishAudioTTSService
 
+from pathlib import Path
+
 from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
 from synapse.bridge.kora import KoraRunner
+from synapse.bridge.runspec import RunSpec
 from synapse.bridge.state import Liveness, SpeakLedger, TaskStore
 from synapse.cascade.breaker import CircuitBreaker
 from synapse.cascade.services import CostCap, build_tier_services
@@ -38,6 +41,7 @@ from synapse.dispatcher.tools import ALL_SCHEMAS, KoraBridge, ToolHandlers, regi
 from synapse.journal import AlertKind, TurnJournal
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
 from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook, make_guarded_assistant_aggregator
+from synapse.threads import ThreadStore
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,8 @@ class SynapseHost:
         cost_cap: CostCap,
         kora_runner: KoraRunner | None = None,
         kora_log: deque | None = None,
+        threads: Any = None,
+        voice_thread: dict | None = None,
     ) -> None:
         self.clock = clock
         self.cfg = cfg
@@ -91,6 +97,9 @@ class SynapseHost:
         # 2026-07-12). Stored RAW like kora_runner (None when unwired, e.g. host stubs in
         # tests); the single reader (the route) guards for None at the call site.
         self.kora_log = kora_log
+        # UI v2 слайс UI-2: треды (ThreadStore) + текущий голосовой тред (mut dict — меняют роуты).
+        self.threads = threads
+        self.voice_thread = voice_thread if voice_thread is not None else {"id": None}
         # M1 slice 2 (the one NON-long-lived field, see class docstring): the currently live
         # per-connection PipelineTask, or None when no client is connected.
         self._output_task: Any = None
@@ -215,11 +224,25 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # kora_log: display-only лента «размышлений Коры» (kora status UI, tero run 2026-07-12) —
     # ring buffer на хосте, кормится log_sink'ом раннера, читается роутом /client/kora-log.
     kora_log: deque = deque(maxlen=cfg.kora_log_max)
+    # UI v2 слайс UI-2: треды. Автотред голосового submit: у голоса всегда есть текущий
+    # тред (UI-3 даст клиенту его выбирать); нет → создаётся из текста задачи. Тред-стор
+    # персистит метаданные синхронно в точках переходов (находка G).
+    threads = ThreadStore(clock, Path(cfg.journal_dir) / "threads", feed_max=cfg.thread_feed_max)
+    voice_thread: dict = {"id": None}
     kora_runner = (
-        KoraRunner(cfg, store, speak_ledger, clock, journal, on_speak, log_sink=kora_log.append)
+        KoraRunner(cfg, store, speak_ledger, clock, journal, on_speak,
+                   log_sink=kora_log.append, on_run_finished=threads.set_outcome)
         if cfg.kora_enabled
         else None
     )
+
+    def _on_task_committed(task_id: str, text: str) -> None:
+        th = threads.get(voice_thread["id"]) if voice_thread["id"] else None
+        if th is None:
+            th = threads.create(title=text)
+            voice_thread["id"] = th.id
+        threads.append_task(th.id, task_id)
+        kora_runner.start(task_id, text, RunSpec(thread_id=th.id, project_root=None))
 
     bridge = KoraBridge(
         store=store,
@@ -227,7 +250,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         clock=clock,
         on_speak=on_speak,
         cfg=cfg,
-        on_task_committed=kora_runner.start if kora_runner else None,
+        on_task_committed=_on_task_committed if kora_runner else None,
         on_cancel=kora_runner.request_cancel if kora_runner else None,
         on_answer=kora_runner.provide_answer if kora_runner else None,
     )
@@ -256,6 +279,8 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         cost_cap=cost_cap,
         kora_runner=kora_runner,
         kora_log=kora_log,
+        threads=threads,
+        voice_thread=voice_thread,
     )
     _h["host"] = host  # fills the on_speak holder -- must precede any runtime SPEAK
     return host
