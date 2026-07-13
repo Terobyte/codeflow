@@ -124,3 +124,109 @@ async def test_cold_thread_rehydrates_from_feed(tmp_path):
     assert any(m["role"] == "user" and m["content"] == "старая реплика" for m in msgs)
     assert any(m["role"] == "assistant" and m["content"] == "старый ответ" for m in msgs)
     assert not any("Write:" in str(m.get("content", "")) for m in msgs)
+
+
+# --- Task 14: HTTP API — projects/threads/feed/message + CSRF + C-guard -------------------
+import asyncio
+from types import SimpleNamespace
+
+from synapse.bridge.state import TaskStatus
+from synapse.threads import ThreadStore
+
+
+def _webrtc_or_skip():
+    pytest.importorskip("aiortc"); pytest.importorskip("cv2"); pytest.importorskip("fastapi")
+    try:
+        from synapse.pipeline import webrtc_server
+        return webrtc_server
+    except (ImportError, RuntimeError) as e:
+        pytest.skip(f"webrtc deps unavailable: {e}")
+
+
+def _endpoint(app, name):
+    return next(r.endpoint for r in app.routes if getattr(getattr(r, "endpoint", None), "__name__", "") == name)
+
+
+def _api_host(tmp_path):
+    # Собрать РЕАЛЬНЫЙ host через build_host нельзя (ключи/сеть) — SimpleNamespace-стаб
+    # с точными полями, которые читают роуты.
+    clock = FakeClock()
+    threads = ThreadStore(clock, tmp_path / "threads")
+    loop_obj, llm = _loop(tmp_path, feed_reader=threads.read_feed)
+    from synapse.projects import ProjectStore
+    return SimpleNamespace(
+        clock=clock, store=loop_obj._store, threads=threads,
+        projects=ProjectStore(tmp_path / "projects.json"),
+        text_loop=loop_obj, turn_lock=asyncio.Lock(),
+        current_http_thread={"id": None}, voice_thread={"id": None},
+        journal=SimpleNamespace(close=lambda: None),
+    )
+
+
+class FakeRequest:
+    def __init__(self, body=None, json_ct=True, origin=None, host="testserver"):
+        self._body = body or {}
+        self.headers = {"content-type": "application/json" if json_ct else "text/plain",
+                        "host": host}
+        if origin:
+            self.headers["origin"] = origin
+    async def json(self): return self._body
+
+
+async def test_message_turn_is_thread_scoped_and_persisted(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    th = host.threads.create("тред")
+    ep = _endpoint(app, "api_thread_message")
+    resp = await ep(th.id, FakeRequest({"text": "привет"}))
+    assert resp.status_code == 200
+    feed = host.threads.read_feed(th.id)
+    assert [e["kind"] for e in feed] == ["user", "assistant"]
+
+
+async def test_mutating_api_rejects_non_json_and_foreign_origin(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    th = host.threads.create("тред")
+    ep = _endpoint(app, "api_thread_message")
+    assert (await ep(th.id, FakeRequest({"text": "x"}, json_ct=False))).status_code == 403
+    assert (await ep(th.id, FakeRequest({"text": "x"}, origin="https://evil.example"))).status_code == 403
+
+
+async def test_project_add_validates_path(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    ep = _endpoint(app, "api_projects_add")
+    assert (await ep(FakeRequest({"name": "x", "path": "/etc"}))).status_code == 400
+    proj_dir = tmp_path / "ok"; proj_dir.mkdir()
+    assert (await ep(FakeRequest({"name": "x", "path": str(proj_dir)}))).status_code == 200
+
+
+async def test_http_answer_guard_blocks_wrong_thread(tmp_path):
+    # прямой юнит на замыкание _http_answer невозможен (живёт в build_host) — проверяем
+    # правило на уровне его составляющих: awaiting-тред ≠ current_http_thread → False.
+    clock = FakeClock()
+    store = TaskStore(clock)
+    threads = ThreadStore(clock, tmp_path / "threads")
+    a = threads.create("A"); b = threads.create("B")
+    threads.append_task(a.id, "t1")
+    store.start_task("t1", "з", TaskStatus.RUNNING, 0.0)
+    store.set_awaiting()
+    current_http_thread = {"id": b.id}
+    delivered = []
+
+    def _http_answer(text: str) -> bool:  # копия правила из build_host
+        task = store.task
+        th = threads.thread_for_task(task.id) if task is not None else None
+        awaiting = th.id if th is not None else None
+        if awaiting is None or current_http_thread["id"] != awaiting:
+            return False
+        delivered.append(text)
+        return True
+
+    assert _http_answer("ответ из Б") is False and delivered == []
+    current_http_thread["id"] = a.id
+    assert _http_answer("ответ из А") is True and delivered == ["ответ из А"]

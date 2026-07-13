@@ -77,6 +77,10 @@ class SynapseHost:
         kora_log: deque | None = None,
         threads: Any = None,
         voice_thread: dict | None = None,
+        projects: Any = None,
+        text_loop: Any = None,
+        turn_lock: asyncio.Lock | None = None,
+        current_http_thread: dict | None = None,
     ) -> None:
         self.clock = clock
         self.cfg = cfg
@@ -100,6 +104,11 @@ class SynapseHost:
         # UI v2 слайс UI-2: треды (ThreadStore) + текущий голосовой тред (mut dict — меняют роуты).
         self.threads = threads
         self.voice_thread = voice_thread if voice_thread is not None else {"id": None}
+        # UI v2 слайс UI-3: проекты, текстовый ход, очередь ходов, текущий HTTP-тред.
+        self.projects = projects
+        self.text_loop = text_loop
+        self.turn_lock = turn_lock or asyncio.Lock()
+        self.current_http_thread = current_http_thread if current_http_thread is not None else {"id": None}
         # M1 slice 2 (the one NON-long-lived field, see class docstring): the currently live
         # per-connection PipelineTask, or None when no client is connected.
         self._output_task: Any = None
@@ -246,6 +255,34 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         else None
     )
 
+    # UI v2 слайс UI-3: текстовый канал + проекты. C-guard (спека §4, находка C):
+    # answer_kora доставляет ответ ТОЛЬКО когда ход идёт в треде awaiting-запуска.
+    from synapse.projects import ProjectStore
+    projects = ProjectStore(Path(cfg.journal_dir) / "projects.json")
+    turn_lock = asyncio.Lock()
+    current_http_thread: dict = {"id": None}
+
+    def _awaiting_thread_id() -> str | None:
+        task = store.task
+        th = threads.thread_for_task(task.id) if task is not None else None
+        return th.id if th is not None else None
+
+    def _voice_answer(text: str) -> bool:
+        if kora_runner is None:
+            return False
+        awaiting = _awaiting_thread_id()
+        if awaiting is not None and voice_thread["id"] not in (None, awaiting):
+            return False  # голос стоит в чужом треде — ответ Коре не отсюда
+        return kora_runner.provide_answer(text)
+
+    def _http_answer(text: str) -> bool:
+        if kora_runner is None:
+            return False
+        awaiting = _awaiting_thread_id()
+        if awaiting is None or current_http_thread["id"] != awaiting:
+            return False  # реплика из треда Б не должна улетать ответом Коре в А
+        return kora_runner.provide_answer(text)
+
     def _on_task_committed(task_id: str, text: str) -> None:
         th = threads.get(voice_thread["id"]) if voice_thread["id"] else None
         if th is None:
@@ -262,9 +299,45 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         cfg=cfg,
         on_task_committed=_on_task_committed if kora_runner else None,
         on_cancel=kora_runner.request_cancel if kora_runner else None,
-        on_answer=kora_runner.provide_answer if kora_runner else None,
+        on_answer=_voice_answer if kora_runner else None,
     )
     handlers = ToolHandlers(bridge, journal)
+
+    # S7: HTTP-канал — СВОЙ ToolHandlers/bridge (дедуп _current_turn_id не делится с голосом),
+    # но store/confirm — синглтоны.
+    http_bridge = KoraBridge(
+        store=store, confirm_flow=confirm_flow, clock=clock, cfg=cfg,
+        on_speak=on_speak,
+        on_task_committed=None,
+        on_cancel=kora_runner.request_cancel if kora_runner else None,
+        on_answer=_http_answer if kora_runner else None,
+    )
+
+    def _http_task_committed(task_id: str, text: str) -> None:
+        tid = current_http_thread["id"]
+        th = threads.get(tid) if tid else None
+        if th is None:
+            th = threads.create(title=text)
+        threads.append_task(th.id, task_id)
+        root = None
+        if th.project_id:
+            proj = projects.get(th.project_id)
+            root = proj["path"] if proj else None
+        kora_runner.start(task_id, text, RunSpec(thread_id=th.id, project_root=root))
+
+    if kora_runner is not None:
+        http_bridge.on_task_committed = _http_task_committed
+    http_handlers = ToolHandlers(http_bridge, journal)
+
+    text_loop = None
+    if cfg.anthropic_api_key:
+        from synapse.dispatcher.llm_client import AnthropicLLMClient
+        from synapse.dispatcher.loop import DispatcherTurnLoop
+        text_loop = DispatcherTurnLoop(
+            AnthropicLLMClient(cfg.anthropic_api_key, cfg.tier2_model),
+            http_handlers, confirm_flow, store, journal, clock, cfg,
+            thread_feed_reader=threads.read_feed,
+        )
 
     # breaker needs only the tier COUNT, not the service instances themselves -- those are
     # per-connection (build_session_pipeline rebuilds them fresh every reconnect, since a
@@ -291,6 +364,10 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         kora_log=kora_log,
         threads=threads,
         voice_thread=voice_thread,
+        projects=projects,
+        text_loop=text_loop,
+        turn_lock=turn_lock,
+        current_http_thread=current_http_thread,
     )
     _h["host"] = host  # fills the on_speak holder -- must precede any runtime SPEAK
     return host
@@ -349,10 +426,14 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
         # and `record_tool_call` no-ops so the tool audit is empty. (Closing the turn with
         # check_grounding/end_turn — capturing the assistant text + turn end in the frame flow —
         # is the remaining grounding-wiring work, needs live-mic verification.)
-        record = host.journal.begin_turn(transcript)
-        host.handlers.begin_turn(record.turn_id)
-        # R3: every user turn must reach confirm_flow.note_user_turn() before the LLM runs.
-        host.confirm_flow.note_user_turn(transcript, host.clock.now())
+        # UI-3 (S7): очередь ходов — HTTP-ход (POST message) не начнётся посреди открытия
+        # голосового. Residual (Parking lot): хвост голосового хода (tool-вызовы в
+        # pipecat-потоке) живёт после отпуска лока — полная сериализация = pipecat-хирургия.
+        async with host.turn_lock:
+            record = host.journal.begin_turn(transcript)
+            host.handlers.begin_turn(record.turn_id)
+            # R3: every user turn must reach confirm_flow.note_user_turn() before the LLM runs.
+            host.confirm_flow.note_user_turn(transcript, host.clock.now())
 
     context = LLMContext(tools=ALL_SCHEMAS)
     # S1: replicate LLMContextAggregatorPair's own __init__ recipe (user first, then the

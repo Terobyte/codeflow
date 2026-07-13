@@ -345,5 +345,92 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def client_status_widget_js():
         return Response(content=_status_widget_js_bytes, media_type="text/javascript")
 
+    # UI v2 слайс UI-3: API тредов/проектов. Анти-CSRF (S4): tailnet — сетевая граница,
+    # не браузерная; мутирующий /api/* требует JSON content-type (HTML-форма не может)
+    # + Origin/Referer против Host.
+    def _csrf_ok(request: Request) -> bool:
+        if not request.headers.get("content-type", "").startswith("application/json"):
+            return False
+        origin = request.headers.get("origin") or request.headers.get("referer") or ""
+        if origin:
+            from urllib.parse import urlparse
+            if urlparse(origin).netloc != request.headers.get("host", ""):
+                return False
+        return True
+
+    def _thread_dict(t) -> dict:
+        return {"id": t.id, "title": t.title, "project_id": t.project_id, "stage": t.stage,
+                "last_outcome": t.last_outcome, "updated_ts": t.updated_ts,
+                "created_ts": t.created_ts}
+
+    @app.get("/api/projects")
+    async def api_projects_list():
+        return JSONResponse({"projects": host.projects.list()})
+
+    @app.post("/api/projects")
+    async def api_projects_add(request: Request):
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        from synapse.projects import ProjectValidationError
+        data = await request.json()
+        try:
+            proj = await host.projects.add(str(data.get("name") or ""), str(data.get("path") or ""))
+        except ProjectValidationError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse(proj)
+
+    @app.get("/api/threads")
+    async def api_threads_list():
+        return JSONResponse({"threads": [_thread_dict(t) for t in host.threads.list()]})
+
+    @app.post("/api/threads")
+    async def api_threads_create(request: Request):
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        data = await request.json()
+        t = host.threads.create(str(data.get("title") or "новый тред"),
+                                project_id=data.get("project_id"))
+        return JSONResponse(_thread_dict(t))
+
+    @app.get("/api/threads/{thread_id}/feed")
+    async def api_thread_feed(thread_id: str, limit: int = 200):
+        if host.threads.get(thread_id) is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        return JSONResponse({"entries": host.threads.read_feed(thread_id, limit=limit)})
+
+    @app.post("/api/threads/{thread_id}/message")
+    async def api_thread_message(thread_id: str, request: Request):
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        if host.text_loop is None:
+            return JSONResponse({"error": "text turns disabled (no anthropic key)"}, status_code=503)
+        if host.threads.get(thread_id) is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        data = await request.json()
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"error": "empty text"}, status_code=400)
+        async with host.turn_lock:  # S7: одна очередь ходов на хост
+            host.current_http_thread["id"] = thread_id
+            try:
+                record, reply = await host.text_loop.ingest_user_turn(text, thread_id=thread_id)
+            finally:
+                host.current_http_thread["id"] = None
+        now = host.clock.now()
+        host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
+        host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": reply})
+        return JSONResponse({"reply": reply})
+
+    @app.post("/api/active-thread")
+    async def api_active_thread(request: Request):
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        data = await request.json()
+        tid = data.get("id")
+        if tid is not None and host.threads.get(str(tid)) is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        host.voice_thread["id"] = str(tid) if tid else None
+        return JSONResponse({"ok": True})
+
     app.mount("/client/dev", PipecatPrebuiltUI, name="client-dev")
     return app

@@ -420,5 +420,10 @@ def test_app_wires_on_answer_to_provide_answer(tmp_path):
     )
     host = build_host(cfg)
     assert host.kora_runner is not None
-    # bound-method equality: same __self__/__func__.
-    assert host.bridge.on_answer == host.kora_runner.provide_answer
+    # UI-3 (находка C): голосовой on_answer больше не прямой provide_answer — между ними
+    # тред-guard _voice_answer (ответ доставляется только из треда awaiting-запуска).
+    # Голос без выбранного треда (voice_thread None) проходит guard насквозь.
+    assert host.bridge.on_answer is not None
+    assert host.bridge.on_answer.__name__ == "_voice_answer"
+    # без awaiting-задачи доставка честно отказывает — guard делегировал в provide_answer
+    assert host.bridge.on_answer("ответ") is False
