@@ -89,6 +89,9 @@ ALL_SCHEMAS = [
 class ToolCall:
     name: str
     arguments: dict[str, Any]
+    # UI-3: id вызова из LLM-ответа — нужен для канонического tool_use/tool_result-шейпа
+    # истории (Anthropic Messages API); мок-пути оставляют "".
+    id: str = ""
 
 
 @dataclass

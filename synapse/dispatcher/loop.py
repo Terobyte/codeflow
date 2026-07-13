@@ -76,6 +76,15 @@ class DispatcherTurnLoop:
         # model keeps chaining tools, bounded by _MAX_TOOL_PASSES; on cap exhaustion the tail
         # tool_calls are dropped (same behavior the old 2-pass shape had on pass 2).
         while tool_calls and passes < _MAX_TOOL_PASSES:
+            # UI-3: канонический шейп — tool-результату предшествует assistant-ход с
+            # tool_use-анонсом (без него Anthropic Messages API отклоняет историю).
+            self._history.append({
+                "role": "assistant",
+                "content": text or "",
+                "tool_calls": [
+                    {"id": c.id, "name": c.name, "arguments": c.arguments} for c in tool_calls
+                ],
+            })
             for call in tool_calls:
                 await self._dispatch_tool(call)
             text, tool_calls = await self._complete()
@@ -109,7 +118,8 @@ class DispatcherTurnLoop:
         else:
             result = await handler(**call.arguments)
         self._history.append(
-            {"role": "tool", "name": call.name, "content": json.dumps(result, ensure_ascii=False)}
+            {"role": "tool", "tool_call_id": call.id, "name": call.name,
+             "content": json.dumps(result, ensure_ascii=False)}
         )
         return result
 
