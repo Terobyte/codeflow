@@ -48,7 +48,10 @@ async function connectVoice() {
       onConnected: () => { setConn("подключено — говори"); setMic(true); },
       onDisconnected: () => { setConn(""); setMic(false); client = null; },
       onTrackStarted: (track, participant) => {
-        if (track.kind === "audio" && participant && !participant.local) {
+        // SmallWebRTCTransport зовёт onTrackStarted(track) БЕЗ participant для
+        // remote-треков (vendor: `onTrackStarted?.(n.track)`), local через этот
+        // колбэк не ходит вовсе — «participant &&» молча выбрасывал аудио бота.
+        if (track.kind === "audio" && !participant?.local) {
           botAudio.srcObject = new MediaStream([track]);
         }
       },
