@@ -86,6 +86,8 @@ class SynapseConfig:
     # Дисплей-лента «размышлений Коры» /client/logs — размер ring-buffer на хосте
     # (kora status UI, tero run 2026-07-12).
     kora_log_max: int = 500
+    # UI v2 (S3/S32): кап файла истории треда, аналог kora_log_max.
+    thread_feed_max: int = 2000
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SynapseConfig":
