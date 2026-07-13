@@ -5,3 +5,4 @@ __pycache__/
 journals/
 journals-staging/
 *.egg-info/
+.playwright-mcp/
