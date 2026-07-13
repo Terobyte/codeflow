@@ -43,6 +43,8 @@ class TurnRecord:
     turn_id: str
     ts: float
     transcript: str
+    # UI-3 (спека §4, находка A): тред, в котором шёл ход. Ставится в loop.ingest_user_turn.
+    thread_id: str = ""
     llm_output: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tts_texts: list[str] = field(default_factory=list)

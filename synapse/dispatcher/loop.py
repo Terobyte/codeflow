@@ -9,7 +9,7 @@ is known).
 from __future__ import annotations
 
 import json
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from synapse.bridge.confirm import ConfirmFlow
 from synapse.bridge.state import TaskStore
@@ -46,6 +46,7 @@ class DispatcherTurnLoop:
         clock: Clock,
         cfg: SynapseConfig,
         task_dictionary: dict[str, str] | None = None,
+        thread_feed_reader: Callable[[str], list[dict]] | None = None,
     ) -> None:
         self._llm = llm
         self._handlers = handlers
@@ -55,20 +56,41 @@ class DispatcherTurnLoop:
         self._clock = clock
         self._cfg = cfg
         self._task_dictionary = task_dictionary or {}
-        self._history: list[dict[str, Any]] = []
+        # UI-3 (спека §4, находка A): пер-тред контекст. История LLM ключуется по треду.
+        self._thread_feed_reader = thread_feed_reader
+        self._histories: dict[str, list[dict[str, Any]]] = {}
 
-    async def ingest_user_turn(self, transcript: str) -> tuple[TurnRecord, str]:
+    def _history_for(self, thread_id: str) -> list[dict[str, Any]]:
+        """Пер-тред контекст (спека §4, находка A): история LLM ключуется по треду.
+        Холодный тред регидрируется из персиста РЕПЛИК (kind user/assistant) — кора-шаги
+        display-only и в LLM-контекст не попадают НИКОГДА (NO-EXFIL)."""
+        hist = self._histories.get(thread_id)
+        if hist is None:
+            hist = []
+            if self._thread_feed_reader is not None:
+                for e in self._thread_feed_reader(thread_id):
+                    kind = e.get("kind")
+                    if kind == "user":
+                        hist.append({"role": "user", "content": str(e.get("text", ""))})
+                    elif kind == "assistant":
+                        hist.append({"role": "assistant", "content": str(e.get("text", ""))})
+            self._histories[thread_id] = hist
+        return hist
+
+    async def ingest_user_turn(self, transcript: str, thread_id: str = "voice") -> tuple[TurnRecord, str]:
         now = self._clock.now()
         record = self._journal.begin_turn(transcript)
+        record.thread_id = thread_id
         self._handlers.begin_turn(record.turn_id)
 
         # R3: MUST run before the LLM call — half (a) of Р-16's double-key confirm check.
         self._confirm_flow.note_user_turn(transcript, now)
 
         had_active_task = self._store.has_active_task()
-        self._history.append({"role": "user", "content": transcript})
+        history = self._history_for(thread_id)
+        history.append({"role": "user", "content": transcript})
 
-        text, tool_calls = await self._complete()
+        text, tool_calls = await self._complete(history)
         record.llm_output = text
         passes = 0
         # Р-2: a tool turn needs at least one more completion with the tool results in context —
@@ -78,7 +100,7 @@ class DispatcherTurnLoop:
         while tool_calls and passes < _MAX_TOOL_PASSES:
             # UI-3: канонический шейп — tool-результату предшествует assistant-ход с
             # tool_use-анонсом (без него Anthropic Messages API отклоняет историю).
-            self._history.append({
+            history.append({
                 "role": "assistant",
                 "content": text or "",
                 "tool_calls": [
@@ -86,29 +108,29 @@ class DispatcherTurnLoop:
                 ],
             })
             for call in tool_calls:
-                await self._dispatch_tool(call)
-            text, tool_calls = await self._complete()
+                await self._dispatch_tool(call, history)
+            text, tool_calls = await self._complete(history)
             if text:
                 record.llm_output = text
             passes += 1
 
         if text:
-            self._history.append({"role": "assistant", "content": text})
+            history.append({"role": "assistant", "content": text})
 
         record.latency_ms = (self._clock.now() - now) * 1000.0
         self._journal.check_grounding(record, had_active_task)
         return record, text
 
-    async def _complete(self) -> tuple[str, list[ToolCall]]:
+    async def _complete(self, history: list[dict[str, Any]]) -> tuple[str, list[ToolCall]]:
         state_block = self._render_state(self._clock.now())
         system_prompt = build_system_prompt(self._cfg, self._task_dictionary)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt + "\n\n" + state_block},
-            *self._history,
+            *history,
         ]
         return await self._llm.complete(messages, ALL_SCHEMAS)
 
-    async def _dispatch_tool(self, call: ToolCall) -> Any:
+    async def _dispatch_tool(self, call: ToolCall, history: list[dict[str, Any]]) -> Any:
         # B5: dispatch ONLY the declared tools. A hallucinated/adversarial name that collides with
         # a real ToolHandlers method (e.g. `begin_turn`) must NOT be `getattr`'d and invoked —
         # validate against the ALL_SCHEMAS allowlist first, not just "is it an attribute".
@@ -117,7 +139,7 @@ class DispatcherTurnLoop:
             result: Any = {"error": f"unknown tool {call.name}"}
         else:
             result = await handler(**call.arguments)
-        self._history.append(
+        history.append(
             {"role": "tool", "tool_call_id": call.id, "name": call.name,
              "content": json.dumps(result, ensure_ascii=False)}
         )

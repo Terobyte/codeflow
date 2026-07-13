@@ -63,3 +63,64 @@ async def test_complete_round_trips_tool_results_as_blocks():
                                      "input": {"text": "x"}}
     assert msgs[2]["content"][0]["type"] == "tool_result"   # user: tool_result с тем же id
     assert msgs[2]["content"][0]["tool_use_id"] == "tu_1"
+
+
+from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
+from synapse.bridge.state import TaskStore
+from synapse.config import SynapseConfig
+from synapse.dispatcher.loop import DispatcherTurnLoop
+from synapse.dispatcher.tools import KoraBridge, ToolHandlers
+from synapse.journal import TurnJournal
+
+
+class FakeClock:
+    def __init__(self, t=0.0): self.t = t
+    def now(self): return self.t
+
+
+class ScriptedLLM:
+    """Возвращает текст с эхом ПОСЛЕДНЕЙ user-реплики и числа реплик в истории."""
+    def __init__(self): self.seen = []
+    async def complete(self, messages, tools):
+        self.seen.append(messages)
+        users = [m for m in messages if m["role"] == "user"]
+        return f"ok:{users[-1]['content']}:{len(users)}", []
+
+
+def _loop(tmp_path, feed_reader=None):
+    clock = FakeClock()
+    cfg = SynapseConfig()
+    store = TaskStore(clock)
+    journal = TurnJournal(str(tmp_path / "j"), clock)
+    confirm = ConfirmFlow(store, clock, KeywordClassifier(cfg.destructive_keywords), journal,
+                          cfg.affirm_words, cfg.deny_words, cfg.max_rereadbacks, cfg.confirm_timeout_s)
+    handlers = ToolHandlers(KoraBridge(store=store, confirm_flow=confirm, clock=clock, cfg=cfg), journal)
+    llm = ScriptedLLM()
+    return DispatcherTurnLoop(llm, handlers, confirm, store, journal, clock, cfg,
+                              thread_feed_reader=feed_reader), llm
+
+
+async def test_histories_are_isolated_per_thread(tmp_path):
+    loop, llm = _loop(tmp_path)
+    await loop.ingest_user_turn("привет из А", thread_id="thA")
+    await loop.ingest_user_turn("привет из Б", thread_id="thB")
+    record, reply = await loop.ingest_user_turn("ещё из А", thread_id="thA")
+    # история треда А: 2 user-реплики, реплика Б НЕ просочилась
+    assert reply == "ok:ещё из А:2"
+    assert record.thread_id == "thA"
+    a_msgs = llm.seen[-1]
+    assert not any("из Б" in str(m.get("content", "")) for m in a_msgs)
+
+
+async def test_cold_thread_rehydrates_from_feed(tmp_path):
+    feed = {"thX": [
+        {"kind": "user", "text": "старая реплика"},
+        {"kind": "assistant", "text": "старый ответ"},
+        {"kind": "tool_use", "text": "Write: ..."},   # кора-шаг — НЕ регидрируется (NO-EXFIL)
+    ]}
+    loop, llm = _loop(tmp_path, feed_reader=lambda tid: feed.get(tid, []))
+    _, reply = await loop.ingest_user_turn("новая", thread_id="thX")
+    msgs = llm.seen[-1]
+    assert any(m["role"] == "user" and m["content"] == "старая реплика" for m in msgs)
+    assert any(m["role"] == "assistant" and m["content"] == "старый ответ" for m in msgs)
+    assert not any("Write:" in str(m.get("content", "")) for m in msgs)

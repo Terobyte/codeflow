@@ -73,7 +73,8 @@ async def test_b5_unknown_tool_name_colliding_with_real_method_is_rejected(tmp_p
     crashed: Exception | None = None
     result = None
     try:
-        result = await loop._dispatch_tool(call)
+        # UI-3: _dispatch_tool теперь принимает history (пер-тред контекст) — передаём список.
+        result = await loop._dispatch_tool(call, [])
     except Exception as exc:  # current code: begin_turn() runs, then `await None` → TypeError
         crashed = exc
 
