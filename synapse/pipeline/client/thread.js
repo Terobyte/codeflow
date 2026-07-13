@@ -51,6 +51,7 @@ async function pollStatus() {
   if (!res.ok) { dot.style.background = "#888"; return; }
   const data = await res.json();
   dot.style.background = COLORS[data.color] || "#888";
+  dot.title = (data.task_text ? "Кора: " + data.task_text : "Кора: нет задачи") + " · " + data.liveness;
 }
 
 send.addEventListener("click", async () => {
