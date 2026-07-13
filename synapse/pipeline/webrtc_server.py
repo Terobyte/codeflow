@@ -250,6 +250,8 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     _app_js_bytes = (_CLIENT_DIR / "app.js").read_bytes()
     _style_css_bytes = (_CLIENT_DIR / "style.css").read_bytes()
     _vendor_pipecat_bytes = (_CLIENT_DIR / "vendor" / "pipecat.mjs").read_bytes()
+    _thread_html_bytes = (_CLIENT_DIR / "thread.html").read_bytes()
+    _thread_js_bytes = (_CLIENT_DIR / "thread.js").read_bytes()
     # static-ассеты (manifest/иконки/reconnect/logs/status-widget) живы — роуты для них ниже.
     _manifest_bytes = (_STATIC_DIR / "manifest.webmanifest").read_bytes()
     _reconnect_js_bytes = (_STATIC_DIR / "reconnect.js").read_bytes()
@@ -278,6 +280,14 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     @app.get("/client/vendor/pipecat.mjs")
     async def client_vendor_pipecat():
         return Response(content=_vendor_pipecat_bytes, media_type="text/javascript")
+
+    @app.get("/client/thread")
+    async def client_thread():
+        return Response(content=_thread_html_bytes, media_type="text/html")
+
+    @app.get("/client/thread.js")
+    async def client_thread_js():
+        return Response(content=_thread_js_bytes, media_type="text/javascript")
 
     @app.get("/client/manifest.webmanifest")
     async def client_manifest():

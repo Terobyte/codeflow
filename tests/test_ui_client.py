@@ -112,5 +112,23 @@ def test_all_exact_client_routes_registered_before_dev_mount():
         "client_icon_192", "client_icon_512", "client_apple_touch_icon", "session_alive",
         "kora_status", "kora_log_feed", "client_logs", "client_status_widget_js",
         "client_app_js", "client_style_css", "client_vendor_pipecat",
+        "client_thread", "client_thread_js",
     ):
         assert idx[name] < mount_i, f"{name} must be registered BEFORE the /client/dev mount (S24)"
+
+
+def test_thread_page_wires_feed_and_message_and_is_xss_safe():
+    body = (CLIENT_DIR / "thread.html").read_text(encoding="utf-8")
+    for token in ("thread.js", "style.css", "feed-list", "msg-input", "msg-send", "← назад"):
+        assert token in body
+    js = (CLIENT_DIR / "thread.js").read_text(encoding="utf-8")
+    for token in ("/feed", "/message", "active-thread", "textContent", "visibilitychange",
+                  "application/json", "🧠"):
+        assert token in js
+    assert "innerHTML" not in js and "innerHTML" not in body
+
+
+def test_home_lists_threads_and_projects():
+    js = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
+    for token in ("/api/threads", "/api/projects", "threads-list", "projects-list", "./thread?id="):
+        assert token in js

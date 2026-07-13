@@ -62,3 +62,63 @@ btn.addEventListener("click", async () => {
     client = null;
   }
 });
+
+// UI v2 слайс UI-3: дом наполняет списки тредов/проектов. Дом = голос на авто-треде:
+// открытие дома сбрасывает активный тред.
+fetch("/api/active-thread", { method: "POST", headers: { "content-type": "application/json" },
+                              body: JSON.stringify({ id: null }) }).catch(() => {});
+
+async function addProject() {
+  // prompt() допустим v1 (план UI-3 Task 15); форма — полировка UI-4.
+  const name = prompt("Имя проекта:");
+  if (name === null) return;
+  const path = prompt("Абсолютный путь к директории проекта:");
+  if (!path) return;
+  await fetch("/api/projects", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, path }),
+  }).catch(() => {});
+  loadLists();
+}
+
+async function loadLists() {
+  try {
+    const [tRes, pRes] = await Promise.all([
+      fetch("/api/threads", { cache: "no-store" }), fetch("/api/projects", { cache: "no-store" }),
+    ]);
+    if (tRes.ok) {
+      const { threads } = await tRes.json();
+      const ul = document.getElementById("threads-list");
+      ul.replaceChildren();
+      threads.slice(0, 20).forEach((t) => {
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.href = "./thread?id=" + encodeURIComponent(t.id);
+        a.textContent = (t.last_outcome === "failed" ? "✖ " : "") + t.title;
+        li.appendChild(a);
+        ul.appendChild(li);
+      });
+      document.getElementById("threads-section").hidden = threads.length === 0;
+    }
+    if (pRes.ok) {
+      const { projects } = await pRes.json();
+      const ul = document.getElementById("projects-list");
+      ul.replaceChildren();
+      projects.forEach((p) => {
+        const li = document.createElement("li");
+        li.textContent = p.name;
+        ul.appendChild(li);
+      });
+      const addLi = document.createElement("li");
+      const addBtn = document.createElement("a");
+      addBtn.href = "#";
+      addBtn.textContent = "+ проект";
+      addBtn.addEventListener("click", (e) => { e.preventDefault(); addProject(); });
+      addLi.appendChild(addBtn);
+      ul.appendChild(addLi);
+      document.getElementById("projects-section").hidden = false;
+    }
+  } catch { /* сеть упала — дом остаётся пустым, не гадаем */ }
+}
+loadLists();
