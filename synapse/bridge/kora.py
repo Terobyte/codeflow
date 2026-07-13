@@ -30,6 +30,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from synapse.bridge.runspec import RunSpec
 from synapse.bridge.state import EventClass, KoraEvent, SpeakLedger, TaskStatus, TaskStore
 from synapse.clock import Clock
 from synapse.config import SynapseConfig
@@ -331,17 +332,24 @@ class KoraRunner:
         # try/finally under an identity guard, so a superseding run never clobbers the successor's
         # question (MAJOR-C1); `_run`'s finally stays terminalize-only.
         self._pending_answer: asyncio.Future[str] | None = None
+        # UI-2 (спека §3, находка B): per-run снапшот launch-параметров. Ставится в начале
+        # _run ДО создания клиента; ЕДИНСТВЕННЫЙ источник корня для _build_options /
+        # _system_prompt / _gate_decision на время рана. Владелец = task_id (identity-guard,
+        # как у _pending_answer): finally суперсиженного рана не трёт снапшот преемника.
+        self._run_owner: str | None = None
+        self._run_root: Path | None = None
+        self._run_model: str | None = None
 
     # --- launch / cancel (host-facing) -----------------------------------------------------
 
-    def start(self, task_id: str, text: str) -> None:
+    def start(self, task_id: str, text: str, spec: RunSpec | None = None) -> None:
         """Fire-and-forget launch on the live async loop. Supersede (cancel) any lingering run
         rather than refuse — refusing would leave the new task's store entry RUNNING with no
         producer (a zombie). If there is no running loop (console + kora_enabled, or a sync
         test), create_task raises RuntimeError → terminalize so we never strand RUNNING."""
         if self._active is not None and not self._active.done():
             self._active.cancel()
-        coro = self._run(task_id, text)
+        coro = self._run(task_id, text, spec or RunSpec(thread_id=""))
         try:
             self._active = asyncio.create_task(coro)
         except RuntimeError:
@@ -370,7 +378,14 @@ class KoraRunner:
 
     # --- run / stream ----------------------------------------------------------------------
 
-    async def _run(self, task_id: str, text: str) -> None:
+    async def _run(self, task_id: str, text: str, spec: RunSpec | None = None) -> None:
+        # Снапшот АТОМАРНО до создания клиента (спека §3): резолв project_root|null → путь
+        # происходит ровно один раз, здесь. None → дефолтный RunSpec (обратная совместимость
+        # существующих тестов, зовущих _run без spec).
+        spec = spec or RunSpec(thread_id="")
+        root = Path(spec.project_root) if spec.project_root else self._workspace()
+        self._run_owner, self._run_root = task_id, root
+        self._run_model = spec.model or self._cfg.kora_model
         try:
             await asyncio.wait_for(self._stream(task_id, text), self._cfg.kora_deadline_s)
         except Exception as exc:  # noqa: BLE001 — includes TimeoutError; CancelledError is a
@@ -378,6 +393,10 @@ class KoraRunner:
             # finally below still terminalizes. Any real error is alerted, never swallowed.
             self._journal.alert(AlertKind.KORA_RUN_FAILED, {"task_id": task_id, "error": repr(exc)})
         finally:
+            if self._run_owner == task_id:  # identity-guard: не трогать снапшот преемника
+                self._run_owner = None
+                self._run_root = None
+                self._run_model = None
             self._terminalize_if_running(task_id)
 
     async def _stream(self, task_id: str, text: str) -> None:
@@ -425,6 +444,11 @@ class KoraRunner:
         raw = self._cfg.kora_workspace_dir or os.path.expanduser("~/synapse-kora-workspace")
         return Path(raw)
 
+    def _current_root(self) -> Path:
+        """Один корень на все три головы (спека §3): во время рана — снапшот RunSpec;
+        вне рана (юнит-вызов options/гейта без _run) — конфиг-дефолт."""
+        return self._run_root if self._run_root is not None else self._workspace()
+
     def _system_prompt(self, workspace: Path, task_text: str) -> str:
         # LOAD-BEARING (§2d CASE 1): with setting_sources=[] Kora does not otherwise know its
         # cwd and will invent absolute paths that the gate then (correctly) denies. Naming the
@@ -448,7 +472,7 @@ class KoraRunner:
         from claude_agent_sdk import ClaudeAgentOptions
         from claude_agent_sdk.types import HookMatcher
 
-        workspace = self._workspace()
+        workspace = self._current_root()
         workspace.mkdir(parents=True, exist_ok=True)
         return ClaudeAgentOptions(
             cwd=str(workspace),
@@ -457,7 +481,7 @@ class KoraRunner:
             disallowed_tools=[],
             setting_sources=[],
             hooks={"PreToolUse": [HookMatcher(hooks=[self._pretool_hook], timeout=None)]},
-            model=self._cfg.kora_model,
+            model=self._run_model or self._cfg.kora_model,
             cli_path=self._cfg.kora_cli_path,
             max_turns=self._cfg.kora_max_turns,
             max_budget_usd=self._cfg.kora_max_budget_usd,
@@ -485,7 +509,7 @@ class KoraRunner:
             if tool_name in _READ_SEARCH_TOOLS:
                 return True, None, "allow"  # defaults to cwd, which is inside the workspace
             return False, f"missing_path: {tool_name}", "missing_path"
-        workspace = self._workspace()
+        workspace = self._current_root()
         p = Path(raw)
         if not p.is_absolute():
             p = workspace / p
