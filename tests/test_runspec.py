@@ -75,3 +75,29 @@ async def test_snapshot_cleared_after_run_with_identity_guard(tmp_path):
     store.start_task("t3", "з", TaskStatus.RUNNING, 0.0)
     await runner._run("t3", "з", RunSpec(thread_id="th1", project_root=str(captured["proj"])))
     assert runner._run_root is None and runner._run_owner is None
+
+
+import json as _json
+
+
+def test_boot_reconciles_running_zombie_to_failed(tmp_path):
+    clock = FakeClock()
+    store = TaskStore(clock, journal_dir=tmp_path)
+    store.start_task("z1", "зависшая", TaskStatus.RUNNING, 5.0)
+    # «крэш»: новый процесс поднимает тот же journal_dir
+    reborn = TaskStore(FakeClock(100.0), journal_dir=tmp_path)
+    assert reborn.task.status == TaskStatus.FAILED
+    assert not reborn.has_active_task()          # submit больше не режется навсегда
+    assert any("перезапуск" in str(e.payload) for e in reborn.task.events)
+    # реконсиляция ПЕРСИСТИТСЯ: третий бут видит уже терминальный статус
+    third = TaskStore(FakeClock(200.0), journal_dir=tmp_path)
+    assert third.task.status == TaskStatus.FAILED
+
+
+def test_boot_keeps_terminal_statuses_untouched(tmp_path):
+    clock = FakeClock()
+    store = TaskStore(clock, journal_dir=tmp_path)
+    store.start_task("c1", "готовая", TaskStatus.RUNNING, 5.0)
+    store.set_task_status(TaskStatus.COMPLETED)
+    reborn = TaskStore(FakeClock(100.0), journal_dir=tmp_path)
+    assert reborn.task.status == TaskStatus.COMPLETED

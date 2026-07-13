@@ -382,6 +382,24 @@ class TaskStore:
             self._task = None
             self._last_event_ts = None
             self._staged = None
+        # S13 (UI v2, слайс UI-2): зомби-реконсиляция бута. RUNNING в state.json на старте
+        # процесса = сервер умер посреди рана: живого продюсера после рестарта не существует
+        # по определению, а оставить как есть — liveness врёт OK и has_active_task() режет
+        # любой submit НАВСЕГДА. Это не resurrection (статус идёт В терминал, не из него);
+        # PENDING_CONFIRMATION/CANCEL_REQUESTED не трогаем — их чинит обычный флоу.
+        if self._task is not None and self._task.status == TaskStatus.RUNNING:
+            self._task.status = TaskStatus.FAILED
+            self._task.events.append(
+                KoraEvent(
+                    id=f"boot-reconcile-{self._task.id}",
+                    type="task_failed",
+                    cls=EventClass.NARRATABLE,
+                    payload={"reason": "сервер перезапускался"},
+                    speak_text=None,
+                    ts=self._clock.now(),
+                )
+            )
+            self._persist()
 
 
 @dataclass
