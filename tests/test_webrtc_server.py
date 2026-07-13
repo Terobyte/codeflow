@@ -32,7 +32,7 @@ def test_web_app_exposes_offer_routes_and_client_mount():
     assert ("/api/offer", "POST") in method_paths
     assert ("/api/offer", "PATCH") in method_paths
     assert ("/", "GET") in method_paths
-    assert any(isinstance(r, Mount) and r.path == "/client" for r in app.routes)
+    assert any(isinstance(r, Mount) and r.path == "/client/dev" for r in app.routes)
 
     # Regression (browser hung at "authenticating -> Unable to connect"): the prebuilt RTVI client
     # POSTs /start FIRST, then the SDP offer to /sessions/<id>/api/offer. A server missing either

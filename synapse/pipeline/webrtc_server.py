@@ -41,19 +41,6 @@ _MAX_PENDING_SESSIONS = 128
 # from the prebuilt bundle's own dist/ directory, which we read from but never write to.
 _STATIC_DIR = Path(__file__).parent / "static"
 
-# M1 slice 5 (§2.2): meta injected into the prebuilt bundle's <head> so /client installs as a
-# PWA (manifest + apple-touch-icon + A2HS meta) and picks up the reconnect watchdog, without
-# forking pipecat_ai_prebuilt's dist/ (a fork would need re-diffing on every pipecat upgrade).
-_PWA_HEAD = (
-    '<link rel="manifest" href="./manifest.webmanifest">'
-    '<link rel="apple-touch-icon" href="./apple-touch-icon.png">'
-    '<meta name="apple-mobile-web-app-capable" content="yes">'
-    '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
-    '<meta name="theme-color" content="#0b0f14">'
-    '<script defer src="./reconnect.js"></script>'
-    '<script defer src="./status-widget.js"></script>'
-)
-
 
 def _status_color(liveness: Liveness, task_status: TaskStatus | None, awaiting: bool) -> str:
     """Светофор Коры — kora status UI (tero run 2026-07-12). red > yellow > green;
@@ -255,41 +242,42 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def index():
         return RedirectResponse(url="/client/")
 
-    # M1 slice 5 (§2.2): PWA wrapper around the prebuilt bundle. `PipecatPrebuiltUI` (mounted
-    # below) is a `StaticFiles(directory=dist, html=True)` whose asset paths are RELATIVE
-    # (`./assets/...`), so serving a patched index.html from a route registered BEFORE the mount
-    # doesn't break asset loading — Starlette matches routes in registration order, so these win
-    # over the mount's own handling of the same paths. We wrap instead of forking dist/ (a fork
-    # would need re-diffing on every pipecat_ai_prebuilt upgrade). `html=True` StaticFiles serves
-    # BOTH "/client/" (its own index-serving fallback) and "/client/index.html" (the literal
-    # path) for the same file, so both are patched here or the second would still serve the
-    # unpatched original.
-    dist_index_path = Path(PipecatPrebuiltUI.directory) / "index.html"
-    dist_html = dist_index_path.read_text(encoding="utf-8")
-    patched_index = dist_html.replace("</head>", _PWA_HEAD + "</head>")
-    if patched_index == dist_html:
-        # B6: a silent no-op anchor replace must never pass as "patched" — dist/index.html's
-        # shape changing out from under us (a pipecat_ai_prebuilt upgrade) must fail loudly at
-        # build time, not silently ship a client with no manifest link.
-        raise RuntimeError("PWA head injection failed: no </head> anchor in dist/index.html")
-    _patched_index_bytes = patched_index.encode("utf-8")
+    # UI v2 слайс UI-1 (спека §4 «миграция»): /client/ отдаёт НАШ тонкий клиент; prebuilt
+    # уезжает НЕПАТЧЕННЫМ на /client/dev (тот же PipecatPrebuiltUI-объект). Инжекты слайса 5
+    # умирают вместе с патч-логикой: PWA-обёртка и реконнект теперь обязанность нашего index.
+    _CLIENT_DIR = Path(__file__).parent / "client"
+    _index_bytes = (_CLIENT_DIR / "index.html").read_bytes()
+    _app_js_bytes = (_CLIENT_DIR / "app.js").read_bytes()
+    _style_css_bytes = (_CLIENT_DIR / "style.css").read_bytes()
+    _vendor_pipecat_bytes = (_CLIENT_DIR / "vendor" / "pipecat.mjs").read_bytes()
+    # static-ассеты (manifest/иконки/reconnect/logs/status-widget) живы — роуты для них ниже.
     _manifest_bytes = (_STATIC_DIR / "manifest.webmanifest").read_bytes()
     _reconnect_js_bytes = (_STATIC_DIR / "reconnect.js").read_bytes()
     _icon_192_bytes = (_STATIC_DIR / "icon-192.png").read_bytes()
     _icon_512_bytes = (_STATIC_DIR / "icon-512.png").read_bytes()
     _apple_touch_icon_bytes = (_STATIC_DIR / "apple-touch-icon.png").read_bytes()
-    # kora status UI (tero run 2026-07-12): страница логов + виджет-светофор, тот же
-    # pre-read-bytes идиом, что и PWA-ассеты выше.
     _logs_html_bytes = (_STATIC_DIR / "logs.html").read_bytes()
     _status_widget_js_bytes = (_STATIC_DIR / "status-widget.js").read_bytes()
 
     @app.get("/client/")
     async def client_index():
-        return Response(content=_patched_index_bytes, media_type="text/html")
+        return Response(content=_index_bytes, media_type="text/html")
 
     @app.get("/client/index.html")
     async def client_index_html():
-        return Response(content=_patched_index_bytes, media_type="text/html")
+        return Response(content=_index_bytes, media_type="text/html")
+
+    @app.get("/client/app.js")
+    async def client_app_js():
+        return Response(content=_app_js_bytes, media_type="text/javascript")
+
+    @app.get("/client/style.css")
+    async def client_style_css():
+        return Response(content=_style_css_bytes, media_type="text/css")
+
+    @app.get("/client/vendor/pipecat.mjs")
+    async def client_vendor_pipecat():
+        return Response(content=_vendor_pipecat_bytes, media_type="text/javascript")
 
     @app.get("/client/manifest.webmanifest")
     async def client_manifest():
@@ -357,5 +345,5 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def client_status_widget_js():
         return Response(content=_status_widget_js_bytes, media_type="text/javascript")
 
-    app.mount("/client", PipecatPrebuiltUI, name="client")
+    app.mount("/client/dev", PipecatPrebuiltUI, name="client-dev")
     return app

@@ -1,5 +1,9 @@
 """M1 slice 5 — PWA manifest for /client (§2.2) + deterministic reconnect resync (§2.7).
 
+/client/ = наш клиент (UI v2 слайс UI-1); патч-инжект в prebuilt удалён, prebuilt непатченный
+на /client/dev. PWA-статика (manifest/иконки/reconnect-роуты) и §2.7-логика (session-alive,
+resync_greeting, SpeakLedger.unspoken, on_client_connected-wiring) живы — роуты не изменились.
+
 Plan v2 (run file `2026-07-12-synapse-slice5-pwa-reconnect.md` §5): the prebuilt bundle at
 /client is wrapped (not forked) to inject PWA meta into its index.html; a new
 `/client/session-alive` truth-endpoint replaces any wall-clock reload heuristic in
@@ -73,26 +77,6 @@ async def test_manifest_route_serves_pwa_fields():
 
 
 # ================================================================================================
-# §2.2 — /client/ AND /client/index.html both serve the patched bundle
-# ================================================================================================
-@pytest.mark.parametrize("endpoint_name", ["client_index", "client_index_html"])
-async def test_client_index_routes_are_patched_and_bundle_stays_intact(endpoint_name):
-    webrtc_server = _webrtc_server_or_skip()
-    app = webrtc_server.build_web_app(host=object())
-    resp = await _endpoint(app, endpoint_name)()
-
-    assert resp.status_code == 200
-    assert resp.media_type == "text/html"
-    body = resp.body.decode("utf-8")
-    assert 'rel="manifest"' in body
-    assert "apple-touch-icon" in body
-    assert "reconnect.js" in body
-    assert "apple-mobile-web-app-capable" in body
-    # the original prebuilt bundle's own relative asset script tag must survive the injection.
-    assert "./assets/index-" in body
-
-
-# ================================================================================================
 # §2.2 — icon routes: valid PNG bytes at the declared sizes
 # ================================================================================================
 @pytest.mark.parametrize(
@@ -143,23 +127,6 @@ async def test_session_alive_reflects_current_task_truth():
     current["task"] = object()
     resp2 = await _endpoint(app, "session_alive")()
     assert json.loads(resp2.body) == {"active": True}
-
-
-# ================================================================================================
-# §2.2 — B6 anchor-assert: a dist/index.html with no </head> fails build_web_app loudly
-# ================================================================================================
-def test_missing_head_anchor_in_dist_index_raises_runtime_error(tmp_path, monkeypatch):
-    webrtc_server = _webrtc_server_or_skip()
-    (tmp_path / "index.html").write_text("<html><body>no head tag here</body></html>", encoding="utf-8")
-    # R5: StaticFiles caches `all_directories` at __init__ — patching `.directory` alone does not
-    # refresh that cache, so any code path that touches actual file *serving* would still see the
-    # stale dist dir. build_web_app only ever reads `.directory` itself (never serves through the
-    # StaticFiles app object), so that staleness doesn't affect this test — noted for whoever
-    # next tries to make this monkeypatch drive real StaticFiles GETs too.
-    monkeypatch.setattr(webrtc_server.PipecatPrebuiltUI, "directory", str(tmp_path))
-
-    with pytest.raises(RuntimeError):
-        webrtc_server.build_web_app(host=object())
 
 
 # ================================================================================================

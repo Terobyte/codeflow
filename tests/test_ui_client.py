@@ -1,5 +1,6 @@
 """UI v2 слайс UI-1: вендор-бандл, наша статика /client, роут-своп, mount-order (S24/S26).
 Лексические проверки — паттерн test_kora_status_ui.py (никакого браузера в CI)."""
+import asyncio
 import re
 from pathlib import Path
 
@@ -53,3 +54,48 @@ def test_app_js_wires_voice_through_vendored_sdk():
         'webrtcUrl: "/api/offer"', "enableMic: true", "onTrackStarted", "MediaStream",
     ):
         assert token in body, f"app.js voice wiring missing {token!r}"
+
+
+def _webrtc_server_or_skip():
+    pytest.importorskip("aiortc"); pytest.importorskip("cv2"); pytest.importorskip("fastapi")
+    try:
+        from synapse.pipeline import webrtc_server
+        return webrtc_server
+    except (ImportError, RuntimeError) as e:
+        pytest.skip(f"webrtc deps unavailable: {e}")
+
+
+def _endpoint(app, name):
+    return next(r.endpoint for r in app.routes if getattr(getattr(r, "endpoint", None), "__name__", "") == name)
+
+
+async def _body(app, name):
+    resp = await _endpoint(app, name)()
+    return resp.body.decode("utf-8")
+
+
+async def test_client_root_serves_our_index_not_prebuilt():
+    webrtc_server = _webrtc_server_or_skip()
+    app = webrtc_server.build_web_app(host=object())
+    for name in ("client_index", "client_index_html"):
+        body = await _body(app, name)
+        assert "Открыть агента" in body      # наш клиент
+        assert "status-widget.js" not in body  # инжекты слайса 5 умерли вместе с патчем
+
+
+def test_prebuilt_mounted_unpatched_at_client_dev():
+    webrtc_server = _webrtc_server_or_skip()
+    from starlette.routing import Mount
+    app = webrtc_server.build_web_app(host=object())
+    mounts = [r for r in app.routes if isinstance(r, Mount)]
+    assert [m.path for m in mounts] == ["/client/dev"]
+    # тот же объект статики, что раньше жил на /client — значит dist отдается КАК ЕСТЬ
+    assert mounts[0].app is webrtc_server.PipecatPrebuiltUI
+
+
+def test_our_static_routes_exist():
+    webrtc_server = _webrtc_server_or_skip()
+    app = webrtc_server.build_web_app(host=object())
+    names = {getattr(getattr(r, "endpoint", None), "__name__", "") for r in app.routes}
+    for n in ("client_app_js", "client_style_css", "client_vendor_pipecat"):
+        assert n in names

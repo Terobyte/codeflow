@@ -449,11 +449,12 @@ async def test_kora_log_route_unwired_host_serves_empty():
 
 
 @pytest.mark.parametrize("endpoint_name", ["client_index", "client_index_html"])
-async def test_index_routes_inject_status_widget(endpoint_name):
+async def test_index_routes_serve_our_client(endpoint_name):
     webrtc_server = _webrtc_server_or_skip()
     app = webrtc_server.build_web_app(host=object())
     body = (await _endpoint(app, endpoint_name)()).body.decode("utf-8")
-    assert "status-widget.js" in body
+    assert "app.js" in body
+    assert "status-widget.js" not in body
 
 
 async def test_logs_route_serves_safe_html():
@@ -494,7 +495,7 @@ def test_new_routes_registered_before_client_mount():
         getattr(getattr(r, "endpoint", None), "__name__", None): i for i, r in enumerate(routes)
     }
     for name in ("kora_status", "kora_log_feed", "client_logs", "client_status_widget_js"):
-        assert idx[name] < mount_i, f"{name} must be registered BEFORE the /client mount"
+        assert idx[name] < mount_i, f"{name} must be registered BEFORE the /client/dev mount"
 
 
 # =========================================================================================
