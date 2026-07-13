@@ -33,3 +33,47 @@ footer { display: flex; gap: 8px; padding: 12px 0 4px; position: sticky; bottom:
   background: #121a24; color: #dbe4ee; cursor: pointer;
 }
 #thread-title { color: #8fa3b8; font-size: 14px; }
+
+/* дом «как Codex»: сайдбар проектов слева, треды в центре */
+#home { display: flex; min-height: 100dvh; padding: 0; }
+#sidebar {
+  width: 220px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+  padding: calc(env(safe-area-inset-top) + 4px) 12px 12px; border-right: 1px solid #16202c;
+}
+#side-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
+#projects-list { flex: 1; overflow-y: auto; }
+#projects-list li { color: #9fb2c6; }
+#add-project {
+  font: inherit; font-size: 14px; background: none; border: 1px dashed #223;
+  border-radius: 10px; color: #7fb3e8; padding: 10px; cursor: pointer;
+}
+#home main {
+  flex: 1; display: flex; flex-direction: column; gap: 14px;
+  padding: calc(env(safe-area-inset-top) + 12px) 16px 0;
+}
+#home #threads-list { flex: 1; overflow-y: auto; }
+#mic-btn {
+  font-size: 18px; padding: 12px 14px; border-radius: 12px; border: 1px solid #223;
+  background: #121a24; color: #dbe4ee; cursor: pointer;
+}
+@media (max-width: 640px) {
+  #home { flex-direction: column; }
+  #sidebar { width: auto; border-right: none; border-bottom: 1px solid #16202c; }
+  #projects-list { max-height: 26vh; }
+}
+
+/* пикер папки («+ проект») */
+#picker { position: fixed; inset: 0; background: rgba(0, 0, 0, .6); display: flex; align-items: center; justify-content: center; }
+#picker[hidden] { display: none; }
+#picker-panel {
+  background: #121a24; border: 1px solid #223; border-radius: 14px;
+  width: min(480px, 92vw); max-height: 80vh; display: flex; flex-direction: column; gap: 8px; padding: 14px;
+}
+#picker-path { color: #8fa3b8; font-size: 13px; margin: 0; word-break: break-all; }
+#picker-dirs { flex: 1; overflow-y: auto; }
+#picker-dirs li { cursor: pointer; }
+#picker-actions { display: flex; gap: 8px; }
+#picker-actions button {
+  flex: 1; font: inherit; font-size: 15px; padding: 10px; border-radius: 10px;
+  border: 1px solid #223; background: #0b0f14; color: #dbe4ee; cursor: pointer;
+}

@@ -29,9 +29,11 @@ def test_vendor_md_pins_versions_and_license():
 
 
 def test_our_index_is_pwa_wrapper_and_wires_our_scripts():
+    # «Открыть агента» умер намеренно (фидбек Теро 2026-07-13): голос = кнопка-микрофон
+    # в композере, дом = чат внизу.
     body = (CLIENT_DIR / "index.html").read_text(encoding="utf-8")
     for token in (
-        "Открыть агента", "manifest.webmanifest", "apple-touch-icon",
+        "mic-btn", "msg-input", "manifest.webmanifest", "apple-touch-icon",
         "reconnect.js", "app.js", "style.css", "kora-dot", "bot-audio",
         'lang="ru"', "viewport-fit=cover",
     ):
@@ -79,7 +81,7 @@ async def test_client_root_serves_our_index_not_prebuilt():
     app = webrtc_server.build_web_app(host=object())
     for name in ("client_index", "client_index_html"):
         body = await _body(app, name)
-        assert "Открыть агента" in body      # наш клиент
+        assert "mic-btn" in body               # наш клиент (маркер композера)
         assert "status-widget.js" not in body  # инжекты слайса 5 умерли вместе с патчем
 
 
@@ -132,3 +134,35 @@ def test_home_lists_threads_and_projects():
     js = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
     for token in ("/api/threads", "/api/projects", "threads-list", "projects-list", "./thread?id="):
         assert token in js
+
+
+def test_home_is_codex_layout_with_folder_picker():
+    """Фидбек Теро 2026-07-13: проекты слева, путь не вводится руками, мусорные слова убраны."""
+    body = (CLIENT_DIR / "index.html").read_text(encoding="utf-8")
+    for token in ("sidebar", "projects-list", "add-project", "picker-dirs", "picker-choose"):
+        assert token in body, f"index.html missing {token!r}"
+    assert "не подключено" not in body       # статус виден только когда есть что сказать
+    assert "лента Коры" not in body           # дебаг-ссылки убраны с дома (точка → ./logs)
+    js = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
+    for token in ("/api/browse", "encodeURIComponent(path)", "picker-choose"):
+        assert token in js
+    assert "prompt(" not in js                # абсолютный путь руками умер вместе с prompt()
+    assert "innerHTML" not in js
+
+
+def test_browse_dir_is_caged_to_home(tmp_path):
+    webrtc_server = _webrtc_server_or_skip()
+    home = tmp_path / "home"
+    (home / "Projects" / "app").mkdir(parents=True)
+    (home / ".ssh").mkdir()
+    (home / "notes.txt").write_text("x", encoding="utf-8")
+    # корень клетки: parent отсутствует, скрытые директории и файлы не показываются
+    root = webrtc_server._browse_dir(None, home)
+    assert root["path"] == str(home.resolve()) and root["parent"] is None
+    assert root["dirs"] == ["Projects"]
+    # спуск и подъём
+    inner = webrtc_server._browse_dir(str(home / "Projects"), home)
+    assert inner["dirs"] == ["app"] and inner["parent"] == str(home.resolve())
+    # побег из клетки (выше HOME, битый путь) молча приземляется на home
+    for escape in ("/", str(tmp_path), str(home / ".." / ".."), "/etc"):
+        assert webrtc_server._browse_dir(escape, home)["path"] == str(home.resolve())

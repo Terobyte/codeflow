@@ -13,24 +13,34 @@
   <script defer src="./reconnect.js"></script>
   <script type="module" src="./app.js"></script>
 </head>
-<body>
-  <header>
-    <h1>Синапс</h1>
-    <div id="kora-dot" title="Кора: статус неизвестен"></div>
-  </header>
+<body id="home">
+  <aside id="sidebar">
+    <div id="side-head">
+      <h1>Синапс</h1>
+      <div id="kora-dot" title="Кора"></div>
+    </div>
+    <ul id="projects-list"></ul>
+    <button id="add-project" type="button">+ проект</button>
+  </aside>
   <main>
-    <button id="agent-btn" type="button">🎙 Открыть агента</button>
-    <p id="conn-status">не подключено</p>
-    <section id="threads-section" hidden>
-      <h2>Треды</h2>
-      <ul id="threads-list"></ul>
-    </section>
-    <section id="projects-section" hidden>
-      <h2>Проекты</h2>
-      <ul id="projects-list"></ul>
-    </section>
-    <p class="links"><a href="./logs">лента Коры</a> · <a href="./dev/">dev-консоль</a></p>
+    <ul id="threads-list"></ul>
+    <p id="conn-status" hidden></p>
+    <footer>
+      <input id="msg-input" type="text" placeholder="Напиши диспетчеру…" autocomplete="off">
+      <button id="msg-send" type="button">➤</button>
+      <button id="mic-btn" type="button">🎙</button>
+    </footer>
   </main>
+  <div id="picker" hidden>
+    <div id="picker-panel">
+      <p id="picker-path"></p>
+      <ul id="picker-dirs"></ul>
+      <div id="picker-actions">
+        <button id="picker-choose" type="button">Выбрать эту папку</button>
+        <button id="picker-cancel" type="button">Отмена</button>
+      </div>
+    </div>
+  </div>
   <audio id="bot-audio" autoplay playsinline></audio>
 </body>
 </html>

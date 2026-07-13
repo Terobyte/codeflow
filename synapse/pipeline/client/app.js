@@ -1,6 +1,7 @@
-// Синапс UI v2, слайс UI-1: дом. Светофор — цвет приходит ГОТОВЫМ с /client/kora-status
+// Синапс UI v2: дом «как Codex» — сайдбар проектов слева, треды в центре, минимум слов
+// (фидбек Теро 2026-07-13). Светофор — цвет приходит ГОТОВЫМ с /client/kora-status
 // (_status_color на сервере, здесь ни логики статуса, ни wall-clock). Только
-// textContent/style-присваивания (XSS: task_text — произвольный текст задачи).
+// textContent/style-присваивания (XSS: task_text/имена папок — произвольный текст).
 const COLORS = { green: "#2ecc71", yellow: "#f1c40f", red: "#e74c3c" };
 const dot = document.getElementById("kora-dot");
 
@@ -27,20 +28,25 @@ dot.addEventListener("click", () => { location.href = "./logs"; });
 // Коннект-логика НАША — закрывает парковку слайса 5 (prebuilt умирал после 3 ретраев).
 import { PipecatClient, SmallWebRTCTransport } from "./vendor/pipecat.mjs";
 
-const btn = document.getElementById("agent-btn");
+const micBtn = document.getElementById("mic-btn");
 const connStatus = document.getElementById("conn-status");
 const botAudio = document.getElementById("bot-audio");
 let client = null;
 
-function setConn(text) { connStatus.textContent = text; }
+// Строка состояния видна только когда есть что сказать — «не подключено» по умолчанию
+// было мусорным словом на пустом доме (фидбек Теро).
+function setConn(text) { connStatus.textContent = text; connStatus.hidden = !text; }
+
+// Кнопка-микрофон = тумблер голоса: горит, пока WebRTC-сессия жива.
+function setMic(on) { micBtn.style.background = on ? "#1f6f3f" : ""; micBtn.title = on ? "голос включён" : "включить голос"; }
 
 async function connectVoice() {
   client = new PipecatClient({
     transport: new SmallWebRTCTransport({ webrtcUrl: "/api/offer" }),
     enableMic: true,
     callbacks: {
-      onConnected: () => { setConn("подключено — говори"); btn.textContent = "⏹ Завершить"; },
-      onDisconnected: () => { setConn("не подключено"); btn.textContent = "🎙 Открыть агента"; client = null; },
+      onConnected: () => { setConn("подключено — говори"); setMic(true); },
+      onDisconnected: () => { setConn(""); setMic(false); client = null; },
       onTrackStarted: (track, participant) => {
         if (track.kind === "audio" && participant && !participant.local) {
           botAudio.srcObject = new MediaStream([track]);
@@ -53,40 +59,118 @@ async function connectVoice() {
   await client.connect();
 }
 
-btn.addEventListener("click", async () => {
+micBtn.addEventListener("click", async () => {
   if (client) { const c = client; client = null; await c.disconnect(); return; }
   try {
     await connectVoice();
   } catch {
     setConn("не удалось подключиться");
+    setMic(false);
     client = null;
   }
 });
 
-// UI v2 слайс UI-3: дом наполняет списки тредов/проектов. Дом = голос на авто-треде:
-// открытие дома сбрасывает активный тред.
+// Чат внизу дома: первое сообщение создаёт тред и открывает его (Codex-паттерн).
+const msgInput = document.getElementById("msg-input");
+const msgSend = document.getElementById("msg-send");
+msgSend.addEventListener("click", async () => {
+  const text = msgInput.value.trim();
+  if (!text) return;
+  msgSend.disabled = true;
+  setConn("отправляю…");
+  try {
+    const tRes = await fetch("/api/threads", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    });
+    if (!tRes.ok) { setConn("не удалось создать тред"); return; }
+    const t = await tRes.json();
+    await fetch(`/api/threads/${t.id}/message`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    location.href = "./thread?id=" + encodeURIComponent(t.id);
+  } catch {
+    setConn("сеть недоступна");
+  } finally {
+    msgSend.disabled = false;
+  }
+});
+msgInput.addEventListener("keydown", (e) => { if (e.key === "Enter") msgSend.click(); });
+
+// Дом = голос на авто-треде: открытие дома сбрасывает активный тред.
 fetch("/api/active-thread", { method: "POST", headers: { "content-type": "application/json" },
                               body: JSON.stringify({ id: null }) }).catch(() => {});
 
-async function addProject() {
-  // prompt() допустим v1 (план UI-3 Task 15); форма — полировка UI-4.
-  const name = prompt("Имя проекта:");
-  if (name === null) return;
-  const path = prompt("Абсолютный путь к директории проекта:");
-  if (!path) return;
-  await fetch("/api/projects", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, path }),
-  }).catch(() => {});
-  loadLists();
+// --- пикер папки для «+ проект» (GET /api/browse — сервер локальный, листает сам;
+// абсолютный путь руками больше не вводится) ------------------------------------------
+const picker = document.getElementById("picker");
+const pickerPath = document.getElementById("picker-path");
+const pickerDirs = document.getElementById("picker-dirs");
+let pickerCur = null;
+
+async function browse(path) {
+  let res;
+  try {
+    const url = "/api/browse" + (path ? "?path=" + encodeURIComponent(path) : "");
+    res = await fetch(url, { cache: "no-store" });
+  } catch { return; }
+  if (!res.ok) return;
+  const data = await res.json();
+  pickerCur = data.path;
+  pickerPath.textContent = data.path;
+  pickerDirs.replaceChildren();
+  if (data.parent) {
+    const up = document.createElement("li");
+    up.textContent = "‹ назад";
+    up.addEventListener("click", () => browse(data.parent));
+    pickerDirs.appendChild(up);
+  }
+  data.dirs.forEach((name) => {
+    const li = document.createElement("li");
+    li.textContent = "📁 " + name;
+    li.addEventListener("click", () => browse(data.path + "/" + name));
+    pickerDirs.appendChild(li);
+  });
 }
 
+document.getElementById("add-project").addEventListener("click", () => {
+  picker.hidden = false;
+  browse(null);
+});
+document.getElementById("picker-cancel").addEventListener("click", () => { picker.hidden = true; });
+document.getElementById("picker-choose").addEventListener("click", async () => {
+  if (!pickerCur) return;
+  const res = await fetch("/api/projects", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "", path: pickerCur }),
+  }).catch(() => null);
+  if (res && !res.ok) {
+    const data = await res.json().catch(() => ({}));
+    pickerPath.textContent = "⛔ " + (data.error || "не удалось добавить");
+    return; // пикер остаётся открытым — видно причину, можно выбрать другую папку
+  }
+  picker.hidden = true;
+  loadLists();
+});
+
+// --- списки: проекты в сайдбар, треды в центр ----------------------------------------
 async function loadLists() {
   try {
     const [tRes, pRes] = await Promise.all([
       fetch("/api/threads", { cache: "no-store" }), fetch("/api/projects", { cache: "no-store" }),
     ]);
+    if (pRes.ok) {
+      const { projects } = await pRes.json();
+      const ul = document.getElementById("projects-list");
+      ul.replaceChildren();
+      projects.forEach((p) => {
+        const li = document.createElement("li");
+        li.textContent = p.name;
+        li.title = p.path;
+        ul.appendChild(li);
+      });
+    }
     if (tRes.ok) {
       const { threads } = await tRes.json();
       const ul = document.getElementById("threads-list");
@@ -99,25 +183,6 @@ async function loadLists() {
         li.appendChild(a);
         ul.appendChild(li);
       });
-      document.getElementById("threads-section").hidden = threads.length === 0;
-    }
-    if (pRes.ok) {
-      const { projects } = await pRes.json();
-      const ul = document.getElementById("projects-list");
-      ul.replaceChildren();
-      projects.forEach((p) => {
-        const li = document.createElement("li");
-        li.textContent = p.name;
-        ul.appendChild(li);
-      });
-      const addLi = document.createElement("li");
-      const addBtn = document.createElement("a");
-      addBtn.href = "#";
-      addBtn.textContent = "+ проект";
-      addBtn.addEventListener("click", (e) => { e.preventDefault(); addProject(); });
-      addLi.appendChild(addBtn);
-      ul.appendChild(addLi);
-      document.getElementById("projects-section").hidden = false;
     }
   } catch { /* сеть упала — дом остаётся пустым, не гадаем */ }
 }

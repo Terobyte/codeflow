@@ -33,6 +33,27 @@ from pipecat_ai_prebuilt.frontend import PipecatPrebuiltUI
 from synapse.bridge.state import Liveness, TaskStatus
 from synapse.pipeline.app import SynapseHost, build_session_pipeline
 
+def _browse_dir(raw: str | None, home: Path) -> dict | None:
+    """Папко-пикер «+ проект» (фидбек Теро: абсолютный путь руками — мусор). Read-only
+    листинг ПОДдиректорий, клетка = HOME: путь вне её или битый молча падает на home,
+    не 403 — UI всегда получает валидную страницу. Скрытые директории не показываются
+    (заодно прячет .ssh/.config; первая линия защиты — validate_project_path при add)."""
+    base = home.resolve()
+    p = Path(raw).expanduser() if raw else base
+    try:
+        rp = p.resolve()
+    except (OSError, RuntimeError):
+        rp = base
+    if not rp.is_relative_to(base) or not rp.is_dir():
+        rp = base
+    try:
+        dirs = sorted(d.name for d in rp.iterdir() if d.is_dir() and not d.name.startswith("."))
+    except OSError:
+        return None
+    parent = str(rp.parent) if rp != base else None
+    return {"path": str(rp), "parent": parent, "dirs": dirs}
+
+
 # B8: hard cap on pending (started-but-not-yet-offered) handshake sessions — bounds the
 # memory a bare-/start flood can claim. Generous for a single-client demo.
 _MAX_PENDING_SESSIONS = 128
@@ -372,6 +393,13 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         return {"id": t.id, "title": t.title, "project_id": t.project_id, "stage": t.stage,
                 "last_outcome": t.last_outcome, "updated_ts": t.updated_ts,
                 "created_ts": t.created_ts}
+
+    @app.get("/api/browse")
+    async def api_browse(path: str | None = None):
+        result = _browse_dir(path, Path.home())
+        if result is None:
+            return JSONResponse({"error": "unreadable"}, status_code=400)
+        return JSONResponse(result)
 
     @app.get("/api/projects")
     async def api_projects_list():
