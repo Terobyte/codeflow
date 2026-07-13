@@ -1,5 +1,6 @@
-"""UI v2 слайс UI-1: вендор-бандл, наша статика /client, роут-своп, mount-order (S24/S26).
-Лексические проверки — паттерн test_kora_status_ui.py (никакого браузера в CI)."""
+"""UI v2 слайс UI-1 + UI v3 редизайн: вендор-бандл, наша статика /client, SPA-shell,
+роут-своп, mount-order (S24/S26). Лексические проверки — паттерн test_kora_status_ui.py
+(никакого браузера в CI)."""
 import asyncio
 import re
 from pathlib import Path
@@ -28,34 +29,52 @@ def test_vendor_md_pins_versions_and_license():
         assert token in md
 
 
-def test_our_index_is_pwa_wrapper_and_wires_our_scripts():
-    # «Открыть агента» умер намеренно (фидбек Теро 2026-07-13): голос = кнопка-микрофон
-    # в композере, дом = чат внизу.
+def test_index_is_spa_shell():
+    """UI v3: один shell — сайдбар (проекты/треды/статус-карточка Коры), вью дома и треда,
+    единый композер. kora-dot умер (Ж4: тултип не существует на тачскрине)."""
     body = (CLIENT_DIR / "index.html").read_text(encoding="utf-8")
     for token in (
-        "mic-btn", "msg-input", "manifest.webmanifest", "apple-touch-icon",
-        "reconnect.js", "app.js", "style.css", "kora-dot", "bot-audio",
-        'lang="ru"', "viewport-fit=cover",
+        "shell", "sidebar", "menu-btn", "new-thread", "projects-list", "add-project",
+        "threads-list", "kora-card", "kora-card-sub", "./logs",
+        "view-home", "view-thread", "feed-list", "typing",
+        "mic-btn", "msg-input", "msg-send", 'data-state="idle"', "bot-audio",
+        "manifest.webmanifest", "apple-touch-icon", "reconnect.js", "app.js", "style.css",
+        'lang="ru"', "viewport-fit=cover", "picker-dirs", "picker-choose",
     ):
         assert token in body, f"index.html missing {token!r}"
-    assert "status-widget.js" not in body  # светофор у нас нативный, не инжект-виджет
+    assert "kora-dot" not in body
+    assert "status-widget.js" not in body  # светофор нативный, не инжект-виджет
+    assert "не подключено" not in body     # статус виден только когда есть что сказать
 
 
-def test_app_js_polls_status_and_is_xss_safe():
+def test_app_js_is_spa_router_and_xss_safe():
     body = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
-    for token in ("kora-status", "visibilitychange", "textContent", "./logs"):
-        assert token in body
+    for token in (
+        "#/thread/", "hashchange",            # SPA-роутер: голос живёт при навигации (Ж6)
+        "kora-status", "visibilitychange", "textContent",
+        "/api/threads", "/api/projects", "active-thread", "/feed", "/message",
+        "/api/browse", "encodeURIComponent(path)", "picker-choose", "🧠",
+    ):
+        assert token in body, f"app.js missing {token!r}"
     assert "innerHTML" not in body
     assert "window.open" not in body  # R3: standalone iOS PWA — навигация, не окна
+    assert "prompt(" not in body      # абсолютный путь руками умер вместе с prompt()
+    assert "location.href" not in body  # SPA: только hash-навигация, никаких перезагрузок
 
 
-def test_app_js_wires_voice_through_vendored_sdk():
+def test_app_js_wires_voice_with_visible_states():
     body = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
     for token in (
         './vendor/pipecat.mjs"', "PipecatClient", "SmallWebRTCTransport",
         'webrtcUrl: "/api/offer"', "enableMic: true", "onTrackStarted", "MediaStream",
+        # Ж2-фиксы: гвард НЕ требует participant (transport зовёт onTrackStarted(track)
+        # без него — иначе аудио бота молча выбрасывается) + видимые стейты и таймаут
+        # вместо вечного «подключаюсь…» на зависшем getUserMedia.
+        "!participant?.local", "dataset.state", "microphone", "withTimeout",
+        "console.error",
     ):
         assert token in body, f"app.js voice wiring missing {token!r}"
+    assert "participant && !participant.local" not in body
 
 
 def _webrtc_server_or_skip():
@@ -85,6 +104,17 @@ async def test_client_root_serves_our_index_not_prebuilt():
         assert "status-widget.js" not in body  # инжекты слайса 5 умерли вместе с патчем
 
 
+async def test_thread_url_redirects_into_spa_hash():
+    """Старые ссылки /client/thread?id=X живут: 30x на /client/#/thread/X (id URL-квотится)."""
+    webrtc_server = _webrtc_server_or_skip()
+    app = webrtc_server.build_web_app(host=object())
+    resp = await _endpoint(app, "client_thread")(id="abc123")
+    assert resp.status_code in (302, 307)
+    assert resp.headers["location"] == "/client/#/thread/abc123"
+    resp = await _endpoint(app, "client_thread")(id="a/б?c")
+    assert resp.headers["location"] == "/client/#/thread/a%2F%D0%B1%3Fc"
+
+
 def test_prebuilt_mounted_unpatched_at_client_dev():
     webrtc_server = _webrtc_server_or_skip()
     from starlette.routing import Mount
@@ -101,6 +131,7 @@ def test_our_static_routes_exist():
     names = {getattr(getattr(r, "endpoint", None), "__name__", "") for r in app.routes}
     for n in ("client_app_js", "client_style_css", "client_vendor_pipecat"):
         assert n in names
+    assert "client_thread_js" not in names  # страница треда умерла вместе с thread.js
 
 
 def test_all_exact_client_routes_registered_before_dev_mount():
@@ -113,41 +144,25 @@ def test_all_exact_client_routes_registered_before_dev_mount():
         "client_index", "client_index_html", "client_manifest", "client_reconnect_js",
         "client_icon_192", "client_icon_512", "client_apple_touch_icon", "session_alive",
         "kora_status", "kora_log_feed", "client_logs", "client_status_widget_js",
-        "client_app_js", "client_style_css", "client_vendor_pipecat",
-        "client_thread", "client_thread_js",
+        "client_app_js", "client_style_css", "client_vendor_pipecat", "client_thread",
     ):
         assert idx[name] < mount_i, f"{name} must be registered BEFORE the /client/dev mount (S24)"
 
 
-def test_thread_page_wires_feed_and_message_and_is_xss_safe():
-    body = (CLIENT_DIR / "thread.html").read_text(encoding="utf-8")
-    for token in ("thread.js", "style.css", "feed-list", "msg-input", "msg-send", "← назад"):
-        assert token in body
-    js = (CLIENT_DIR / "thread.js").read_text(encoding="utf-8")
-    for token in ("/feed", "/message", "active-thread", "textContent", "visibilitychange",
-                  "application/json", "🧠"):
-        assert token in js
-    assert "innerHTML" not in js and "innerHTML" not in body
+def test_client_files_served_from_disk_not_startup_ram():
+    """UI v3: index/app/style читаются per-request — итерации дизайна без рестарта.
+    Лексически: в build_web_app нет стартового read_bytes для них (vendored — можно)."""
+    webrtc_server = _webrtc_server_or_skip()
+    src = Path(webrtc_server.__file__).read_text(encoding="utf-8")
+    for stale in ("_index_bytes", "_app_js_bytes", "_style_css_bytes",
+                  "_thread_html_bytes", "_thread_js_bytes"):
+        assert stale not in src, f"{stale}: клиент снова закеширован на старте"
+    assert "_client_file(" in src
 
 
-def test_home_lists_threads_and_projects():
-    js = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
-    for token in ("/api/threads", "/api/projects", "threads-list", "projects-list", "./thread?id="):
-        assert token in js
-
-
-def test_home_is_codex_layout_with_folder_picker():
-    """Фидбек Теро 2026-07-13: проекты слева, путь не вводится руками, мусорные слова убраны."""
-    body = (CLIENT_DIR / "index.html").read_text(encoding="utf-8")
-    for token in ("sidebar", "projects-list", "add-project", "picker-dirs", "picker-choose"):
-        assert token in body, f"index.html missing {token!r}"
-    assert "не подключено" not in body       # статус виден только когда есть что сказать
-    assert "лента Коры" not in body           # дебаг-ссылки убраны с дома (точка → ./logs)
-    js = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
-    for token in ("/api/browse", "encodeURIComponent(path)", "picker-choose"):
-        assert token in js
-    assert "prompt(" not in js                # абсолютный путь руками умер вместе с prompt()
-    assert "innerHTML" not in js
+def test_thread_page_files_are_gone():
+    assert not (CLIENT_DIR / "thread.html").exists()
+    assert not (CLIENT_DIR / "thread.js").exists()
 
 
 def test_browse_dir_is_caged_to_home(tmp_path):

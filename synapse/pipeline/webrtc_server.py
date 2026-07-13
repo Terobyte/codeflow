@@ -14,6 +14,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -267,12 +268,12 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     # уезжает НЕПАТЧЕННЫМ на /client/dev (тот же PipecatPrebuiltUI-объект). Инжекты слайса 5
     # умирают вместе с патч-логикой: PWA-обёртка и реконнект теперь обязанность нашего index.
     _CLIENT_DIR = Path(__file__).parent / "client"
-    _index_bytes = (_CLIENT_DIR / "index.html").read_bytes()
-    _app_js_bytes = (_CLIENT_DIR / "app.js").read_bytes()
-    _style_css_bytes = (_CLIENT_DIR / "style.css").read_bytes()
+    # UI v3: наши файлы (index/app/style) читаются с ДИСКА на каждый запрос — итерации
+    # дизайна на staging без рестарта сервера. Vendored-бандл большой и неизменный — RAM.
     _vendor_pipecat_bytes = (_CLIENT_DIR / "vendor" / "pipecat.mjs").read_bytes()
-    _thread_html_bytes = (_CLIENT_DIR / "thread.html").read_bytes()
-    _thread_js_bytes = (_CLIENT_DIR / "thread.js").read_bytes()
+
+    def _client_file(name: str, media_type: str) -> Response:
+        return Response(content=(_CLIENT_DIR / name).read_bytes(), media_type=media_type)
     # static-ассеты (manifest/иконки/reconnect/logs/status-widget) живы — роуты для них ниже.
     _manifest_bytes = (_STATIC_DIR / "manifest.webmanifest").read_bytes()
     _reconnect_js_bytes = (_STATIC_DIR / "reconnect.js").read_bytes()
@@ -284,31 +285,29 @@ def build_web_app(host: SynapseHost) -> FastAPI:
 
     @app.get("/client/")
     async def client_index():
-        return Response(content=_index_bytes, media_type="text/html")
+        return _client_file("index.html", "text/html")
 
     @app.get("/client/index.html")
     async def client_index_html():
-        return Response(content=_index_bytes, media_type="text/html")
+        return _client_file("index.html", "text/html")
 
     @app.get("/client/app.js")
     async def client_app_js():
-        return Response(content=_app_js_bytes, media_type="text/javascript")
+        return _client_file("app.js", "text/javascript")
 
     @app.get("/client/style.css")
     async def client_style_css():
-        return Response(content=_style_css_bytes, media_type="text/css")
+        return _client_file("style.css", "text/css")
 
     @app.get("/client/vendor/pipecat.mjs")
     async def client_vendor_pipecat():
         return Response(content=_vendor_pipecat_bytes, media_type="text/javascript")
 
     @app.get("/client/thread")
-    async def client_thread():
-        return Response(content=_thread_html_bytes, media_type="text/html")
-
-    @app.get("/client/thread.js")
-    async def client_thread_js():
-        return Response(content=_thread_js_bytes, media_type="text/javascript")
+    async def client_thread(id: str | None = None):
+        # UI v3: страница треда умерла, тред живёт в SPA-хеше. Старые ссылки/закладки
+        # /client/thread?id=X доезжают редиректом (quote: id — произвольная строка).
+        return RedirectResponse(url="/client/#/thread/" + quote(id or "", safe=""))
 
     @app.get("/client/manifest.webmanifest")
     async def client_manifest():

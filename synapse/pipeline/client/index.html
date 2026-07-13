@@ -6,6 +6,7 @@
   <title>Синапс</title>
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#0b0f14">
@@ -13,24 +14,56 @@
   <script defer src="./reconnect.js"></script>
   <script type="module" src="./app.js"></script>
 </head>
-<body id="home">
-  <aside id="sidebar">
-    <div id="side-head">
-      <h1>Синапс</h1>
-      <div id="kora-dot" title="Кора"></div>
-    </div>
-    <ul id="projects-list"></ul>
-    <button id="add-project" type="button">+ проект</button>
-  </aside>
-  <main>
-    <ul id="threads-list"></ul>
-    <p id="conn-status" hidden></p>
-    <footer>
-      <input id="msg-input" type="text" placeholder="Напиши диспетчеру…" autocomplete="off">
-      <button id="msg-send" type="button">➤</button>
-      <button id="mic-btn" type="button">🎙</button>
-    </footer>
-  </main>
+<body>
+  <div id="shell">
+    <aside id="sidebar">
+      <div id="side-head">
+        <h1>Синапс</h1>
+        <button id="side-close" type="button" aria-label="закрыть меню">✕</button>
+      </div>
+      <button id="new-thread" type="button">＋ новый тред</button>
+      <nav id="side-scroll">
+        <h2>Проекты</h2>
+        <ul id="projects-list"></ul>
+        <button id="add-project" type="button">＋ проект</button>
+        <h2>Треды</h2>
+        <ul id="threads-list"></ul>
+      </nav>
+      <a id="kora-card" href="./logs">
+        <span id="kora-card-dot"></span>
+        <span id="kora-card-text">
+          <span id="kora-card-title">Кора</span>
+          <span id="kora-card-sub">…</span>
+        </span>
+      </a>
+    </aside>
+    <div id="backdrop" hidden></div>
+    <main id="main">
+      <header id="topbar">
+        <button id="menu-btn" type="button" aria-label="меню">☰</button>
+        <div id="view-title">Синапс</div>
+        <span id="thread-badge" hidden></span>
+      </header>
+      <section id="view-home" class="view">
+        <div id="hero">
+          <p id="hero-title">Что делаем?</p>
+          <p id="hero-sub">Опиши задачу текстом или включи микрофон — тред создастся сам.</p>
+        </div>
+        <h2 id="recent-h" hidden>Недавние</h2>
+        <ul id="home-recent"></ul>
+      </section>
+      <section id="view-thread" class="view" hidden>
+        <ol id="feed-list"></ol>
+        <p id="typing" hidden>думаю<span class="dots"><span>.</span><span>.</span><span>.</span></span></p>
+      </section>
+      <p id="conn-status" hidden></p>
+      <footer id="composer">
+        <input id="msg-input" type="text" placeholder="Опиши задачу…" autocomplete="off">
+        <button id="msg-send" type="button" aria-label="отправить">➤</button>
+        <button id="mic-btn" type="button" data-state="idle" aria-label="микрофон">🎙</button>
+      </footer>
+    </main>
+  </div>
   <div id="picker" hidden>
     <div id="picker-panel">
       <p id="picker-path"></p>
