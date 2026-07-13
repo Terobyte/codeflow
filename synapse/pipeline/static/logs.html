@@ -1,0 +1,83 @@
+<!doctype html>
+<!-- kora status UI (tero run 2026-07-12): standalone-страница «Размышления Коры» — дисплей
+     ring-buffer'а /client/kora-log. Отдельная страница вместо вкладки внутри prebuilt-React
+     (борьба с чужим бандлом дороже). Никаких внешних хостов: inline-стили и inline-скрипт. -->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0f14">
+<title>Размышления Коры</title>
+<style>
+  body { margin: 0; background: #0b0f14; color: #d7dde5; font: 14px/1.5 -apple-system, "SF Mono", Menlo, monospace; }
+  header {
+    position: sticky; top: 0; display: flex; align-items: center; gap: 12px;
+    padding: calc(env(safe-area-inset-top, 0px) + 10px) 14px 10px;
+    background: #11161d; border-bottom: 1px solid #1f2732;
+  }
+  header a { color: #5dade2; text-decoration: none; }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  #feed { padding: 10px 14px calc(env(safe-area-inset-bottom, 0px) + 20px); }
+  .row { margin: 0 0 10px; }
+  .meta { display: block; font-size: 11px; color: #6b7683; margin-bottom: 2px; }
+  .text { white-space: pre-wrap; word-break: break-word; }
+  .kind-task .text { color: #5dade2; font-weight: 600; }
+  .kind-thinking .text { color: #9b8ec4; font-style: italic; }
+  .kind-tool_use .text { color: #e0b76b; }
+  .kind-tool_result .text { color: #6b7683; }
+  .kind-result .text { color: #2ecc71; font-weight: 600; }
+  .kind-system .text { color: #6b7683; }
+  #empty { color: #6b7683; padding: 24px 14px; }
+</style>
+</head>
+<body>
+<header><a href="./">← назад</a><h1>Размышления Коры</h1></header>
+<div id="empty">Лента пуста — Кора ещё не запускалась в этом процессе.</div>
+<div id="feed"></div>
+<script>
+// Только textContent-присваивания (XSS: Кора стримит произвольный текст, в т.ч. потенциально
+// HTML/script — вставка сырого HTML исполнила бы его в браузере владельца). Автоскролл вниз
+// только если читатель УЖЕ внизу — иначе стримящая лента дёргается под пальцем. ts — чистый
+// дисплей локального времени, решений по времени нет.
+const feed = document.getElementById("feed");
+const empty = document.getElementById("empty");
+
+function render(entries) {
+  const atBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 40;
+  empty.style.display = entries.length ? "none" : "block";
+  feed.replaceChildren();
+  for (const e of entries) {
+    const row = document.createElement("div");
+    row.className = "row kind-" + e.kind;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = new Date(e.ts * 1000).toLocaleTimeString() + " · " + e.kind;
+    const text = document.createElement("div");
+    text.className = "text";
+    text.textContent = e.text;
+    row.append(meta, text);
+    feed.append(row);
+  }
+  if (atBottom) window.scrollTo(0, document.body.scrollHeight);
+}
+
+async function poll() {
+  let res;
+  try {
+    res = await fetch("./kora-log", { cache: "no-store" });
+  } catch {
+    return; // сеть упала — оставляем последнее отрисованное
+  }
+  if (!res.ok) return;
+  const data = await res.json();
+  render(data.entries || []);
+}
+
+poll();
+setInterval(poll, 2000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) poll();
+});
+</script>
+</body>
+</html>

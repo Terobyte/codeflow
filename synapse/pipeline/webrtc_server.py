@@ -30,6 +30,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat_ai_prebuilt.frontend import PipecatPrebuiltUI
 
+from synapse.bridge.state import Liveness, TaskStatus
 from synapse.pipeline.app import SynapseHost, build_session_pipeline
 
 # B8: hard cap on pending (started-but-not-yet-offered) handshake sessions — bounds the
@@ -50,7 +51,29 @@ _PWA_HEAD = (
     '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
     '<meta name="theme-color" content="#0b0f14">'
     '<script defer src="./reconnect.js"></script>'
+    '<script defer src="./status-widget.js"></script>'
 )
+
+
+def _status_color(liveness: Liveness, task_status: TaskStatus | None, awaiting: bool) -> str:
+    """Светофор Коры — kora status UI (tero run 2026-07-12). red > yellow > green;
+    дефолт-маппинг из ран-файла §1, Теро подкрутит на глаз. Терминал/нет-задачи проверяются
+    ПЕРВЫМИ (R2): после task_completed стрим кончается и heartbeat'ов больше нет, так что
+    возраст в liveness() растёт вечно — успешно завершённая задача обязана оставаться
+    зелёной, а не гнить в жёлтый/красный. liveness опрашивается только при живом ране."""
+    if task_status is TaskStatus.FAILED:
+        return "red"
+    if task_status is None or task_status in (TaskStatus.IDLE, TaskStatus.COMPLETED):
+        return "green"  # нет живого рана — liveness не о чем
+    if liveness is Liveness.UNREACHABLE:
+        return "red"
+    if (
+        liveness is Liveness.STALE
+        or awaiting
+        or task_status in (TaskStatus.PENDING_CONFIRMATION, TaskStatus.CANCEL_REQUESTED)
+    ):
+        return "yellow"
+    return "green"
 
 
 def build_web_app(host: SynapseHost) -> FastAPI:
@@ -255,6 +278,10 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     _icon_192_bytes = (_STATIC_DIR / "icon-192.png").read_bytes()
     _icon_512_bytes = (_STATIC_DIR / "icon-512.png").read_bytes()
     _apple_touch_icon_bytes = (_STATIC_DIR / "apple-touch-icon.png").read_bytes()
+    # kora status UI (tero run 2026-07-12): страница логов + виджет-светофор, тот же
+    # pre-read-bytes идиом, что и PWA-ассеты выше.
+    _logs_html_bytes = (_STATIC_DIR / "logs.html").read_bytes()
+    _status_widget_js_bytes = (_STATIC_DIR / "status-widget.js").read_bytes()
 
     @app.get("/client/")
     async def client_index():
@@ -291,6 +318,44 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     @app.get("/client/session-alive")
     async def session_alive():
         return JSONResponse({"active": current["task"] is not None})
+
+    # kora status UI (tero run 2026-07-12): все четыре роута ниже — как session-alive,
+    # ДО app.mount (Starlette матчит в порядке регистрации, роут выигрывает у StaticFiles).
+
+    @app.get("/client/kora-status")
+    async def kora_status():
+        now = host.clock.now()
+        live = host.store.liveness(now, host.cfg.stale_after_s, host.cfg.unreachable_after_s)
+        task = host.store.task
+        status = task.status if task is not None else None
+        # Зеркалит RUNNING-гейт snapshot'а (state.py:310): флаг «ждёт ответа» показывается
+        # только пока задача реально бежит.
+        awaiting = bool(
+            host.store.awaiting_answer and task is not None and task.status == TaskStatus.RUNNING
+        )
+        return JSONResponse(
+            {
+                "color": _status_color(live, status, awaiting),
+                "liveness": live.value,
+                "task_status": status.value if status is not None else None,
+                "awaiting_answer": awaiting,
+                "task_text": task.text[:60] if task is not None else None,
+            }
+        )
+
+    @app.get("/client/kora-log")
+    async def kora_log_feed():
+        # Хост-стаб без проведённой ленты (kora_log=None, паттерн kora_runner) → пустой фид.
+        entries = list(host.kora_log) if host.kora_log is not None else []
+        return JSONResponse({"entries": entries})
+
+    @app.get("/client/logs")
+    async def client_logs():
+        return Response(content=_logs_html_bytes, media_type="text/html")
+
+    @app.get("/client/status-widget.js")
+    async def client_status_widget_js():
+        return Response(content=_status_widget_js_bytes, media_type="text/javascript")
 
     app.mount("/client", PipecatPrebuiltUI, name="client")
     return app

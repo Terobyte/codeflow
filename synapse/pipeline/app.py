@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from typing import Any
 
 from pipecat.frames.frames import TTSSpeakFrame
@@ -69,6 +70,7 @@ class SynapseHost:
         breaker: CircuitBreaker,
         cost_cap: CostCap,
         kora_runner: KoraRunner | None = None,
+        kora_log: deque | None = None,
     ) -> None:
         self.clock = clock
         self.cfg = cfg
@@ -85,6 +87,10 @@ class SynapseHost:
         # The real Kora producer (M1 slice 1), held on the host so its single in-flight task
         # survives WebRTC reconnects like the rest of the long-lived state. None when disabled.
         self.kora_runner = kora_runner
+        # Display-only ring buffer behind GET /client/kora-log — kora status UI (tero run
+        # 2026-07-12). Stored RAW like kora_runner (None when unwired, e.g. host stubs in
+        # tests); the single reader (the route) guards for None at the call site.
+        self.kora_log = kora_log
         # M1 slice 2 (the one NON-long-lived field, see class docstring): the currently live
         # per-connection PipelineTask, or None when no client is connected.
         self._output_task: Any = None
@@ -206,8 +212,13 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
 
     # Build the real Kora producer before the bridge so submit/confirm-COMMITTED can launch it
     # and request_cancel can tear it down (M1 slice 1). Disabled → the old hollow behavior.
+    # kora_log: display-only лента «размышлений Коры» (kora status UI, tero run 2026-07-12) —
+    # ring buffer на хосте, кормится log_sink'ом раннера, читается роутом /client/kora-log.
+    kora_log: deque = deque(maxlen=cfg.kora_log_max)
     kora_runner = (
-        KoraRunner(cfg, store, speak_ledger, clock, journal, on_speak) if cfg.kora_enabled else None
+        KoraRunner(cfg, store, speak_ledger, clock, journal, on_speak, log_sink=kora_log.append)
+        if cfg.kora_enabled
+        else None
     )
 
     bridge = KoraBridge(
@@ -244,6 +255,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         breaker=breaker,
         cost_cap=cost_cap,
         kora_runner=kora_runner,
+        kora_log=kora_log,
     )
     _h["host"] = host  # fills the on_speak holder -- must precede any runtime SPEAK
     return host

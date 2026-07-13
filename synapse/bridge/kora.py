@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import os
 import re
 from pathlib import Path
@@ -201,6 +202,64 @@ def _message_to_events(
     return events
 
 
+def _message_to_log_entries(msg: Any, ts: float) -> list[dict[str, Any]]:
+    """Display-only twin of `_message_to_events` — kora status UI (tero run 2026-07-12).
+    Feeds ONLY the host's ring buffer behind GET /client/kora-log (the «размышления Коры»
+    page); never the journal, store, [СОСТОЯНИЕ] or the dispatcher's LLM context, so Р-15
+    is untouched by construction. Deliberate, dispositioned exception to the keys-only
+    policy of `_message_to_events`: tool-input VALUES are shown here — anything Kora could
+    put in an input she can equally say in a TextBlock (which this feed exists to display),
+    secret paths are gate-denied BEFORE execution (slice 4), and the reader is the machine's
+    owner over tailnet-only HTTP. Duck-typed like `_message_to_events`; unknown message
+    types are skipped on purpose (Task*Message subagent spam would flood a 500-line display
+    feed — full fidelity already lives in the journal via kora_* events)."""
+    entries: list[dict[str, Any]] = []
+
+    def add(kind: str, text: str) -> None:
+        entries.append({"ts": ts, "kind": kind, "text": text})
+
+    name = type(msg).__name__
+    if name == "SystemMessage":
+        subtype = getattr(msg, "subtype", None)
+        if subtype == "init":
+            data = getattr(msg, "data", None) or {}
+            add("system", f"старт сессии, модель {data.get('model')}")
+        else:
+            add("system", str(subtype))
+
+    elif name == "AssistantMessage":
+        for block in _blocks(getattr(msg, "content", None)):
+            bname = type(block).__name__
+            if bname == "TextBlock":
+                add("text", (getattr(block, "text", "") or "")[:4000])
+            elif bname == "ThinkingBlock":
+                add("thinking", (getattr(block, "thinking", "") or "")[:4000])
+            elif bname == "ToolUseBlock":
+                inp = getattr(block, "input", None) or {}
+                try:
+                    args = json.dumps(inp, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    args = str(inp)
+                add("tool_use", f"{getattr(block, 'name', None)}: {args}"[:300])
+
+    elif name == "UserMessage":
+        for block in _blocks(getattr(msg, "content", None)):
+            if type(block).__name__ == "ToolResultBlock":
+                add("tool_result", "ошибка" if bool(getattr(block, "is_error", False)) else "ок")
+
+    elif name == "ResultMessage":
+        text = "задача упала" if bool(getattr(msg, "is_error", False)) else "задача завершена"
+        turns = getattr(msg, "num_turns", None)
+        cost = getattr(msg, "total_cost_usd", None)
+        if turns is not None:
+            text += f" · ходов: {turns}"
+        if isinstance(cost, (int, float)):
+            text += f" · ${cost:.4f}"
+        add("result", text)
+
+    return entries
+
+
 def apply_event_to_store(
     event: KoraEvent,
     store: TaskStore,
@@ -253,6 +312,7 @@ class KoraRunner:
         journal: TurnJournal,
         on_speak: Callable[[str], None] | None,
         client_factory: Callable[[Any], Any] | None = None,
+        log_sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._store = store
@@ -261,6 +321,9 @@ class KoraRunner:
         self._journal = journal
         self._on_speak = on_speak
         self._client_factory = client_factory or self._default_client_factory
+        # Display-only feed for the /client/logs page — kora status UI (tero run 2026-07-12).
+        # None → feature unwired (tests, console); the runner never depends on it.
+        self._log_sink = log_sink
         self._active: asyncio.Task[None] | None = None
         # M1 slice 3 (E5): while Kora's stream is blocked in the gate on an AskUserQuestion, this
         # holds the future the dispatcher's answer_kora resolves. None whenever no question is
@@ -320,6 +383,16 @@ class KoraRunner:
     async def _stream(self, task_id: str, text: str) -> None:
         opts = self._build_options(task_id, text)
         seq_gen = itertools.count()
+        # Both log-sink insertions below swallow EVERY exception on purpose (kora status UI,
+        # tero run 2026-07-12): the sink is display-only, and anything escaping _stream lands
+        # in _run's broad `except Exception` → KORA_RUN_FAILED + terminalize — a cosmetic bug
+        # must never mark a genuinely running task FAILED. Degradation is silent by design:
+        # the /client/logs feed freezes while the traffic light (a separate path) keeps working.
+        if self._log_sink is not None:
+            try:
+                self._log_sink({"ts": self._clock.now(), "kind": "task", "text": text})
+            except Exception:  # noqa: BLE001
+                pass
         async with self._client_factory(opts) as client:
             await client.query(text)
             async for msg in client.receive_response():
@@ -328,6 +401,12 @@ class KoraRunner:
                 if self._store.task is None or self._store.task.id != task_id:
                     return
                 ts = self._clock.now()
+                if self._log_sink is not None:
+                    try:
+                        for entry in _message_to_log_entries(msg, ts):
+                            self._log_sink(entry)
+                    except Exception:  # noqa: BLE001
+                        pass
                 for event in _message_to_events(msg, task_id, text, ts, seq_gen):
                     apply_event_to_store(event, self._store, self._speak_ledger, self._on_speak, self._journal)
 

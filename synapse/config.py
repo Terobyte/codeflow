@@ -83,6 +83,9 @@ class SynapseConfig:
     # never emits a ResultMessage can't strand the task RUNNING forever (max_turns/max_budget
     # only fire on a ResultMessage).
     kora_deadline_s: float = 900.0
+    # Дисплей-лента «размышлений Коры» /client/logs — размер ring-buffer на хосте
+    # (kora status UI, tero run 2026-07-12).
+    kora_log_max: int = 500
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SynapseConfig":
