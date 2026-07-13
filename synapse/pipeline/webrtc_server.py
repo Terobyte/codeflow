@@ -274,9 +274,10 @@ def build_web_app(host: SynapseHost) -> FastAPI:
 
     def _client_file(name: str, media_type: str) -> Response:
         return Response(content=(_CLIENT_DIR / name).read_bytes(), media_type=media_type)
-    # static-ассеты (manifest/иконки/reconnect/logs/status-widget) живы — роуты для них ниже.
+    # static-ассеты (manifest/иконки/logs/status-widget) живы — роуты для них ниже.
+    # reconnect.js умер в UI v3: вотчдог-семантика §2.7 живёт в app.js (авто-реконнект
+    # на месте, reload — последний резерв).
     _manifest_bytes = (_STATIC_DIR / "manifest.webmanifest").read_bytes()
-    _reconnect_js_bytes = (_STATIC_DIR / "reconnect.js").read_bytes()
     _icon_192_bytes = (_STATIC_DIR / "icon-192.png").read_bytes()
     _icon_512_bytes = (_STATIC_DIR / "icon-512.png").read_bytes()
     _apple_touch_icon_bytes = (_STATIC_DIR / "apple-touch-icon.png").read_bytes()
@@ -313,10 +314,6 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def client_manifest():
         return Response(content=_manifest_bytes, media_type="application/manifest+json")
 
-    @app.get("/client/reconnect.js")
-    async def client_reconnect_js():
-        return Response(content=_reconnect_js_bytes, media_type="text/javascript")
-
     @app.get("/client/icon-192.png")
     async def client_icon_192():
         return Response(content=_icon_192_bytes, media_type="image/png")
@@ -329,7 +326,7 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def client_apple_touch_icon():
         return Response(content=_apple_touch_icon_bytes, media_type="image/png")
 
-    # M1 slice 5 (§2.7): truth-based signal for reconnect.js — NOT a wall clock (R3/R4: iOS
+    # M1 slice 5 (§2.7): truth-based signal for the app.js watchdog — NOT a wall clock (R3/R4: iOS
     # suspends page timers while locked/backgrounded, so elapsed-time heuristics false-positive
     # on every ordinary wake). `current["task"]` is None the instant no client is actively bound
     # (torn down or preempted), so this reflects real server state instead of a guess.

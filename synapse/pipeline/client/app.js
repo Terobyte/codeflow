@@ -258,24 +258,27 @@ async function connectVoice() {
   // и таймаут дают видимую ошибку. permissions.query нет в старом Safari → пропускаем.
   const perm = await navigator.permissions.query({ name: "microphone" }).catch(() => null);
   if (perm && perm.state === "denied") throw new Error("микрофон запрещён для этого сайта");
-  client = new PipecatClient({
+  // Identity-guard (урок слайса 3): колбэки действуют только пока `me` — текущий клиент,
+  // иначе поздний onDisconnected СТАРОЙ сессии глушил бы новую после авто-реконнекта.
+  const me = new PipecatClient({
     transport: new SmallWebRTCTransport({ webrtcUrl: "/api/offer" }),
     enableMic: true,
     callbacks: {
-      onConnected: () => setMicState("on"),
-      onDisconnected: () => { client = null; setMicState("idle"); },
+      onConnected: () => { if (client === me) setMicState("on"); },
+      onDisconnected: () => { if (client === me) { client = null; setMicState("idle"); } },
       onTrackStarted: (track, participant) => {
         // SmallWebRTCTransport зовёт onTrackStarted(track) БЕЗ participant для
         // remote-треков (vendor: `onTrackStarted?.(n.track)`), local через этот
         // колбэк не ходит вовсе — «participant &&» молча выбрасывал аудио бота.
-        if (track.kind === "audio" && !participant?.local) {
+        if (client === me && track.kind === "audio" && !participant?.local) {
           botAudio.srcObject = new MediaStream([track]);
         }
       },
       onError: (e) => { console.error("voice error:", e); setConn("⛔ ошибка соединения"); },
     },
   });
-  await withTimeout(client.connect(), 20000);
+  client = me;
+  await withTimeout(me.connect(), 20000);
 }
 
 $("mic-btn").addEventListener("click", async () => {
@@ -300,6 +303,49 @@ $("mic-btn").addEventListener("click", async () => {
     connecting = false;
   }
 });
+
+// ---------- вотчдог (§2.7, наследник reconnect.js): правда сервера, не wall-clock ----------
+// iOS замораживает таймеры страницы при локе — elapsed-time эвристика ложно видит «разрыв»
+// на каждом пробуждении, поэтому только поллинг /client/session-alive. В отличие от prebuilt
+// (умирал навсегда после 3 ретраев → reload был единственным спасением) наш клиент умеет
+// реконнект на месте; location.reload остаётся ПОСЛЕДНИМ резервом по прежним правилам:
+// сервер доступен И говорит «сессии нет» И голос был жив.
+let aliveMisses = 0;
+
+function maybeReload() {
+  const last = Number(sessionStorage.getItem("synapse-last-reload") || 0);
+  if (Date.now() - last < 10000) return; // анти-луп: не чаще раза в 10с
+  sessionStorage.setItem("synapse-last-reload", String(Date.now()));
+  location.reload();
+}
+
+async function probeSession() {
+  if (!client || connecting) return; // вотчдог сторожит только живой голос
+  let data;
+  try { data = await getJSON("./session-alive"); }
+  catch { return; } // сеть упала — неизвестность, реконнект ничего не починит
+  if (data.active) { aliveMisses = 0; return; }
+  if (++aliveMisses < 2) return; // одиночный false — возможная гонка старта сессии
+  aliveMisses = 0;
+  // зомби: клиент думает «on», сервер сессию не держит → тихий реконнект на месте
+  const c = client;
+  client = null;
+  await c.disconnect().catch(() => {});
+  connecting = true;
+  setMicState("connecting");
+  setConn("связь потеряна — переподключаю…");
+  try {
+    await connectVoice();
+  } catch (err) {
+    console.error("auto-reconnect failed:", err);
+    client = null;
+    setMicState("error", "связь потеряна — тапни микрофон");
+    maybeReload();
+  } finally {
+    connecting = false;
+  }
+}
+setInterval(probeSession, 5000);
 
 // ---------- drawer (мобайл) ----------
 function closeDrawer() { $("shell").classList.remove("drawer-open"); $("backdrop").hidden = true; }
@@ -366,5 +412,6 @@ setInterval(loadLists, 5000);
 setInterval(pollFeed, 3000);
 setInterval(pollStatus, 3000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) { loadLists(); pollFeed(); pollStatus(); }
+  if (!document.hidden) { loadLists(); pollFeed(); pollStatus(); probeSession(); }
 });
+window.addEventListener("online", () => probeSession());

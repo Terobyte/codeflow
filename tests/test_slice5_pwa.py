@@ -96,18 +96,22 @@ async def test_icon_routes_serve_correctly_sized_png(endpoint_name, size):
 
 
 # ================================================================================================
-# §2.7 — reconnect.js: truth-poll watchdog, no wall-clock reload logic
+# §2.7 — вотчдог: truth-poll, no wall-clock reload logic. UI v3: носитель — app.js (reconnect.js
+# умер; свой клиент реконнектится на месте, reload — последний резерв по прежним правилам).
 # ================================================================================================
-async def test_reconnect_js_route_contains_watchdog_primitives():
+async def test_app_js_carries_watchdog_primitives():
     webrtc_server = _webrtc_server_or_skip()
     app = webrtc_server.build_web_app(host=object())
-    resp = await _endpoint(app, "client_reconnect_js")()
+    resp = await _endpoint(app, "client_app_js")()
 
     assert resp.status_code == 200
     assert resp.media_type == "text/javascript"
     body = resp.body.decode("utf-8")
-    for token in ("session-alive", "location.reload", "sessionStorage", "visibilitychange"):
-        assert token in body, f"reconnect.js missing expected token {token!r}"
+    for token in ("session-alive", "location.reload", "sessionStorage", "visibilitychange",
+                  "probeSession"):
+        assert token in body, f"app.js watchdog missing expected token {token!r}"
+    names = {getattr(getattr(r, "endpoint", None), "__name__", "") for r in app.routes}
+    assert "client_reconnect_js" not in names
 
 
 # ================================================================================================

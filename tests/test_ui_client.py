@@ -38,10 +38,11 @@ def test_index_is_spa_shell():
         "threads-list", "kora-card", "kora-card-sub", "./logs",
         "view-home", "view-thread", "feed-list", "typing",
         "mic-btn", "msg-input", "msg-send", 'data-state="idle"', "bot-audio",
-        "manifest.webmanifest", "apple-touch-icon", "reconnect.js", "app.js", "style.css",
+        "manifest.webmanifest", "apple-touch-icon", "app.js", "style.css",
         'lang="ru"', "viewport-fit=cover", "picker-dirs", "picker-choose",
     ):
         assert token in body, f"index.html missing {token!r}"
+    assert "reconnect.js" not in body  # вотчдог живёт в app.js (UI v3)
     assert "kora-dot" not in body
     assert "status-widget.js" not in body  # светофор нативный, не инжект-виджет
     assert "не подключено" not in body     # статус виден только когда есть что сказать
@@ -141,7 +142,7 @@ def test_all_exact_client_routes_registered_before_dev_mount():
     mount_i = next(i for i, r in enumerate(routes) if r.__class__.__name__ == "Mount")
     idx = {getattr(getattr(r, "endpoint", None), "__name__", None): i for i, r in enumerate(routes)}
     for name in (
-        "client_index", "client_index_html", "client_manifest", "client_reconnect_js",
+        "client_index", "client_index_html", "client_manifest",
         "client_icon_192", "client_icon_512", "client_apple_touch_icon", "session_alive",
         "kora_status", "kora_log_feed", "client_logs", "client_status_widget_js",
         "client_app_js", "client_style_css", "client_vendor_pipecat", "client_thread",
