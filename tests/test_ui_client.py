@@ -99,3 +99,18 @@ def test_our_static_routes_exist():
     names = {getattr(getattr(r, "endpoint", None), "__name__", "") for r in app.routes}
     for n in ("client_app_js", "client_style_css", "client_vendor_pipecat"):
         assert n in names
+
+
+def test_all_exact_client_routes_registered_before_dev_mount():
+    webrtc_server = _webrtc_server_or_skip()
+    app = webrtc_server.build_web_app(host=object())
+    routes = app.router.routes
+    mount_i = next(i for i, r in enumerate(routes) if r.__class__.__name__ == "Mount")
+    idx = {getattr(getattr(r, "endpoint", None), "__name__", None): i for i, r in enumerate(routes)}
+    for name in (
+        "client_index", "client_index_html", "client_manifest", "client_reconnect_js",
+        "client_icon_192", "client_icon_512", "client_apple_touch_icon", "session_alive",
+        "kora_status", "kora_log_feed", "client_logs", "client_status_widget_js",
+        "client_app_js", "client_style_css", "client_vendor_pipecat",
+    ):
+        assert idx[name] < mount_i, f"{name} must be registered BEFORE the /client/dev mount (S24)"
