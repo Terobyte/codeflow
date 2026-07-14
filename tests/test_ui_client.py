@@ -188,7 +188,7 @@ def test_stage_ui_is_xss_safe_and_has_gate_controls():
     for token in (
         "gate_card", "/gate", "СБОР", "ЗАПРОС", "СПЕКА·ПЛАН", "КОД", "ГОТОВО",
         "точно", 'el("select"', "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5",
-        "renderStageChip", "#/activity", "pollActivity",
+        "renderStageChip", "#/activity", "pollActivity", "resizeMessageInput", "thread_stage",
     ):
         assert token in app, f"stage UI missing {token!r}"
     assert 'id="stage-chip"' in index

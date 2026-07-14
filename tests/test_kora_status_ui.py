@@ -27,6 +27,7 @@ from synapse.bridge.state import Liveness, SpeakLedger, TaskStatus, TaskStore
 from synapse.clock import FakeClock
 from synapse.config import SynapseConfig
 from synapse.journal import TurnJournal
+from synapse.threads import ThreadStore
 
 
 def _webrtc_server_or_skip():
@@ -341,9 +342,9 @@ def test_status_color_matrix(liveness, task_status, awaiting, expected):
 # =========================================================================================
 
 
-def _stub_host(clock, store, kora_log=None):
+def _stub_host(clock, store, kora_log=None, threads=None):
     cfg = types.SimpleNamespace(stale_after_s=120.0, unreachable_after_s=300.0)
-    return types.SimpleNamespace(clock=clock, cfg=cfg, store=store, kora_log=kora_log)
+    return types.SimpleNamespace(clock=clock, cfg=cfg, store=store, kora_log=kora_log, threads=threads)
 
 
 async def test_kora_status_route_running_fresh_is_green(tmp_path):
@@ -422,6 +423,24 @@ async def test_kora_status_route_truncates_task_text_to_60():
 
     data = json.loads((await _endpoint(app, "kora_status")()).body)
     assert data["task_text"] == "а" * 60
+
+
+async def test_kora_status_route_includes_active_thread_context(tmp_path):
+    webrtc_server = _webrtc_server_or_skip()
+    clock = FakeClock(1.0)
+    store = TaskStore(FakeClock(0.0))
+    store.start_task("t1", "задача", TaskStatus.RUNNING, now=0.0)
+    store.heartbeat(0.0)
+    threads = ThreadStore(clock, tmp_path / "threads")
+    thread = threads.create("Контекстный тред")
+    threads.append_task(thread.id, "t1")
+    threads.set_stage(thread.id, "propose")
+    app = webrtc_server.build_web_app(host=_stub_host(clock, store, threads=threads))
+
+    data = json.loads((await _endpoint(app, "kora_status")()).body)
+    assert data["thread_id"] == thread.id
+    assert data["thread_title"] == "Контекстный тред"
+    assert data["thread_stage"] == "propose"
 
 
 async def test_kora_log_route_serves_entries_in_insertion_order():
