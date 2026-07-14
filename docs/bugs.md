@@ -307,3 +307,89 @@ Proof (test node id per bug — B15's is xfail'd, the rest flip green after thei
 - **B24** (`synapse/bridge/kora.py`): гейт v3 — мутирующие Write/Edit/NotebookEdit разрешены ВНЕ workspace (секрет-чек `_is_secret_path` на полном resolved-пути ДО этой ветки не тронут; docs_only-ран → вне ws = docs_only_violation). Проверки: `test_B24_write_outside_workspace_nonsecret_is_allowed` зелёный, `::test_B24_write_to_secret_path_stays_denied` зелёный. Перепинены под новый контракт: `test_kora` (sibling/home write→allow, journals-категории, read+write outside), `test_runspec` (default-ws больше не outside_workspace-deny), `test_bughunt_w3` B21-проба (Write секрета вне ws, инвариант «detail без пути» цел).
   - `_system_prompt` переписан: «создавать/изменять файлы можно где угодно кроме секретных; дефолт-путь — workspace». **`not-test-verifiable`** (LLM-поведение) — owed live-check: «создай helloworld.txt на рабочем столе» → Кора ДОЛЖНА выполнить (в стейджинге отказывалась на уровне промпта, tool не звала).
 - **B25** (`synapse/pipeline/context_guard.py` + `app.py`): в `make_guarded_assistant_aggregator` добавлен опц. `on_commit`-колбэк — вызывается сразу после коммита ответа в контекст (guard на `is_aborted(gen)`, чтобы не слить отменённый failover-текст); в `app.py` прокинут `on_commit=_flush_voice_context`. Курсор флашера делает три вызова (commit / next-turn / disconnect) идемпотентными. Проверка: `test_dispatcher_answer_reaches_feed_at_commit` зелёный (драйвит реальный `push_aggregation`).
+
+## 2026-07-14 — hands-on browser + fan-out UI hunt (16 находок, 3 CRIT; Opus senior + 4 соннет-хантера read-only)
+Разведка: Opus кликал живой UI на стейджинге :7861 (Playwright) + 4 соннет-хантера на непересекающихся линзах (client/app.js edge-cases · webrtc_server routes security · gate/thread/project FSM · realtime voice→chat история). Приоритет Теро: **realtime→чат должен быть бесшовным и хранить ВСЮ историю** → войс-баги идут ПЕРВЫМИ. Все находки с file:line-уликами; фиксов пока НЕТ (ждём порядок). Дифф-кнопка («Пока нет изменений») — НЕ баг, а осознанная заглушка (`app.js:173` «плейсхолдер P2: реальный git diff не подключён»). `/api/browse` — traversal НЕ пробит (клетка `is_relative_to(home)`, скрытые каталоги спрятаны).
+
+### B42 — REALTIME: недокоммиченный ответ диспетчера ТЕРЯЕТСЯ при «Завершить — в чат» посреди речи — CRIT — open
+- class: history loss (прямо бьёт по приоритету Теро) · location: `webrtc_server.py:176-190` (on_client_disconnected → `task.cancel()`), `app.py:845-858` (`_flush_voice_context`), pipecat `llm_response_universal.py:1595-1612` (commit ТОЛЬКО на `LLMFullResponseEndFrame`) vs `1645-1657` (`_handle_end_or_cancel` — НЕ зовёт `push_aggregation`)
+- symptom: юзер спросил, диспетчер НАЧАЛ отвечать (текст уже стримится через TTS, уже слышен), юзер тапает «Завершить — в чат» / вешает трубку → `task.cancel()` шлёт `CancelFrame` → агрегатор pipecat коммитит ответ в `context.messages` ТОЛЬКО на нормальном end-frame, на Cancel — НЕ коммитит → `_flush_voice_context` флашить нечего → в чате, куда попадает юзер, НЕТ ответа, который он только что СЛЫШАЛ.
+- expected vs actual: лента треда обязана содержать каждый ответ, что юзер услышал · actual: самый частый кейс (обрыв главной hangup-кнопкой посреди ответа) роняет ответ на пол. B25 закрыл лаг commit→лента, но НЕ ответы, которые до commit не доходят.
+- fix sketch: на teardown дофлашить хвост агрегатора ДО cancel — вызвать `push_aggregation()` (или его эквивалент) на войс-assistant-агрегаторе в on_client_disconnected ПЕРЕД `task.cancel()`, затем `flush_voice_feed()`. Гвард на пустой `_aggregation`.
+
+### B43 — REALTIME: гонка реконнекта переклеивает живой звонок на ДРУГОЙ тред → история расщепляется — MAJOR — open
+- class: history split / wrong-thread bind · location: `app.js:226-234` (гейт active-thread только на `!client`, НЕ на `liveRequested/connecting`), `app.js:898-927` (`probeSession` тихий реконнект: `client=null` на время хендшейка), `webrtc_server.py:687` (`voice_thread["id"]` переписывается безусловно)
+- symptom: звонок привязан к T1; сеть моргнула → `probeSession` ставит `client=null` и запускает `connectVoice()` (ICE/DTLS — сотни мс…секунды). В это окно `client` falsy, хотя звонок жив. Юзер тапает другой тред → `render()` видит `client===null` → POST `/api/active-thread` переписывает `voice_thread["id"]=T2`. Реконнект дозавершается → `_on_end_of_turn` читает `voice_thread["id"]`=T2 → следующие ходы падают в T2, ранние в T1.
+- expected vs actual: пока звонок жив (включая тихий реконнект) — история держится одного треда · actual: навигация в окне реконнекта расщепляет разговор по двум тредам. Меньший тот же зазор на ПЕРВОМ коннекте (между `liveRequested=true` и `client=me`).
+- fix sketch: гейт active-thread в `render()` расширить на `!client && !liveRequested && !connecting`; ИЛИ сервер не переклеивает `voice_thread`, пока сессия mid-(re)connect.
+
+### B44 — REALTIME: реконнект обнуляет живой LLM-контекст диспетчера — лента полная, но диспетчер «забыл» всё до обрыва — MAJOR — open
+- class: continuity loss (лента ≠ память диспетчера) · location: `app.py:832` (`context = LLMContext(tools=ALL_SCHEMAS)` — единственная точка), `webrtc_server.py:145` (`build_session_pipeline` заново на КАЖДЫЙ reconnect), контраст `dispatcher/loop.py:83-108` (`_history_for` HTTP-путь ДЕЛАЕТ регидрацию из ленты)
+- symptom: каждый reconnect (авто после блипа / ручной перезвон в тот же тред) получает свежий ПУСТОЙ `LLMContext`; системный промпт несёт только статичные правила + `stage_block`, НЕ прошлые ходы/`request_text`. Диспетчер переспрашивает то, на что уже есть ответы — хотя лента треда (пишется независимо из `_on_end_of_turn`/`_flush_voice_context`) показывает весь прошлый обмен.
+- expected vs actual: reconnect продолжает разговор, диспетчер помнит обсуждённое · actual: видимое противоречие — экран показывает историю, диспетчер ведёт себя как амнезиак. Транскрипт не потерян, «бесшовность» — да.
+- fix sketch: seed свежего `context` из `host.threads` feed (регидрация user/assistant, как `_history_for` на HTTP), либо переиспользовать тёплую `text_loop`-историю треда. NO-EXFIL: только слова user/диспетчера, кора-виды в контекст не идут.
+
+### B45 — тап по заголовку треда (rename) сносит `#view-title` из DOM → следующий render кидает → ВСЕ обновления title/badge/стадии замирают до перезагрузки — CRIT — open
+- class: crash + перманентная регрессия render-цикла · location: `app.js:723-734` (`renameCurrentThread`: `titleEl.replaceWith(input)` — узел с id снят), `app.js:698-703` (`commitRename`: `$("view-title")` → null → `titleEl.textContent=` TypeError), `index.html:72` (id на самом div, `el("input")` его не восстанавливает)
+- symptom: юзер тапнул заголовок треда, ввёл имя, blur/Enter → `commitRename` первым делом `titleEl.textContent=` на null → TypeError ДО `try/finally` → `renaming` навсегда `true`; `#view-title` не восстановлен → каждый последующий `render()` (`app.js:196`) и `loadLists()` (`app.js:400`) тоже кидают на том же null — а они бегут на каждый hashchange и каждые 5с. Итог: один тап по заголовку намертво морозит title/badge/стадию до полной перезагрузки.
+- repro: открыть тред → тапнуть заголовок → Enter. Тривиально достижимо.
+
+### B46 — write_code stale-plan гвард переоткрыт: завершение НЕсвязанной direct-dispatch задачи ставит `last_outcome="completed"` → Кора кодит по НЕвалидированному плану (реопен B07) — CRIT — open
+- class: data-integrity/safety · location: `app.py:285-297` (`_run_finished`: `set_outcome(thread_id, outcome)` безусловно), `kora.py:511-520` (колбэк `on_run_finished(thread_id, outcome)` — БЕЗ task_id/gate_mode/стадии), `app.py:354-376` (`write_code`: единственный freshness-сигнал `last_outcome=="completed"`), `app.py:317-331` (`revise` сбрасывает outcome=None — это и был фикс B07)
+- repro: (1) тред T: propose→send_to_kora docs_only completes → `docs/plans/T.md` под запрос A, last_outcome=completed. (2) revise → stage=collect, last_outcome=None (B07), но T.md НЕ удалён. (3) тот же тред, `submit_task` на НЕсвязанную мелочь (ничто не стадия-гейтит его — см. B47) → completes → `_run_finished(T,"completed")` → last_outcome снова "completed". (4) propose(B) → `write_code(confirm)`: plan_path.exists()=True (стейл T.md запроса A), `last_outcome!="completed"`=False → гвард пропускает → Кора запускается «Реализуй по плану docs/plans/T.md, запрос: B» по ЧУЖОМУ плану, без единого свежего spec_plan для B.
+- fix sketch: `on_run_finished` должен нести task_id/стадию; `_run_finished` ставит last_outcome="completed" ТОЛЬКО для gate-launched spec_plan-рана этого треда, не для любой завершённой задачи.
+
+### B47 — direct-dispatch (`submit_task`/`confirm_task`) НЕ двигает `thread.stage` → завершённая задача навсегда с бейджем «СБОР» (наблюдалось живьём) — MAJOR — open
+- class: FSM/UI inconsistency · location: `app.py:613-626` (`_on_task_committed` — нет set_stage), `app.py:662-669` (`_http_task_committed` — нет set_stage), `app.py:285-297` (`_run_finished`: единственный set_stage(«done») только если stage уже «code»)
+- symptom: наблюдал живьём — «создай helloworld.txt» ушло через прямой send_to_kora диспетчера, задача COMPLETED, файл записан, а тред остался stage="collect" (бейдж «СБОР»). `last_outcome` читается "completed" при stage="collect" бесконечно.
+- note: структурно, не by-design; промпт (`prompt.py:36`) рекламирует `submit_task` без стадийного квалификатора, стадия-правила навешиваются только на collect/propose. Родня B46 (тот же слепой канал).
+
+### B48 — архивный тред остаётся полностью запускаемым/мутируемым: `archived` не проверяется ни в одном write-пути — MAJOR — open
+- class: illegal state / zombie thread · location: `app.py` (`gate_action` 299-377, `_propose_for` 530-554, `_on_task_committed` 613-626, `_http_task_committed` 662-669) — никто не читает `th.archived`; `threads.py` (`append_task` 110-117, `append_feed` 244-247) — тоже
+- symptom: `gate_action(id,"send_to_kora",confirm)` (голос или POST /gate) на архивном треде идёт как на живом (единственный гвард — глобальный busy + per-thread lock); `propose_request` двигает архивный collect→propose; оба commit-пути аппендят задачи/пускают Кору в него. Стейл `voice_thread["id"]` на архивный тред → он копит задачи/ленту и гоняет Кору после «уборки».
+- fix sketch: read-гвард `th.archived` в gate_action/propose/commit-путях → отказ (или тихий no-op с фидбеком).
+
+### B49 — архив треда разрешён, пока задача в `PENDING_CONFIRMATION` (busy-чек ловит только RUNNING) — MAJOR — open
+- class: illegal transition · location: `webrtc_server.py:612-628` (`api_thread_archive`: `task.status == TaskStatus.RUNNING` only), `state.py:186-190` (`has_active_task` канонично включает PENDING_CONFIRMATION)
+- repro: деструктивный ask на T → `ConfirmFlow.submit` → task=PENDING_CONFIRMATION → POST /threads/T/archive: RUNNING-чек False → архив проходит. Юзер говорит «да» → confirm_task → RUNNING → append_task в уже-архивный T + запуск Коры. «Ушедший» тред принимает и гоняет задачу.
+- fix sketch: archive busy-чек = `has_active_task()` (RUNNING ∪ PENDING_CONFIRMATION), как везде.
+
+### B50 — `/api/browse?path=%00` (null-байт) → 500 unhandled на неаутентифицированном роуте — MAJOR — open
+- class: crash / input validation · location: `webrtc_server.py:44-47` (`_browse_dir`: `p.resolve()` ловит только OSError/RuntimeError; null-байт даёт `ValueError: embedded null character` мимо гарда)
+- repro (live, TestClient): `GET /api/browse?path=%00` → 500. Любой вызыватель роняет эндпоинт.
+- fix sketch: расширить except на ValueError → fallback-to-home (как для любого нерезолвимого пути) или 400.
+
+### B51 — `confirm`/`fast` строка-vs-bool: `bool("false")==True` → `confirm:"false"` запускает НЕподтверждённый full-write Kora-ран — MAJOR — open
+- class: confirmation-gate bypass (данные/безопасность) · location: `webrtc_server.py:663-664` (`confirm=bool(data.get("confirm"))`, `fast=bool(...)`), достигает `app.py:332-353` (confirm гейтит запуск, fast переключает docs_only→code/full write)
+- repro (live): POST /gate `{"action":"send_to_kora","confirm":"false","fast":"false"}` → сервер получает confirm=True, fast=True → 200, запуск full-write. Штатный клиент шлёт настоящие bool'ы (не достижимо через app.js), но любой прямой/кривой вызыватель ломает гейт подтверждения.
+- fix sketch: строгая интерпретация — `data.get("confirm") is True` или явный парс bool из JSON-типа, не `bool(str)`.
+
+### B52 — gate-карточка навсегда disabled после 409 «busy», нет пути ретрая — MAJOR — open
+- class: workflow dead-end · location: `app.js:529-548` (кнопки force-disabled синхронно ДО fetch; на 409 `finally` явно НЕ ре-энейблит, т.к. `note.textContent==="Кора занята — ждёт"`; gate-карточки рисуются один раз, поллингом не перерисовываются)
+- symptom: Кора на миг занята → 409 → карточка мертва навсегда, юзер не может повторить, пока сервер не выпустит НОВЫЙ gate_card (если выпустит).
+
+### B53 — успешный gate-экшен оставляет note «запускаю…» и ре-энейблит те же кнопки → приглашение к дублю; `live` захвачен один раз, устаревает — MAJOR — open
+- class: duplicate action / no success feedback · location: `app.js:478-482,530,541-548` (`live` вычислен один раз на рендере, не ревалидируется; на успехе note не меняется с «запускаю…», `finally` ре-энейблит кнопки по стейл `live`)
+- symptom: после «Пиши код» карточка всё ещё «запускаю…» и снова кликабельна; стейл-карточка может выстрелить экшен по стадии, которой уже нет.
+
+### B54 — архив треда, который открыт → страница молча деградирует в пустую, ноль фидбека — MAJOR — open
+- class: silent failure / no empty-state · location: `app.js:195-196` (`render`: `t?t.title:"тред"` — нет error-UI когда t undefined), `app.js:563-571` (`pollFeed` `catch{return}` — 404 на архивном треде глотается вечно; в отличие от `loadLists`, у pollFeed нет `setConn(LOAD_ERR)`)
+- repro: открыть тред → «архив» на его же карточке в сайдбаре → `location.hash` всё ещё на нём → render даёт generic «тред», pollFeed вечно 404-ит молча. Юзер смотрит в статичную пустую страницу без единого намёка.
+
+### B55 — неизвестный/стейл тред-роут → пустая вью + бесконечный 404-поллинг ленты, нет «не найдено» — MINOR — open
+- class: silent failure · location: `app.js:563-571` (`pollFeed` `catch{return}` не останавливает интервал), нет not-found-состояния для неизвестного id
+- repro (live, я кликал): navigate `#/thread/<garbage>` → 7+ одинаковых 404 `/feed?limit=500` подряд, POST `/api/active-thread` с битым id → 404, юзер видит пустой тред без «не найдено».
+
+### B56 — `GET /api/threads?archived=false` трактуется truthy → прячет реальный список тредов — MINOR — open
+- class: silent data-hiding · location: `webrtc_server.py:511` (`if archived and archived != "0"` — только "0"/пусто = off; "false"/"no" → ветка archived-only)
+- repro (live): `?archived=false` → `{"threads":[]}`, без параметра → реальный список. Штатный app.js не шлёт, но контракт API нарушен.
+
+### B57 — `feed?limit=0` возвращает ВСЮ ленту (и `limit=-5` — левый срез) — MINOR — open
+- class: off-by-semantics · location: `webrtc_server.py:538` (`limit:int=200`) → `threads.py:266` (`.splitlines()[-limit:]`; `lst[-0:]==lst[0:]` → всё)
+- repro (live): `?limit=0` при 2 записях → обе записи. Негативный limit даёт несвязанный срез.
+
+### B58 — `POST /api/active-thread {"id":""}` → 404 вместо очистки активного треда — MINOR — open
+- class: contract inconsistency · location: `webrtc_server.py:685,687` (гвард исключает только None; строка 687 трактует falsy как clear, но 685 404-ит на "" как на несуществующем id)
+- repro (live): `{"id":""}` → 404. Штатный клиент шлёт null/реальный id.
+
+### Awareness (вне линз, не в счёте 16): CSRF-зазор на `POST /api/offer` (`webrtc_server.py:311`) и `POST /start` (263) — без CSRF, cross-origin достижимы; `/api/offer` вытесняет единственную живую сессию. Комментарий файла зовёт их «unused by prebuilt, kept curl-testable» — принятый/известный зазор WebRTC-сигналинга, не CodeFlow-API. Флаг для осознанности.
