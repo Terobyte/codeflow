@@ -422,8 +422,12 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         if not _csrf_ok(request):
             return JSONResponse({"error": "csrf"}, status_code=403)
         data = await request.json()
-        t = host.threads.create(str(data.get("title") or "новый тред"),
-                                project_id=data.get("project_id"))
+        pid = data.get("project_id")
+        t = host.threads.create(
+            str(data.get("title") or "новый тред"),
+            # мёртвый/чужой project_id тихо деградирует в «без проекта» (паттерн active-thread)
+            project_id=str(pid) if pid and host.projects.get(str(pid)) is not None else None,
+        )
         return JSONResponse(_thread_dict(t))
 
     @app.get("/api/threads/{thread_id}/feed")
@@ -464,6 +468,12 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         if tid is not None and host.threads.get(str(tid)) is None:
             return JSONResponse({"error": "no such thread"}, status_code=404)
         host.voice_thread["id"] = str(tid) if tid else None
+        # UI v3 иерархия: активный проект дома — голосовой авто-тред родится в нём.
+        # Неизвестный проект тихо сбрасывается в None (тот же паттерн, что voice_thread).
+        pid = data.get("project_id")
+        host.voice_project["id"] = (
+            str(pid) if pid and host.projects.get(str(pid)) is not None else None
+        )
         return JSONResponse({"ok": True})
 
     app.mount("/client/dev", PipecatPrebuiltUI, name="client-dev")

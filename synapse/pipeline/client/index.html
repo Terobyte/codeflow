@@ -25,7 +25,7 @@
         <h2>Проекты</h2>
         <ul id="projects-list"></ul>
         <button id="add-project" type="button">＋ проект</button>
-        <h2>Треды</h2>
+        <h2 id="loose-h" hidden>Без проекта</h2>
         <ul id="threads-list"></ul>
       </nav>
       <a id="kora-card" href="./logs">
@@ -57,6 +57,7 @@
       </section>
       <p id="conn-status" hidden></p>
       <footer id="composer">
+        <button id="proj-chip" type="button" title="активный проект"></button>
         <input id="msg-input" type="text" placeholder="Опиши задачу…" autocomplete="off">
         <button id="msg-send" type="button" aria-label="отправить">➤</button>
         <button id="mic-btn" type="button" data-state="idle" aria-label="микрофон">🎙</button>

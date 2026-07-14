@@ -43,6 +43,25 @@ let projects = [];
 let feedThread = null; // чей фид сейчас в DOM
 let feedCount = 0;     // сколько записей уже отрендерено (инкрементальный append)
 
+// ---------- активный проект: дом рожает треды-ветки в нём ----------
+// Персистится в localStorage; валидируется против загруженного списка — удалённый
+// на сервере проект не должен молча утаскивать новые треды в никуда.
+let activeProject = localStorage.getItem("synapse-active-project") || null;
+
+function setActiveProject(pid) {
+  activeProject = activeProject === pid ? null : pid; // повторный тап снимает выбор
+  if (activeProject) localStorage.setItem("synapse-active-project", activeProject);
+  else localStorage.removeItem("synapse-active-project");
+  render();
+}
+
+function validateActiveProject() {
+  // Storage — источник правды, здесь только гейт отображения: транзиентно-пустой
+  // список проектов (гонка загрузки, рестарт сервера) не должен НАВСЕГДА стирать выбор.
+  const stored = localStorage.getItem("synapse-active-project");
+  activeProject = stored && projects.some((p) => p.id === stored) ? stored : null;
+}
+
 function render() {
   const r = route();
   closeDrawer();
@@ -65,8 +84,12 @@ function render() {
     $("thread-badge").hidden = true;
     feedThread = null;
   }
-  // Голос адресуется открытому треду; дом = авто-тред диспетчера (сброс в null).
-  postJSON("/api/active-thread", { id: r.view === "thread" ? r.id : null }).catch(() => {});
+  // Голос адресуется открытому треду; дом = авто-тред диспетчера в активном проекте.
+  postJSON("/api/active-thread", {
+    id: r.view === "thread" ? r.id : null,
+    project_id: r.view === "home" ? activeProject : null,
+  }).catch(() => {});
+  renderChip(r);
   renderSidebar();
   renderHome();
 }
@@ -81,34 +104,65 @@ function renderBadge(t) {
   b.hidden = false;
 }
 
-// ---------- сайдбар: проекты + треды-карточки ----------
-function threadCard(t, cur) {
+// ---------- сайдбар: дерево проект → его треды-ветки ----------
+function threadCard(t, cur, showProj) {
   const a = el("a", "thread-card" + (cur.view === "thread" && cur.id === t.id ? " active" : ""));
   a.href = "#/thread/" + encodeURIComponent(t.id);
   const badge = t.last_outcome === "failed" ? "✖ " : t.last_outcome === "completed" ? "✓ " : "";
   a.appendChild(el("span", "tc-title", badge + t.title));
-  const proj = projects.find((p) => p.id === t.project_id);
+  const proj = showProj ? projects.find((p) => p.id === t.project_id) : null;
   a.appendChild(el("span", "tc-meta", relTime(t.updated_ts) + (proj ? " · " + proj.name : "")));
   return a;
 }
 
 function renderSidebar() {
   const cur = route();
+  const known = new Set(projects.map((p) => p.id));
   const pul = $("projects-list");
   pul.replaceChildren();
   projects.forEach((p) => {
-    const li = el("li", "", "📁 " + p.name);
-    li.title = p.path;
+    const li = el("li", "project");
+    const row = el("button", "project-row" + (p.id === activeProject ? " active" : ""));
+    row.type = "button";
+    row.title = p.path;
+    row.appendChild(el("span", "pr-name", "📁 " + p.name));
+    row.addEventListener("click", () => setActiveProject(p.id));
+    li.appendChild(row);
+    const branch = el("ul", "branch");
+    threads.filter((t) => t.project_id === p.id).forEach((t) => {
+      const bi = el("li");
+      bi.appendChild(threadCard(t, cur, false)); // имя проекта уже над веткой
+      branch.appendChild(bi);
+    });
+    li.appendChild(branch);
     pul.appendChild(li);
   });
+  // мёртвый project_id (проект удалили) — тред не исчезает, а падает в «Без проекта»
+  const loose = threads.filter((t) => !t.project_id || !known.has(t.project_id));
   const tul = $("threads-list");
   tul.replaceChildren();
-  threads.forEach((t) => {
+  loose.forEach((t) => {
     const li = el("li");
-    li.appendChild(threadCard(t, cur));
+    li.appendChild(threadCard(t, cur, false));
     tul.appendChild(li);
   });
+  $("loose-h").hidden = loose.length === 0;
 }
+
+// ---------- чип проекта в композере: куда родится тред с дома ----------
+function renderChip(r) {
+  const chip = $("proj-chip");
+  if (r.view !== "home") { chip.hidden = true; return; }
+  const proj = projects.find((p) => p.id === activeProject);
+  chip.textContent = proj ? "📁 " + proj.name : "без проекта";
+  chip.classList.toggle("has-proj", !!proj);
+  chip.hidden = false;
+}
+$("proj-chip").addEventListener("click", () => {
+  // тап по чипу ведёт к списку проектов — выбор делается тапом по строке проекта
+  $("shell").classList.add("drawer-open");
+  $("backdrop").hidden = false;
+});
 
 function renderHome() {
   const cur = route();
@@ -116,7 +170,7 @@ function renderHome() {
   ul.replaceChildren();
   threads.slice(0, 6).forEach((t) => {
     const li = el("li");
-    li.appendChild(threadCard(t, cur));
+    li.appendChild(threadCard(t, cur, true)); // на доме ветки перемешаны — имя проекта нужно
     ul.appendChild(li);
   });
   $("recent-h").hidden = threads.length === 0;
@@ -128,6 +182,8 @@ async function loadLists() {
     threads = tData.threads;
     projects = pData.projects;
   } catch { return; } // сеть упала — оставляем прошлый рендер, не гадаем
+  validateActiveProject();
+  renderChip(route());
   renderSidebar();
   renderHome();
   const r = route();
@@ -211,8 +267,9 @@ async function sendMessage() {
   try {
     let id = r.view === "thread" ? r.id : null;
     if (!id) {
-      // Дом: первое сообщение создаёт тред с человеческим именем (Ж1 — не «новый тред»)
-      const tRes = await postJSON("/api/threads", { title: text.slice(0, 60) });
+      // Дом: первое сообщение создаёт тред-ветку активного проекта (Ж1 + иерархия)
+      const tRes = await postJSON("/api/threads",
+                                  { title: text.slice(0, 60), project_id: activeProject });
       if (!tRes.ok) { setConn("не удалось создать тред"); return; }
       id = (await tRes.json()).id;
       location.hash = "#/thread/" + encodeURIComponent(id); // render() переключит вью без reload

@@ -77,6 +77,7 @@ class SynapseHost:
         kora_log: deque | None = None,
         threads: Any = None,
         voice_thread: dict | None = None,
+        voice_project: dict | None = None,
         projects: Any = None,
         text_loop: Any = None,
         turn_lock: asyncio.Lock | None = None,
@@ -104,6 +105,9 @@ class SynapseHost:
         # UI v2 слайс UI-2: треды (ThreadStore) + текущий голосовой тред (mut dict — меняют роуты).
         self.threads = threads
         self.voice_thread = voice_thread if voice_thread is not None else {"id": None}
+        # UI v3 иерархия: активный проект дома (фидбек Теро «проекты → треды») — голосовой
+        # авто-тред рождается В проекте, а не сиротой. Mut dict, меняет /api/active-thread.
+        self.voice_project = voice_project if voice_project is not None else {"id": None}
         # UI v2 слайс UI-3: проекты, текстовый ход, очередь ходов, текущий HTTP-тред.
         self.projects = projects
         self.text_loop = text_loop
@@ -238,6 +242,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # персистит метаданные синхронно в точках переходов (находка G).
     threads = ThreadStore(clock, Path(cfg.journal_dir) / "threads", feed_max=cfg.thread_feed_max)
     voice_thread: dict = {"id": None}
+    voice_project: dict = {"id": None}  # UI v3: проект, в котором дом рожает авто-треды
 
     def _kora_log_sink(entry: dict) -> None:
         # Горячий кэш live-стрима (ring) + правда на диске (S3). Исключения глотает
@@ -283,13 +288,27 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             return False  # реплика из треда Б не должна улетать ответом Коре в А
         return kora_runner.provide_answer(text)
 
+    def _resolve_project_root(th) -> str | None:
+        # UI v3: единый резолвер для голоса и HTTP — Кора работает в папке проекта треда.
+        if th.project_id:
+            proj = projects.get(th.project_id)
+            return proj["path"] if proj else None
+        return None
+
     def _on_task_committed(task_id: str, text: str) -> None:
         th = threads.get(voice_thread["id"]) if voice_thread["id"] else None
         if th is None:
-            th = threads.create(title=text)
+            # Авто-тред рождается В активном проекте дома (иерархия «проекты → треды»);
+            # несуществующий/удалённый проект тихо деградирует в «без проекта».
+            pid = voice_project["id"]
+            th = threads.create(title=text,
+                                project_id=pid if pid and projects.get(pid) else None)
             voice_thread["id"] = th.id
         threads.append_task(th.id, task_id)
-        kora_runner.start(task_id, text, RunSpec(thread_id=th.id, project_root=None))
+        # Раньше здесь было жёсткое project_root=None — голосовая задача в проектном треде
+        # игнорировала папку проекта и Кора шла в дефолтный workspace.
+        kora_runner.start(task_id, text,
+                          RunSpec(thread_id=th.id, project_root=_resolve_project_root(th)))
 
     bridge = KoraBridge(
         store=store,
@@ -319,11 +338,8 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         if th is None:
             th = threads.create(title=text)
         threads.append_task(th.id, task_id)
-        root = None
-        if th.project_id:
-            proj = projects.get(th.project_id)
-            root = proj["path"] if proj else None
-        kora_runner.start(task_id, text, RunSpec(thread_id=th.id, project_root=root))
+        kora_runner.start(task_id, text,
+                          RunSpec(thread_id=th.id, project_root=_resolve_project_root(th)))
 
     if kora_runner is not None:
         http_bridge.on_task_committed = _http_task_committed
@@ -364,6 +380,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         kora_log=kora_log,
         threads=threads,
         voice_thread=voice_thread,
+        voice_project=voice_project,
         projects=projects,
         text_loop=text_loop,
         turn_lock=turn_lock,

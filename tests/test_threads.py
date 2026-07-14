@@ -143,3 +143,79 @@ async def test_feed_writer_persists_kora_entries_by_task(tmp_path):
 
     feed = ThreadStore(FakeClock(), tmp_path / "threads").read_feed(th.id)  # рестарт
     assert feed and feed[0]["kind"] == "task" and feed[0]["task_id"] == "t1"
+
+
+# --- UI v3 иерархия «проекты → треды»: настоящие замыкания build_host ---------------------
+# build_host собирается с фейковыми ключами (паттерн test_host_singleton) — тестируем
+# НАСТОЯЩИЙ _on_task_committed/_resolve_project_root, а не копию wiring-а.
+
+
+def _fake_host(tmp_path):
+    from synapse.pipeline.app import build_host
+    cfg = SynapseConfig(
+        google_api_key="fake-google-key",
+        openrouter_api_key="fake-openrouter-key",
+        anthropic_api_key="fake-anthropic-key",
+        deepgram_api_key="fake-deepgram-key",
+        fish_audio_api_key="fake-fish-key",
+        fish_reference_id="fake-fish-ref",
+        journal_dir=str(tmp_path),
+    )
+    host = build_host(cfg)
+    specs = []
+    host.kora_runner.start = lambda tid, text, spec: specs.append(spec)
+    return host, specs
+
+
+async def test_voice_auto_thread_born_in_active_project(tmp_path):
+    host, specs = _fake_host(tmp_path)
+    proj_dir = tmp_path / "proj"; proj_dir.mkdir()
+    proj = await host.projects.add("мой проект", str(proj_dir))
+    host.voice_project["id"] = proj["id"]
+
+    host.bridge.on_task_committed("t1", "сделай файл")
+
+    th = host.threads.thread_for_task("t1")
+    assert th.project_id == proj["id"]           # авто-тред — ветка активного проекта
+    assert specs[0].thread_id == th.id
+    assert specs[0].project_root == proj["path"] # Кора идёт в папку проекта, не в дефолт
+
+
+async def test_voice_auto_thread_dead_project_degrades_to_loose(tmp_path):
+    host, specs = _fake_host(tmp_path)
+    host.voice_project["id"] = "ghost"           # проект удалили, а дом ещё помнит id
+
+    host.bridge.on_task_committed("t2", "текст задачи")
+
+    th = host.threads.thread_for_task("t2")
+    assert th.project_id is None
+    assert specs[0].project_root is None
+
+
+async def test_voice_task_in_project_thread_resolves_project_root(tmp_path):
+    # Регресс-пин бага: раньше голосовой путь слал жёсткое project_root=None —
+    # задача в проектном треде игнорировала папку проекта.
+    host, specs = _fake_host(tmp_path)
+    proj_dir = tmp_path / "p2"; proj_dir.mkdir()
+    proj = await host.projects.add("п2", str(proj_dir))
+    th = host.threads.create("тред проекта", project_id=proj["id"])
+    host.voice_thread["id"] = th.id
+
+    host.bridge.on_task_committed("t3", "задача")
+
+    assert specs[0].thread_id == th.id
+    assert specs[0].project_root == proj["path"]
+
+
+async def test_http_task_in_project_thread_resolves_project_root(tmp_path):
+    host, specs = _fake_host(tmp_path)
+    proj_dir = tmp_path / "p3"; proj_dir.mkdir()
+    proj = await host.projects.add("п3", str(proj_dir))
+    th = host.threads.create("тред проекта", project_id=proj["id"])
+    host.current_http_thread["id"] = th.id
+
+    # HTTP-мост живёт внутри text_loop (S7: свой ToolHandlers) — общий резолвер тот же
+    host.text_loop._handlers.bridge.on_task_committed("t4", "задача")
+
+    assert specs[0].thread_id == th.id
+    assert specs[0].project_root == proj["path"]

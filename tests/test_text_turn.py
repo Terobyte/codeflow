@@ -159,6 +159,7 @@ def _api_host(tmp_path):
         projects=ProjectStore(tmp_path / "projects.json"),
         text_loop=loop_obj, turn_lock=asyncio.Lock(),
         current_http_thread={"id": None}, voice_thread={"id": None},
+        voice_project={"id": None},
         journal=SimpleNamespace(close=lambda: None),
     )
 
@@ -203,6 +204,41 @@ async def test_project_add_validates_path(tmp_path):
     assert (await ep(FakeRequest({"name": "x", "path": "/etc"}))).status_code == 400
     proj_dir = tmp_path / "ok"; proj_dir.mkdir()
     assert (await ep(FakeRequest({"name": "x", "path": str(proj_dir)}))).status_code == 200
+
+
+async def test_active_thread_carries_project_for_voice(tmp_path):
+    # UI v3 иерархия: дом шлёт project_id — голосовой авто-тред родится в этом проекте.
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    ep = _endpoint(app, "api_active_thread")
+    proj_dir = tmp_path / "p"; proj_dir.mkdir()
+    proj = await host.projects.add("п", str(proj_dir))
+
+    assert (await ep(FakeRequest({"id": None, "project_id": proj["id"]}))).status_code == 200
+    assert host.voice_project["id"] == proj["id"]
+    # неизвестный проект тихо сбрасывается (паттерн voice_thread)
+    await ep(FakeRequest({"id": None, "project_id": "ghost"}))
+    assert host.voice_project["id"] is None
+    # отсутствие project_id — тоже сброс: уход с дома не оставляет хвост
+    await ep(FakeRequest({"id": None, "project_id": proj["id"]}))
+    await ep(FakeRequest({"id": None}))
+    assert host.voice_project["id"] is None
+
+
+async def test_thread_create_binds_and_sanitizes_project(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    ep = _endpoint(app, "api_threads_create")
+    proj_dir = tmp_path / "p"; proj_dir.mkdir()
+    proj = await host.projects.add("п", str(proj_dir))
+
+    body = json.loads((await ep(FakeRequest({"title": "т", "project_id": proj["id"]}))).body)
+    assert body["project_id"] == proj["id"]
+    # мёртвый project_id деградирует в «без проекта», тред всё равно создаётся
+    body = json.loads((await ep(FakeRequest({"title": "т2", "project_id": "ghost"}))).body)
+    assert body["project_id"] is None and body["title"] == "т2"
 
 
 async def test_http_answer_guard_blocks_wrong_thread(tmp_path):

@@ -49,10 +49,17 @@ button { font: inherit; cursor: pointer; }
 }
 #new-thread:hover { background: var(--surface-2); }
 #side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 8px; }
-#projects-list li {
+/* дерево: строка проекта, под ней его треды-ветки с общим стволом слева */
+.project-row {
+  display: flex; width: 100%; align-items: center; text-align: left; font: inherit;
   color: var(--dim); font-size: 14px; padding: 8px 6px; border-radius: 8px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border: 1px solid transparent; background: none;
 }
+.project-row:hover { background: var(--surface); }
+.project-row.active { color: var(--text); border-color: var(--accent); background: var(--surface); }
+.pr-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.branch { margin-left: 13px; padding-left: 6px; border-left: 1px solid var(--border); }
+.branch .thread-card { padding: 8px 10px; }
 #add-project {
   width: 100%; margin-top: 4px; font-size: 14px; background: none;
   border: 1px dashed var(--border); border-radius: 10px; color: var(--accent); padding: 9px;
@@ -164,6 +171,14 @@ button { font: inherit; cursor: pointer; }
   display: flex; gap: 8px; padding: 10px 14px calc(env(safe-area-inset-bottom) + 10px);
   border-top: 1px solid var(--border); background: var(--bg);
 }
+/* чип активного проекта: показывает, в какую ветку дом родит тред */
+#proj-chip {
+  align-self: center; max-width: 34%; min-height: 32px; padding: 5px 12px;
+  border-radius: 16px; border: 1px solid var(--border); background: var(--surface);
+  color: var(--dimmer); font-size: 12.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#proj-chip.has-proj { color: var(--accent); border-color: var(--accent); }
 #msg-input {
   flex: 1; font: inherit; padding: 12px 16px; border-radius: 22px;
   border: 1px solid var(--border); background: var(--surface); color: var(--text);

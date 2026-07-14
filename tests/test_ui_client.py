@@ -35,9 +35,9 @@ def test_index_is_spa_shell():
     body = (CLIENT_DIR / "index.html").read_text(encoding="utf-8")
     for token in (
         "shell", "sidebar", "menu-btn", "new-thread", "projects-list", "add-project",
-        "threads-list", "kora-card", "kora-card-sub", "./logs",
+        "threads-list", "loose-h", "kora-card", "kora-card-sub", "./logs",
         "view-home", "view-thread", "feed-list", "typing",
-        "mic-btn", "msg-input", "msg-send", 'data-state="idle"', "bot-audio",
+        "mic-btn", "msg-input", "msg-send", "proj-chip", 'data-state="idle"', "bot-audio",
         "manifest.webmanifest", "apple-touch-icon", "app.js", "style.css",
         'lang="ru"', "viewport-fit=cover", "picker-dirs", "picker-choose",
     ):
@@ -61,6 +61,21 @@ def test_app_js_is_spa_router_and_xss_safe():
     assert "window.open" not in body  # R3: standalone iOS PWA — навигация, не окна
     assert "prompt(" not in body      # абсолютный путь руками умер вместе с prompt()
     assert "location.href" not in body  # SPA: только hash-навигация, никаких перезагрузок
+
+
+def test_app_js_builds_project_thread_tree():
+    """Иерархия: треды растут из проектов ветками, дом рожает тред в активном проекте
+    (localStorage-персист + чип в композере), голос дома получает project_id."""
+    body = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
+    for token in (
+        "synapse-active-project", "setActiveProject", "validateActiveProject",
+        "project-row", "branch", "loose-h",       # дерево в сайдбаре + группа «без проекта»
+        "proj-chip", "renderChip",                # чип цели на доме
+        "project_id: activeProject",              # создание треда с дома — в активный проект
+    ):
+        assert token in body, f"app.js hierarchy missing {token!r}"
+    # active-thread с дома несёт project_id — голосовой авто-тред родится в проекте
+    assert re.search(r"active-thread[\s\S]{0,200}project_id", body)
 
 
 def test_app_js_wires_voice_with_visible_states():
