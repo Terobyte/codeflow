@@ -75,8 +75,6 @@ def _gate_host(tmp_path):
 # =============================================================================================
 
 
-@pytest.mark.xfail(reason="B46: unrelated direct-dispatch completion resets last_outcome, "
-                          "reopening the stale-plan guard write_code relies on", strict=True)
 async def test_B46_unrelated_direct_dispatch_completion_must_not_unstale_the_plan(tmp_path):
     host = _gate_host(tmp_path)
     t = host.threads.create("x")
@@ -92,7 +90,7 @@ async def test_B46_unrelated_direct_dispatch_completion_must_not_unstale_the_pla
     (root / "docs" / "plans").mkdir(parents=True, exist_ok=True)
     (root / "docs" / "plans" / f"{t.id}.md").write_text("план A", encoding="utf-8")
     host.store.set_task_status(TaskStatus.COMPLETED)
-    host._run_finished(t.id, "completed")
+    host._run_finished(t.id, "completed", "docs_only")  # B46: вид рана явный — это spec_plan
     assert host.threads.get(t.id).last_outcome == "completed"
 
     # revise correctly resets last_outcome (B07 fix) -- but the stale plan FILE for

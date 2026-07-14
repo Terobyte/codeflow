@@ -12,5 +12,10 @@ from dataclasses import dataclass
 class RunSpec:
     thread_id: str
     project_root: str | None = None  # None → дефолт-воркспейс (KORA_WORKSPACE_DIR)
-    gate_mode: str = "full"          # "docs_only" появляется в UI-4
+    # None-сентинел как у соседей (B46): None → права дефолтные ("full" нормализует kora),
+    # но вид рана честный — «прямая диспетчеризация, НЕ гейт-ран стадии». Гейт-запуски
+    # (_launch_run) ВСЕГДА передают явный "docs_only"/"full"; on_run_finished по этому полю
+    # отличает стадийный ран (двигает freshness/стадию треда) от прямой задачи (невидима
+    # для гейт-стейта). Дефолт "full" здесь конфлейтил прямую задачу с гейт-раном.
+    gate_mode: str | None = None
     model: str | None = None         # None → cfg.kora_model

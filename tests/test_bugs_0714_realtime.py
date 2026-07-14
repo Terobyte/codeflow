@@ -330,10 +330,6 @@ class _FakeCompletingClient:
         return gen()
 
 
-@pytest.mark.xfail(
-    reason="B47: direct-dispatch commit never advances thread.stage past 'collect'",
-    strict=True,
-)
 async def test_B47_direct_dispatch_commit_never_advances_stage(tmp_path):
     from synapse.bridge.state import TaskStatus
     from synapse.clock import FakeClock

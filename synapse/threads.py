@@ -14,10 +14,12 @@ from pathlib import Path
 from synapse.clock import Clock
 
 # Таблица легальных переходов стадии (UI-4). done — терминальная, без исходящих;
-# collect → propose — единственный «вперёд» из сбора; revise (→ collect) доступен из
-# каждой рабочей стадии (propose/spec_plan/code), см. спеку:57/60/96.
+# collect → propose — «вперёд» гейт-флоу из сбора; collect → done — завершение чистого
+# direct-dispatch треда (B47: тред без гейт-флоу, единственная активность — прямая задача
+# диспетчера, обязан покидать «СБОР» когда задача выполнена); revise (→ collect) доступен
+# из каждой рабочей стадии (propose/spec_plan/code), см. спеку:57/60/96.
 _STAGE_TRANSITIONS: dict[str, frozenset[str]] = {
-    "collect": frozenset({"propose"}),
+    "collect": frozenset({"propose", "done"}),
     "propose": frozenset({"spec_plan", "code", "collect"}),
     "spec_plan": frozenset({"code", "collect"}),
     "code": frozenset({"done", "collect"}),

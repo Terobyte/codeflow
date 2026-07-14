@@ -291,17 +291,36 @@ class SynapseHost:
                 return proj["path"]
         return self.cfg.kora_workspace_dir
 
-    def _run_finished(self, thread_id: str, outcome: str) -> None:
-        """НОВАЯ обёртка на месте on_run_finished=threads.set_outcome: пишет исход И, если ран
-        был на стадии code и завершился completed, переводит тред в done. set_outcome про стадии
-        не знает (факт 10) — переход code→done живёт здесь."""
+    def _run_finished(self, thread_id: str, outcome: str, gate_mode: str | None = None) -> None:
+        """Обёртка on_run_finished. `gate_mode` — вид завершившегося рана (несёт RunSpec):
+        docs_only/full = гейт-ран стадии, None = прямая диспетчеризация (submit/confirm).
+
+        Гейт-ран: пишет исход (freshness-сигнал write_code) и, если ран был на стадии code и
+        завершился completed, переводит тред в done. set_outcome про стадии не знает (факт 10)
+        — переход code→done живёт здесь.
+
+        Прямая задача (B46, реопен B07 закрыт): в треде С гейт-флоу (request_text есть) она
+        НЕВИДИМА для гейт-стейта — не трогает ни last_outcome (иначе завершение несвязанной
+        мелочи воскрешает stale-plan-гвард и Кора кодит по чужому плану), ни стадию (юзер
+        всё ещё собирает/правит запрос). В ЧИСТОМ direct-dispatch треде (гейт-флоу не было)
+        исход пишется для UI, а completed двигает collect→done (B47: бейдж «СБОР» на
+        выполненной задаче)."""
         if self.threads is None:
             return
-        self.threads.set_outcome(thread_id, outcome)
         th = self.threads.get(thread_id)
-        if th is not None and th.stage == "code" and outcome == "completed":
+        if th is None:
+            return
+        if gate_mode is None and th.request_text is not None:
+            return  # B46: несвязанная прямая задача не касается гейт-стейта треда
+        self.threads.set_outcome(thread_id, outcome)
+        if outcome != "completed":
+            return
+        target = "done" if gate_mode is not None and th.stage == "code" else None
+        if gate_mode is None and th.stage == "collect":
+            target = "done"  # B47: чистый direct-dispatch тред покидает «СБОР»
+        if target is not None:
             try:
-                self.threads.set_stage(thread_id, "done")
+                self.threads.set_stage(thread_id, target)
             except ValueError:
                 pass  # гонка: стадия уже сменилась — молчаливый no-op
 
@@ -498,12 +517,13 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         if th is not None:
             threads.append_feed(th.id, entry)
 
-    def _on_run_finished(thread_id: str, outcome: str) -> None:
-        # UI-4: обёртка над threads.set_outcome — переводит code→done при completed. Holder-паттерн:
-        # kora_runner строится ДО host, но on_run_finished зовётся в runtime (после сборки host).
+    def _on_run_finished(thread_id: str, outcome: str, gate_mode: str | None = None) -> None:
+        # UI-4: обёртка над host._run_finished (исход + стадийные переходы; B46 — прямые
+        # задачи не трогают гейт-стейт). Holder-паттерн: kora_runner строится ДО host, но
+        # on_run_finished зовётся в runtime (после сборки host).
         host = _h["host"]
         if host is not None:
-            host._run_finished(thread_id, outcome)
+            host._run_finished(thread_id, outcome, gate_mode)
         else:
             threads.set_outcome(thread_id, outcome)
 

@@ -79,7 +79,8 @@ async def test_run_finished_reports_thread_outcome(tmp_path):
     cfg = SynapseConfig(kora_workspace_dir=str(tmp_path / "ws"))
     runner = KoraRunner(cfg, store, SpeakLedger(), clock, TurnJournal(str(tmp_path / "j"), clock),
                         None, client_factory=_OkClient,
-                        on_run_finished=lambda thread_id, outcome: outcomes.append((thread_id, outcome)))
+                        on_run_finished=lambda thread_id, outcome, gate_mode=None:
+                            outcomes.append((thread_id, outcome)))
     store.start_task("t1", "задача", TaskStatus.RUNNING, 0.0)
     await runner._run("t1", "задача", RunSpec(thread_id="th9"))
     # пустой стрим без task_completed → терминализация в FAILED → исход failed

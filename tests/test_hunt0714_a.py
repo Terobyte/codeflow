@@ -257,7 +257,7 @@ async def test_B07_write_code_refuses_stale_plan_after_revise_and_new_propose(tm
     (root / "docs" / "plans").mkdir(parents=True, exist_ok=True)
     (root / "docs" / "plans" / f"{t.id}.md").write_text("план A", encoding="utf-8")
     host.store.set_task_status(TaskStatus.COMPLETED)
-    host._run_finished(t.id, "completed")
+    host._run_finished(t.id, "completed", "docs_only")  # B46: вид рана явный — это spec_plan
     assert host.threads.get(t.id).last_outcome == "completed"
 
     # Правки → сбор (revise), then propose a DIFFERENT request B. No new spec_plan run has

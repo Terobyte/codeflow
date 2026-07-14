@@ -415,7 +415,7 @@ class KoraRunner:
         on_speak: Callable[[str], None] | None,
         client_factory: Callable[[Any], Any] | None = None,
         log_sink: Callable[[dict[str, Any]], None] | None = None,
-        on_run_finished: Callable[[str, str], None] | None = None,
+        on_run_finished: Callable[[str, str, str | None], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._store = store
@@ -510,6 +510,9 @@ class KoraRunner:
             self._terminalize_if_running(task_id)
             # UI-2 (находка G): исход запуска → тред. Источник — терминальный статус стора
             # ПОСЛЕ terminalize; чужой task в сторе (суперсид) → исход не наш, молчим.
+            # B46: колбэк несёт spec.gate_mode — приёмник обязан отличать гейт-ран стадии
+            # (docs_only/full) от прямой диспетчеризации (None): исход НЕсвязанной прямой
+            # задачи не должен воскрешать freshness-сигнал write_code в этом треде.
             if self._on_run_finished is not None and spec.thread_id:
                 task = self._store.task
                 if task is not None and task.id == task_id:
@@ -517,7 +520,7 @@ class KoraRunner:
                         TaskStatus.COMPLETED: "completed",
                         TaskStatus.FAILED: "failed",
                     }.get(task.status, "cancelled")
-                    self._on_run_finished(spec.thread_id, outcome)
+                    self._on_run_finished(spec.thread_id, outcome, spec.gate_mode)
 
     async def _stream(self, task_id: str, text: str) -> None:
         opts = self._build_options(task_id, text)

@@ -63,7 +63,7 @@ def test_illegal_stage_transitions_raise():
     bad = [
         ("collect", "code"),       # перепрыгивание стадий
         ("collect", "spec_plan"),
-        ("collect", "done"),
+        # collect → done ЛЕГАЛЕН с B47 (чистый direct-dispatch тред завершает задачу)
         ("code", "propose"),       # назад по «лесенке» без revise
         ("done", "collect"),       # done — терминальная
         ("done", "code"),
@@ -170,9 +170,10 @@ def test_load_old_file_without_new_fields_uses_defaults():
 
 
 def test_stage_transitions_table_is_complete():
-    # Stage FSM: collect → propose; propose → spec_plan|code|collect; spec_plan → code|collect;
-    # code → done|collect; done — терминальная (нет исходящих).
-    assert _STAGE_TRANSITIONS["collect"] == frozenset({"propose"})
+    # Stage FSM: collect → propose (гейт-флоу) | done (B47: чистый direct-dispatch тред);
+    # propose → spec_plan|code|collect; spec_plan → code|collect; code → done|collect;
+    # done — терминальная (нет исходящих).
+    assert _STAGE_TRANSITIONS["collect"] == frozenset({"propose", "done"})
     assert _STAGE_TRANSITIONS["propose"] == frozenset({"spec_plan", "code", "collect"})
     assert _STAGE_TRANSITIONS["spec_plan"] == frozenset({"code", "collect"})
     assert _STAGE_TRANSITIONS["code"] == frozenset({"done", "collect"})
@@ -508,11 +509,13 @@ async def test_gate_single_flight_concurrent_calls(tmp_path):
 
 
 async def test_run_finished_code_completed_transitions_to_done(tmp_path):
-    """Новая обёртка on_run_finished: code+completed → done (голый set_outcome так не умеет)."""
+    """Новая обёртка on_run_finished: code+completed → done (голый set_outcome так не умеет).
+    B46: колбэк теперь несёт вид рана — здесь симулируется ГЕЙТ-ран стадии code (gate_mode
+    "full"), ассерты прежние."""
     host = _gate_host(tmp_path)
     t = _propose_thread(host)
     host.threads.set_stage(t.id, "code")
-    host._run_finished(t.id, "completed")
+    host._run_finished(t.id, "completed", "full")
     assert host.threads.get(t.id).stage == "done"
     assert host.threads.get(t.id).last_outcome == "completed"
 
@@ -520,7 +523,7 @@ async def test_run_finished_code_completed_transitions_to_done(tmp_path):
 async def test_run_finished_other_stage_does_not_touch_stage(tmp_path):
     host = _gate_host(tmp_path)
     t = _propose_thread(host)  # stage = propose
-    host._run_finished(t.id, "completed")
+    host._run_finished(t.id, "completed", "full")  # B46: гейт-ран, вид рана теперь явный
     assert host.threads.get(t.id).stage == "propose"  # только code→done
     assert host.threads.get(t.id).last_outcome == "completed"
 
