@@ -431,7 +431,8 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     def _thread_dict(t) -> dict:
         return {"id": t.id, "title": t.title, "project_id": t.project_id, "stage": t.stage,
                 "last_outcome": t.last_outcome, "updated_ts": t.updated_ts,
-                "created_ts": t.created_ts}
+                "created_ts": t.created_ts, "request_text": t.request_text,
+                "last_model": t.last_model, "archived": t.archived}
 
     @app.get("/api/browse")
     async def api_browse(path: str | None = None):
@@ -459,6 +460,13 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     @app.get("/api/threads")
     async def api_threads_list():
         return JSONResponse({"threads": [_thread_dict(t) for t in host.threads.list()]})
+
+    @app.get("/api/threads/{thread_id}")
+    async def api_thread_get(thread_id: str):
+        thread = host.threads.get(thread_id)
+        if thread is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        return JSONResponse(_thread_dict(thread))
 
     @app.post("/api/threads")
     async def api_threads_create(request: Request):
@@ -502,6 +510,39 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
         host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": reply})
         return JSONResponse({"reply": reply})
+
+    @app.post("/api/threads/{thread_id}/gate")
+    async def api_thread_gate(thread_id: str, request: Request):
+        """HTTP-эквивалент голосового гейта: одна серверная gate_action-логика для обоих путей.
+
+        Клиент не определяет стадии и не запускает Кору сам: он только передаёт намерение,
+        а хост возвращает свежий снимок треда после успешного перехода.
+        """
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        if host.threads.get(thread_id) is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        data = await request.json()
+        action = str(data.get("action") or "")
+        raw_model = data.get("model")
+        model = str(raw_model) if raw_model is not None else None
+        result = await host.gate_action(
+            thread_id,
+            action,
+            model=model,
+            confirm=bool(data.get("confirm")),
+            fast=bool(data.get("fast")),
+        )
+        error = result.get("error")
+        if error:
+            status = 409 if error == "busy" else 404 if error == "unknown_thread" else 400
+            return JSONResponse(result, status_code=status)
+        # gate_action меняет ThreadStore синхронно под своим per-thread lock, поэтому снимок
+        # уже содержит новую стадию, модель и outcome для немедленной перерисовки UI.
+        thread = host.threads.get(thread_id)
+        if thread is None:  # defensive: чужая реализация host не должна дать 500 клиенту
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        return JSONResponse(_thread_dict(thread))
 
     @app.post("/api/active-thread")
     async def api_active_thread(request: Request):

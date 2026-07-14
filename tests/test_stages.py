@@ -2,6 +2,11 @@
 инструментов диспетчера и стадийного промпта. Пополняется по таскам плана UI-4/UI-5."""
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
+import pytest
+
 from synapse.clock import FakeClock
 from synapse.threads import ThreadStore, _STAGE_TRANSITIONS
 
@@ -524,3 +529,115 @@ async def test_gate_unknown_thread_errors(tmp_path):
     host = _gate_host(tmp_path)
     res = await host.gate_action("ghost", "revise")
     assert res.get("error") == "unknown_thread"
+
+
+# ---------------------------------------------------------------------------
+# Task 4: HTTP gate + detail API
+# ---------------------------------------------------------------------------
+
+
+def _webrtc_or_skip():
+    pytest.importorskip("aiortc")
+    pytest.importorskip("cv2")
+    pytest.importorskip("fastapi")
+    try:
+        from synapse.pipeline import webrtc_server
+        return webrtc_server
+    except (ImportError, RuntimeError) as e:
+        pytest.skip(f"webrtc deps unavailable: {e}")
+
+
+def _endpoint(app, name):
+    return next(route.endpoint for route in app.routes
+                if getattr(getattr(route, "endpoint", None), "__name__", "") == name)
+
+
+class _FakeRequest:
+    def __init__(self, body=None, *, json_ct=True, origin="http://testserver", host="testserver"):
+        self._body = body or {}
+        self.headers = {
+            "content-type": "application/json" if json_ct else "text/plain",
+            "host": host,
+        }
+        if origin:
+            self.headers["origin"] = origin
+
+    async def json(self):
+        return self._body
+
+
+def _http_gate_host(tmp_path, gate_result):
+    threads = ThreadStore(FakeClock(1_000_000.0), tmp_path / "threads")
+    calls = []
+
+    async def gate_action(thread_id, action, *, model=None, confirm=False, fast=False):
+        calls.append({"thread_id": thread_id, "action": action, "model": model,
+                      "confirm": confirm, "fast": fast})
+        return gate_result
+
+    host = SimpleNamespace(
+        threads=threads,
+        gate_action=gate_action,
+        journal=SimpleNamespace(close=lambda: None),
+    )
+    return host, calls
+
+
+async def test_thread_detail_api_exposes_stage_request_model_and_archive(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host, _ = _http_gate_host(tmp_path, {"ok": True})
+    thread = host.threads.create("тред")
+    host.threads.set_request(thread.id, "свод")
+    host.threads.set_last_model(thread.id, "claude-sonnet-5")
+    # Управление архивом — отдельный UI-5 слайс; здесь фиксируем, что уже существующее поле
+    # корректно выходит через detail API.
+    host.threads.get(thread.id).archived = True
+    app = webrtc_server.build_web_app(host)
+
+    response = await _endpoint(app, "api_thread_get")(thread.id)
+    body = json.loads(response.body)
+    assert response.status_code == 200
+    assert body["stage"] == "collect"
+    assert body["request_text"] == "свод"
+    assert body["last_model"] == "claude-sonnet-5"
+    assert body["archived"] is True
+    assert (await _endpoint(app, "api_thread_get")("missing")).status_code == 404
+
+
+async def test_thread_gate_api_enforces_csrf_proxies_arguments_and_returns_fresh_thread(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host, calls = _http_gate_host(tmp_path, {"ok": True})
+    thread = host.threads.create("тред")
+    host.threads.set_stage(thread.id, "propose")
+    app = webrtc_server.build_web_app(host)
+    endpoint = _endpoint(app, "api_thread_gate")
+
+    assert (await endpoint(thread.id, _FakeRequest({"action": "send_to_kora"}, json_ct=False))).status_code == 403
+    assert (await endpoint("missing", _FakeRequest({"action": "send_to_kora"}))).status_code == 404
+
+    response = await endpoint(thread.id, _FakeRequest({
+        "action": "send_to_kora", "model": "claude-opus-4-8", "confirm": True, "fast": True,
+    }))
+    assert response.status_code == 200
+    assert json.loads(response.body)["stage"] == "propose"
+    assert calls == [{"thread_id": thread.id, "action": "send_to_kora", "model": "claude-opus-4-8",
+                      "confirm": True, "fast": True}]
+
+
+@pytest.mark.parametrize(("gate_result", "status"), [
+    ({"error": "busy"}, 409),
+    ({"error": "invalid_model"}, 400),
+    ({"error": "confirm_required"}, 400),
+    ({"error": "no_plan_file"}, 400),
+    ({"error": "stale_plan"}, 400),
+    ({"error": "illegal_stage"}, 400),
+])
+async def test_thread_gate_api_maps_host_errors_to_client_status(tmp_path, gate_result, status):
+    webrtc_server = _webrtc_or_skip()
+    host, _ = _http_gate_host(tmp_path, gate_result)
+    thread = host.threads.create("тред")
+    app = webrtc_server.build_web_app(host)
+
+    response = await _endpoint(app, "api_thread_gate")(thread.id, _FakeRequest({"action": "write_code"}))
+    assert response.status_code == status
+    assert json.loads(response.body) == gate_result
