@@ -390,6 +390,16 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         awaiting = bool(
             host.store.awaiting_answer and task is not None and task.status == TaskStatus.RUNNING
         )
+        # UI-4: статус Коры — не абстрактный «работает», а ссылка на конкретную задачу.
+        # Старые минимальные host-стабы могут не нести threads, поэтому контекст опционален.
+        thread = None
+        threads = getattr(host, "threads", None)
+        if task is not None and threads is not None:
+            thread = threads.thread_for_task(task.id)
+        thread_context = (
+            {"thread_id": thread.id, "thread_title": thread.title, "thread_stage": thread.stage}
+            if thread is not None else {}
+        )
         return JSONResponse(
             {
                 "color": _status_color(live, status, awaiting),
@@ -397,6 +407,7 @@ def build_web_app(host: SynapseHost) -> FastAPI:
                 "task_status": status.value if status is not None else None,
                 "awaiting_answer": awaiting,
                 "task_text": task.text[:60] if task is not None else None,
+                **thread_context,
             }
         )
 
@@ -507,9 +518,27 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             async with host.turn_lock:
                 host.current_http_thread["id"] = None
         now = host.clock.now()
+        # UI-5 (S30): авто-title из первой реплики — только тредам-сентинелям композера.
+        # Не меняет stage/request semantics (stage движется только propose_request/gate).
+        host.threads.maybe_autotitle(thread_id, text)
         host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
         host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": reply})
         return JSONResponse({"reply": reply})
+
+    @app.patch("/api/threads/{thread_id}")
+    async def api_thread_patch(thread_id: str, request: Request):
+        """Переименование треда (UI-5, S30). PATCH только title; stage/request не трогает."""
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        th = host.threads.get(thread_id)
+        if th is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        data = await request.json()
+        title = str(data.get("title") or "").strip()
+        if not title:
+            return JSONResponse({"error": "empty title"}, status_code=400)
+        host.threads.rename(thread_id, title[:80])
+        return JSONResponse(_thread_dict(host.threads.get(thread_id)))
 
     @app.post("/api/threads/{thread_id}/gate")
     async def api_thread_gate(thread_id: str, request: Request):

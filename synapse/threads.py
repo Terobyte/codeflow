@@ -171,6 +171,37 @@ class ThreadStore:
         self._persist(t)
         return True
 
+    # --- заголовки: авто-title + rename (UI-5, S30) -------------------------------------
+
+    def maybe_autotitle(self, thread_id: str, text: str) -> bool:
+        """Авто-title из первой пользовательской реплики — ТОЛЬКО пока title несёт сентинель
+        «новый тред» (треды домашнего композера без title; голосовой/HTTP commit-пути создают
+        тред с title=text задачи — им auto-title не нужен и здесь no-op). Обрезка 80, как create.
+        Второй ход не переименовывает осмысленный title (title уже не сентинель)."""
+        t = self._threads.get(thread_id)
+        if t is None:
+            return False
+        if t.title != "новый тред":
+            return False  # осмысленный title (commit-путь или уже переименованный) — не трогаем
+        title = (text or "").strip().replace("\n", " ")[:80]
+        if not title:
+            return False
+        t.title = title
+        t.updated_ts = self._clock.now()
+        self._persist(t)
+        return True
+
+    def rename(self, thread_id: str, title: str) -> bool:
+        """Явное переименование треда пользователем. Пустой title → отказ (роут вернёт 400).
+        Возвращает True если тред существует и переименован."""
+        t = self._threads.get(thread_id)
+        if t is None:
+            return False
+        t.title = title[:80]
+        t.updated_ts = self._clock.now()
+        self._persist(t)
+        return True
+
     # --- лента (S3) -----------------------------------------------------------------------
 
     def _feed_path(self, thread_id: str) -> Path:

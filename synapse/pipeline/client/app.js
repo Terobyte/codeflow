@@ -27,6 +27,14 @@ function postJSON(url, body) {
                       body: JSON.stringify(body), signal: ctrl.signal })
     .finally(() => clearTimeout(timeout));
 }
+// UI-5 (S30): PATCH для rename треда — тот же CSRF/timeout-паттерн, что postJSON.
+function patchJSON(url, body) {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  return fetch(url, { method: "PATCH", headers: { "content-type": "application/json" },
+                      body: JSON.stringify(body), signal: ctrl.signal })
+    .finally(() => clearTimeout(timeout));
+}
 function el(tag, cls, text) {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -414,18 +422,26 @@ async function pollFeed() {
 }
 
 // ---------- статус Коры: карточка в сайдбаре (цвет готовым с сервера) ----------
-function setKora(color, sub) {
+function setKora(color, sub, threadId = null) {
   $("kora-card-dot").style.background = color;
   $("kora-card-sub").textContent = sub;
+  const card = $("kora-card");
+  const activeThread = typeof threadId === "string" && threadId;
+  card.href = activeThread ? "#/thread/" + encodeURIComponent(threadId) : "#/activity";
+  card.title = activeThread ? "Открыть активный тред" : "Открыть активность Коры";
 }
 async function pollStatus() {
   let data;
   try { data = await getJSON("./kora-status"); }
   catch { setKora("#888", "нет связи"); return; }
+  const context = data.thread_id
+    ? (data.thread_title || "тред") + (data.thread_stage && STAGES[data.thread_stage]
+      ? " · " + STAGES[data.thread_stage] : "")
+    : (data.task_text || "");
   // task_text живёт и ПОСЛЕ завершения задачи — «работает» только при running.
-  const sub = data.awaiting_answer ? "ждёт ответа: " + (data.task_text || "")
-    : data.task_status === "running" ? "работает: " + (data.task_text || "") : "свободна";
-  setKora(COLORS[data.color] || "#888", sub);
+  const sub = data.awaiting_answer ? "ждёт ответа в " + context
+    : data.task_status === "running" ? "работает в " + context : "свободна";
+  setKora(COLORS[data.color] || "#888", sub, data.thread_id || null);
 }
 
 async function pollActivity() {
@@ -448,6 +464,14 @@ async function pollActivity() {
 function setConn(text) {
   $("conn-status").textContent = text;
   $("conn-status").hidden = !text;
+}
+
+function resizeMessageInput() {
+  const input = $("msg-input");
+  input.style.height = "auto";
+  const maxHeight = 148;
+  input.style.height = Math.min(input.scrollHeight, maxHeight) + "px";
+  input.style.overflowY = input.scrollHeight > maxHeight ? "auto" : "hidden";
 }
 
 async function sendMessage() {
@@ -477,6 +501,7 @@ async function sendMessage() {
     }
     setConn("");
     input.value = ""; // успех подтверждён — теперь чистим
+    resizeMessageInput();
     await Promise.all([pollFeed(), loadLists()]);
   } catch {
     setConn("сеть недоступна"); // текст остаётся в поле
@@ -486,6 +511,7 @@ async function sendMessage() {
   }
 }
 $("msg-send").addEventListener("click", sendMessage);
+$("msg-input").addEventListener("input", resizeMessageInput);
 // B-CORE-15: не отправляем во время IME-композиции (китайский/японский/эмодзи-клавиатура iOS —
 // Enter там подтверждает набор, а не сообщение).
 $("msg-input").addEventListener("keydown", (e) => {
@@ -497,6 +523,58 @@ $("msg-input").addEventListener("keydown", (e) => {
     sendMessage();
   }
 });
+
+// UI-5 (S30): rename треда по тапу на заголовке (#view-title, НЕ #thread-badge — тот скрыт
+// до конца рана). Inline-редактор (input), НЕ window.prompt — проектная дисциплина его выкинула.
+// textContent/appendChild only; hash-router и голос не трогаются.
+let renaming = false;
+async function commitRename(input, oldTitle, cur) {
+  if (renaming) return;
+  renaming = true;
+  const trimmed = input.value.trim();
+  const titleEl = $("view-title");
+  titleEl.textContent = trimmed || oldTitle; // восстанавливаем title-узел (input убирается заменой)
+  try {
+    if (trimmed && trimmed !== oldTitle) {
+      const res = await patchJSON(`/api/threads/${encodeURIComponent(cur.id)}`, { title: trimmed });
+      if (res.ok) {
+        cur.title = trimmed.slice(0, 80);
+        titleEl.textContent = cur.title;
+        await loadLists();
+      } else {
+        titleEl.textContent = oldTitle;
+        setConn("не переименовать");
+      }
+    }
+  } catch {
+    titleEl.textContent = oldTitle;
+    setConn("сеть недоступна");
+  } finally {
+    renaming = false;
+  }
+}
+function renameCurrentThread() {
+  if (renaming) return;
+  const r = route();
+  if (r.view !== "thread") return;
+  const cur = threads.find((t) => t.id === r.id);
+  if (!cur) return;
+  const titleEl = $("view-title");
+  const input = el("input");
+  input.value = cur.title;
+  input.maxLength = 80;
+  input.className = "rename-input";
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+  const restore = () => commitRename(input, cur.title, cur);
+  input.addEventListener("blur", restore, { once: true });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); input.blur(); }
+    else if (e.key === "Escape") { input.value = cur.title; input.blur(); }
+  });
+}
+$("view-title").addEventListener("click", renameCurrentThread);
 
 // ---------- голос: vendored SDK → session-less POST /api/offer, видимые стейты ----------
 const botAudio = $("bot-audio");
@@ -735,6 +813,7 @@ $("picker-choose").addEventListener("click", async () => {
 // B-CORE-10: восстановить черновик, сохранённый перед вынужденным reload вотчдога
 const draft = sessionStorage.getItem("synapse-draft");
 if (draft) { $("msg-input").value = draft; sessionStorage.removeItem("synapse-draft"); }
+resizeMessageInput();
 loadLists().then(render);
 pollStatus();
 setInterval(loadLists, 5000);
