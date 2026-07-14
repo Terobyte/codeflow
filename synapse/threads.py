@@ -13,6 +13,17 @@ from pathlib import Path
 
 from synapse.clock import Clock
 
+# Таблица легальных переходов стадии (UI-4). done — терминальная, без исходящих;
+# collect → propose — единственный «вперёд» из сбора; revise (→ collect) доступен из
+# каждой рабочей стадии (propose/spec_plan/code), см. спеку:57/60/96.
+_STAGE_TRANSITIONS: dict[str, frozenset[str]] = {
+    "collect": frozenset({"propose"}),
+    "propose": frozenset({"spec_plan", "code", "collect"}),
+    "spec_plan": frozenset({"code", "collect"}),
+    "code": frozenset({"done", "collect"}),
+    "done": frozenset(),
+}
+
 
 @dataclass
 class Thread:
@@ -21,6 +32,9 @@ class Thread:
     project_id: str | None = None
     stage: str = "collect"           # collect|propose|spec_plan|code|done — FSM въезжает в UI-4
     last_outcome: str | None = None  # completed|failed|cancelled — исход ПОСЛЕДНЕГО запуска
+    request_text: str | None = None  # свод запроса — носитель между COLLECT и запусками (UI-4)
+    last_model: str | None = None    # модель последнего гейт-запуска (UI-4)
+    archived: bool = False           # архив треда (UI-5)
     created_ts: float = 0.0
     updated_ts: float = 0.0
     task_ids: list[str] = field(default_factory=list)
@@ -53,6 +67,9 @@ class ThreadStore:
                 project_id=d.get("project_id"),
                 stage=str(d.get("stage") or "collect"),
                 last_outcome=d.get("last_outcome"),
+                request_text=d.get("request_text"),
+                last_model=d.get("last_model"),
+                archived=bool(d.get("archived", False)),
                 created_ts=float(d.get("created_ts") or 0.0),
                 updated_ts=float(d.get("updated_ts") or 0.0),
                 task_ids=[str(x) for x in (d.get("task_ids") or [])],
@@ -66,8 +83,9 @@ class ThreadStore:
         tmp = path.with_suffix(".json.tmp")
         data = {
             "id": t.id, "title": t.title, "project_id": t.project_id, "stage": t.stage,
-            "last_outcome": t.last_outcome, "created_ts": t.created_ts,
-            "updated_ts": t.updated_ts, "task_ids": t.task_ids,
+            "last_outcome": t.last_outcome, "request_text": t.request_text,
+            "last_model": t.last_model, "archived": t.archived,
+            "created_ts": t.created_ts, "updated_ts": t.updated_ts, "task_ids": t.task_ids,
         }
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
@@ -106,6 +124,52 @@ class ThreadStore:
     def thread_for_task(self, task_id: str) -> Thread | None:
         tid = self._task_index.get(task_id)
         return self._threads.get(tid) if tid else None
+
+    # --- стадийный FSM (UI-4) -----------------------------------------------------------
+
+    def set_stage(self, thread_id: str, stage: str) -> None:
+        """Перевод стадии по таблице _STAGE_TRANSITIONS. Нелегальный переход → ValueError,
+        персист не трогается. Стадия двигается ТОЛЬКО здесь (S2)."""
+        t = self._threads.get(thread_id)
+        if t is None:
+            return
+        allowed = _STAGE_TRANSITIONS.get(t.stage, frozenset())
+        if stage not in allowed:
+            raise ValueError(f"illegal stage transition {t.stage!r} → {stage!r}")
+        t.stage = stage
+        t.updated_ts = self._clock.now()
+        self._persist(t)
+
+    def set_request(self, thread_id: str, text: str) -> None:
+        """Свод запроса — носитель между COLLECT и запусками стадий."""
+        t = self._threads.get(thread_id)
+        if t is None:
+            return
+        t.request_text = text
+        t.updated_ts = self._clock.now()
+        self._persist(t)
+
+    def set_last_model(self, thread_id: str, model: str) -> None:
+        """Модель последнего гейт-запуска (дефолт-кандидат для следующего, находка E)."""
+        t = self._threads.get(thread_id)
+        if t is None:
+            return
+        t.last_model = model
+        t.updated_ts = self._clock.now()
+        self._persist(t)
+
+    def bind_project(self, thread_id: str, project_id: str) -> bool:
+        """Привязка проекта к треду (находка F): ок только при null→значение и пустых task_ids.
+        Повторная привязка / после запуска / значение→значение → отказ (False)."""
+        t = self._threads.get(thread_id)
+        if t is None:
+            return False
+        if t.project_id is not None or t.task_ids:
+            return False
+        t.project_id = project_id
+        t.updated_ts = self._clock.now()
+        self._persist(t)
+        return True
 
     # --- лента (S3) -----------------------------------------------------------------------
 
