@@ -57,7 +57,6 @@ def _threads_host(tmp_path):
 # ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="B50: null-byte path in GET /api/browse must not 500", strict=True)
 def test_B50_browse_null_byte_path_must_not_500():
     host = MagicMock()
     app = build_web_app(host)
@@ -81,9 +80,6 @@ def test_B50_browse_null_byte_path_must_not_500():
 # ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="B51: string confirm='false' must coerce to False, not True", strict=True
-)
 def test_B51_string_false_confirm_must_not_be_treated_as_confirmed():
     captured: dict = {}
 
@@ -135,10 +131,6 @@ def test_B51_string_false_confirm_must_not_be_treated_as_confirmed():
 # ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="B56: ?archived=false must return non-archived threads, not archived-only",
-    strict=True,
-)
 def test_B56_archived_false_string_must_return_non_archived_threads(tmp_path):
     host = _threads_host(tmp_path)
     t = host.threads.create("some thread")
@@ -165,9 +157,6 @@ def test_B56_archived_false_string_must_return_non_archived_threads(tmp_path):
 # ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="B57: feed limit=0 must return zero entries, not every entry", strict=True
-)
 def test_B57_feed_limit_zero_must_return_zero_entries(tmp_path):
     host = _threads_host(tmp_path)
     t = host.threads.create("some thread")
@@ -195,9 +184,6 @@ def test_B57_feed_limit_zero_must_return_zero_entries(tmp_path):
 # ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="B58: active-thread id='' must clear the active thread, not 404", strict=True
-)
 def test_B58_active_thread_empty_string_id_must_clear(tmp_path):
     host = _threads_host(tmp_path)
     t = host.threads.create("some thread")

@@ -261,6 +261,8 @@ class ThreadStore:
             self._feed_counts[thread_id] = len(lines)
 
     def read_feed(self, thread_id: str, limit: int = 200) -> list[dict]:
+        if limit <= 0:  # B57: -0 == 0 → срез «всё»; неположительный limit = пусто
+            return []
         path = self._feed_path(thread_id)
         if not path.exists():
             return []

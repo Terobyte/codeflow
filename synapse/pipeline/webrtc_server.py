@@ -40,10 +40,12 @@ def _browse_dir(raw: str | None, home: Path) -> dict | None:
     не 403 — UI всегда получает валидную страницу. Скрытые директории не показываются
     (заодно прячет .ssh/.config; первая линия защиты — validate_project_path при add)."""
     base = home.resolve()
-    p = Path(raw).expanduser() if raw else base
+    # B50: null-байт в пути даёт ValueError (из Path/resolve) — падаем на home, как любой
+    # другой неразрешимый путь, а не 500.
     try:
+        p = Path(raw).expanduser() if raw else base
         rp = p.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         rp = base
     if not rp.is_relative_to(base) or not rp.is_dir():
         rp = base
@@ -508,7 +510,8 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     @app.get("/api/threads")
     async def api_threads_list(archived: str | None = None):
         # UI-5 (S31): по умолчанию архив скрыт; ?archived=1 отдаёт только архив.
-        if archived and archived != "0":
+        # B56: явный truthy-набор — "false"/"no"/"0"/"" идут в обычный неархивный список.
+        if archived is not None and archived.lower() in ("1", "true", "yes"):
             return JSONResponse({"threads": [_thread_dict(t) for t in host.threads.list(include_archived=True) if t.archived]})
         return JSONResponse({"threads": [_thread_dict(t) for t in host.threads.list()]})
 
@@ -663,8 +666,9 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             thread_id,
             action,
             model=model,
-            confirm=bool(data.get("confirm")),
-            fast=bool(data.get("fast")),
+            # строгий JSON-bool — строка "false" не должна проходить confirmation-гейт (B51)
+            confirm=data.get("confirm") is True,
+            fast=data.get("fast") is True,
         )
         error = result.get("error")
         if error:
@@ -685,7 +689,8 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         if err is not None:
             return err
         tid = data.get("id")
-        if tid is not None and host.threads.get(str(tid)) is None:
+        # B58: falsy id ("" или None) значит CLEAR — существование не проверяем.
+        if tid and host.threads.get(str(tid)) is None:
             return JSONResponse({"error": "no such thread"}, status_code=404)
         # B43: пока звонок ЖИВ (включая окно тихого реконнекта — бинд переживает клиентский
         # `client=null`), навигация по тредам НЕ переклеивает привязку голоса: иначе история
