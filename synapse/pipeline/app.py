@@ -445,6 +445,11 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             return STAGE_RULES_PROPOSE
         return ""
 
+    def _on_compact(thread_id: str) -> None:
+        # UI-5 (S10): факт компакта истории → запись в ленту треда. Сырой feed-файл не
+        # меняется компактом (он жмёт только LLM-историю в памяти), это лишь уведомление.
+        threads.append_feed(thread_id, {"ts": clock.now(), "kind": "event", "text": "контекст сжат"})
+
     def _propose_for(thread_id: str | None, text: str, *, project_id: str | None = None) -> dict:
         """Commit a dispatcher-approved request summary to its thread.
 
@@ -599,6 +604,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             http_handlers, confirm_flow, store, journal, clock, cfg,
             thread_feed_reader=threads.read_feed,
             stage_block_for=_stage_block_for,
+            on_compact=_on_compact,
         )
 
     # breaker needs only the tier COUNT, not the service instances themselves -- those are

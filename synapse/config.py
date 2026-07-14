@@ -88,6 +88,9 @@ class SynapseConfig:
     kora_log_max: int = 500
     # UI v2 (S3/S32): кап файла истории треда, аналог kora_log_max.
     thread_feed_max: int = 2000
+    # UI-5 (S10): порог компакта истории диспетчера — ПЕРЕД ходом, если история длиннее,
+    # старшая половина жмётся одним LLM-вызовом (только user/assistant, NO-EXFIL). 0 = выкл.
+    dispatcher_compact_after: int = 40
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SynapseConfig":
@@ -135,6 +138,12 @@ class SynapseConfig:
         deadline = _num("KORA_DEADLINE_S", float)
         if deadline is not None:
             kwargs["kora_deadline_s"] = deadline
+        # UI-5 (S10): тот же two-step, что kora_max_turns — _num на малформе/отсутствии
+        # возвращает None (конструктор не падает), тогда остаётся дефолт датакласса.
+        # ⚠️ НЕ `_num(...) or 40` — это затрёт валидный явный DISPATCHER_COMPACT_AFTER=0.
+        compact = _num("DISPATCHER_COMPACT_AFTER", int)
+        if compact is not None:
+            kwargs["dispatcher_compact_after"] = compact
         return cls(**kwargs)
 
     def validate_voice_keys(self) -> None:

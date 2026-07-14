@@ -50,6 +50,7 @@ class DispatcherTurnLoop:
         task_dictionary: dict[str, str] | None = None,
         thread_feed_reader: Callable[[str], list[dict]] | None = None,
         stage_block_for: Callable[[str], str] | None = None,
+        on_compact: Callable[[str], None] | None = None,
     ) -> None:
         self._llm = llm
         self._handlers = handlers
@@ -62,6 +63,8 @@ class DispatcherTurnLoop:
         # UI-3 (спека §4, находка A): пер-тред контекст. История LLM ключуется по треду.
         self._thread_feed_reader = thread_feed_reader
         self._stage_block_for = stage_block_for
+        # UI-5 (S10): колбэк на факт компакта истории треда (лента пишет event «контекст сжат»).
+        self._on_compact = on_compact
         self._histories: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 
     def _history_for(self, thread_id: str) -> list[dict[str, Any]]:
@@ -96,6 +99,11 @@ class DispatcherTurnLoop:
 
         had_active_task = self._store.has_active_task()
         history = self._history_for(thread_id)
+        # UI-5 (S10): компакт ПЕРЕД ходом — старшая половина жмётся отдельным LLM-вызовом,
+        # если история длиннее порога. Мутирует список IN-PLACE (history[:] = ...): ребинд
+        # локальной `history` дошёл бы до _complete ЭТОГО хода, но self._histories[thread_id]
+        # остался бы несжатым → на следующем ходу всё всплыло бы обратно.
+        await self._maybe_compact(thread_id, history)
         history.append({"role": "user", "content": transcript})
 
         text = ""
@@ -170,3 +178,56 @@ class DispatcherTurnLoop:
 
     def _render_state(self, now: float) -> str:
         return self._store.render_state(now, self._cfg.stale_after_s, self._cfg.unreachable_after_s)
+
+    # --- UI-5 (S10): компакт длинной истории -------------------------------------------
+
+    async def _maybe_compact(self, thread_id: str, history: list[dict[str, Any]]) -> None:
+        """Сжать старшую половину истории, если она длиннее порога, ПЕРЕД ходом.
+
+        Мутирует `history` IN-PLACE (history[:] = ...), а не ребиндит локальную ссылку:
+        `_history_for` отдаёт ЖИВУЮ ссылку на `self._histories[thread_id]`, поэтому только
+        inplace-мутация переживает следующий ход (анти-rebind-якорь в тесте).
+
+        Граница разреза — МЕХАНИЧЕСКАЯ: `cut = len//2`, продвинутый вперёд до первого
+        role==user на/после cut (user всегда начинает свежую turn-группу). Жать только
+        целые группы — оборванная tool_use/tool_result-пара ломает Anthropic API. Поскольку
+        история здесь содержит только user/assistant (регидрация + этот метод), роль user —
+        корректный срез-маркер; tool-хвостов в `history` нет (они удаляются на откате хода).
+        """
+        threshold = self._cfg.dispatcher_compact_after
+        if threshold <= 0 or len(history) <= threshold:
+            return
+        cut = len(history) // 2
+        # продвинуть cut до первого role==user (на или после cut) — не оставлять начало
+        # хвоста assistant-репликой без предшествующего user
+        while cut < len(history) and history[cut].get("role") != "user":
+            cut += 1
+        if cut >= len(history):
+            # после cut нет user-сообщения — хвост одна группа, резать нечего чисто
+            return
+        older = history[:cut]
+        tail = history[cut:]
+        # NO-EXFIL: в историю компакта попадают ТОЛЬКО user/assistant (по построению здесь
+        # другого и нет); кора-виды/лента сюда не входят. tools=[] — компакт без инструментов.
+        compact_messages = [
+            {"role": "system", "content": (
+                "Сожми диалог диспетчера ниже в краткую выжимку. Сохрани решения, имена, пути "
+                "файлов и договорённости дословно. Не добавляй ничего от себя."
+            )},
+            {"role": "user", "content": json.dumps(older, ensure_ascii=False)},
+        ]
+        try:
+            summary, _ = await self._llm.complete(compact_messages, [])
+        except Exception:  # noqa: BLE001 — сбой компакта не должен валить ход диспетчера
+            return
+        summary = (summary or "").strip() or "[история сжата]"
+        history[:] = [
+            {"role": "user", "content": f"[КОМПАКТ] {summary}"},
+            *tail,
+        ]
+        if self._on_compact is not None:
+            try:
+                self._on_compact(thread_id)
+            except Exception:  # noqa: BLE001 — колбэк ленты не валит ход
+                pass
+
