@@ -869,6 +869,23 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     )
     assistant_aggregator = GuardedAssistantAggregator(context, _paired_user_aggregator=user_aggregator)
 
+    # B42: teardown-флаш («Завершить — в чат» / hangup). Ответ, оборванный ПОСРЕДИ речи, в
+    # context.messages не попадает никогда: pipecat коммитит агрегацию только на
+    # LLMFullResponseEndFrame, а CancelFrame (_handle_end_or_cancel) её молча бросает. При этом
+    # всё, что лежит в _aggregation, УЖЕ прозвучало — агрегатор сидит downstream TTS. Поэтому
+    # только на teardown (не на commit-флашах: там недокоммиченный хвост — это ещё живой
+    # стриминг) дренируем pending-хвост в ленту, чтобы лента держала ровно то, что юзер слышал.
+    def _flush_voice_final() -> None:
+        _flush_voice_context()
+        pending = assistant_aggregator.aggregation_string() if assistant_aggregator._aggregation else ""
+        assistant_aggregator._aggregation = []  # идемпотентность повторного teardown-вызова
+        tid = host.voice_thread["id"]
+        if host.threads is None or tid is None or not pending.strip():
+            return
+        host.threads.append_feed(tid, {"ts": host.clock.now(), "kind": "assistant", "text": pending})
+        if host.text_loop is not None:
+            host.text_loop.note_external_turn(tid, "assistant", pending)
+
     # Two GenerationStartHooks, not one, around llm_switcher (research §2.2): a user turn's
     # LLMContextFrame travels DOWNSTREAM out of user_aggregator, but a tool-call's
     # re-inference travels UPSTREAM out of assistant_aggregator instead -- LLM services
@@ -908,7 +925,7 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     )
 
     return SynapseSession(pipeline=pipeline, llm_switcher=llm_switcher, generation_guard=generation_guard,
-                          flush_voice_feed=_flush_voice_context)
+                          flush_voice_feed=_flush_voice_final)
 
 
 def run() -> None:

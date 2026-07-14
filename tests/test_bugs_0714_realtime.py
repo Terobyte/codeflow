@@ -50,9 +50,6 @@ from test_live_to_chat import _context_of, _voice_host_or_skip
 # =============================================================================================
 
 
-@pytest.mark.xfail(
-    reason="B42: mid-speech answer lost on hangup -- no pre-cancel aggregator flush", strict=True
-)
 async def test_B42_mid_speech_answer_survives_hangup_flush(tmp_path):
     from pipecat.processors.aggregators.llm_response_universal import (
         LLMAssistantAggregator,
