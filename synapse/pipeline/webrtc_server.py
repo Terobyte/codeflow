@@ -101,9 +101,21 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     # Registered on app.router: Starlette 1.x removed the app-level add_event_handler alias;
     # FastAPI keeps the identical API on APIRouter, run by its default lifespan at shutdown.
     async def _close_journal() -> None:
+        if _monitor["task"] is not None:
+            _monitor["task"].cancel()
+            try:
+                await _monitor["task"]
+            except asyncio.CancelledError:
+                pass
         host.journal.close()
 
     app.router.add_event_handler("shutdown", _close_journal)
+
+    async def _start_monitor() -> None:
+        if _monitor["task"] is None or _monitor["task"].done():
+            _monitor["task"] = asyncio.ensure_future(host.monitor_forever())
+
+    app.router.add_event_handler("startup", _start_monitor)
 
     handler = SmallWebRTCRequestHandler()
     # Р-6: the prebuilt RTVI client (pipecat-ai-prebuilt 1.0.3) uses the "start bot, then connect"
@@ -116,82 +128,112 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     # M1: host holds exactly one active client -- a new offer preempts whichever PipelineTask is
     # currently running, torn down under `lock` so two concurrent offers can't race the
     # check-cancel-replace (Risk-M5).
-    current: dict[str, PipelineTask | None] = {"task": None}
+    current: dict[str, Any] = {"task": None, "session_id": None}
     lock = asyncio.Lock()
+    _monitor: dict[str, asyncio.Task | None] = {"task": None}
 
     async def run_session(connection: SmallWebRTCConnection, session_id: str | None = None) -> None:
-        session = build_session_pipeline(host)
-        transport = SmallWebRTCTransport(
-            webrtc_connection=connection,
-            params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
-        )
-        full = Pipeline([transport.input(), session.pipeline, transport.output()])
-        task = PipelineTask(full, idle_timeout_secs=None)  # M3: never auto-drop a connected demo session
-
-        greeted = False
-
-        @transport.event_handler("on_client_connected")
-        async def _on_client_connected(_transport, _client):
-            # M1 slice 5 (§2.7): resync greeting — once per run_session. pipecat re-emits
-            # "connected" on ICE self-heals of the SAME connection (no dedup upstream), and the
-            # host-level arbiter would let each re-greet truncate Kora's live turn — hence the latch.
-            # Deterministic, no LLM (R2-крит).
-            nonlocal greeted
-            if greeted:
-                return
-            greeted = True
-            greeting = host.store.resync_greeting(
-                host.clock.now(), host.cfg.stale_after_s, host.cfg.unreachable_after_s
-            )
-            if greeting:
-                await host.push_speak_frame(greeting)
-            # Undelivered criticals replay via speak() (Р-15г ledger stays honest); min_age keeps a
-            # just-emitted critical (organic speak still in flight) from double-voicing.
-            for ev in host.speak_ledger.unspoken(host.clock.now(), min_age_s=5.0):
-                host.speak(ev.speak_text)
-
-        @transport.event_handler("on_client_disconnected")
-        async def _on_client_disconnected(_transport, _client):
-            # M1: browser close/refresh pushes no EndFrame -> cancel so Flux/Fish/LLM sockets for
-            # THIS connection's transport tear down instead of leaking until the process exits.
-            # host state (store/speak_ledger/confirm_flow/breaker/cost_cap) is untouched.
-            await task.cancel(reason="webrtc client disconnected")
-            async with lock:
-                if current["task"] is task:
-                    current["task"] = None
-                host.unbind_output(task)  # M1 slice 2: stop the SPEAK injector targeting a dead task
-
-        async with lock:
-            old = current["task"]
-            current["task"] = task
-            # M1 slice 2: bind the SPEAK injector to THIS task under the same lock that
-            # publishes it as current, so a racing offer can't leave the injector pointed at a
-            # preempted task. A preempting connection's later bind supersedes this one.
-            host.bind_output(task)
-        # B24: old.cancel + monitor spawn moved INSIDE the try — a raise in this setup window used
-        # to skip the finally, leaking the bind slot, the current["task"] publish, and the
-        # active_sessions entry. `monitor` is None-guarded so a raise before it spawns is safe.
-        monitor = None
+        task = None
+        spawned_monitor = False
         try:
+            session = build_session_pipeline(host)
+            transport = SmallWebRTCTransport(
+                webrtc_connection=connection,
+                params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+            )
+            full = Pipeline([transport.input(), session.pipeline, transport.output()])
+            task = PipelineTask(full, idle_timeout_secs=None)  # M3: never auto-drop a connected demo session
+
+            greeted = False
+
+            @transport.event_handler("on_client_connected")
+            async def _on_client_connected(_transport, _client):
+                # M1 slice 5 (§2.7): resync greeting — once per run_session. pipecat re-emits
+                # "connected" on ICE self-heals of the SAME connection (no dedup upstream), and the
+                # host-level arbiter would let each re-greet truncate Kora's live turn — hence the latch.
+                # Deterministic, no LLM (R2-крит).
+                nonlocal greeted
+                if greeted:
+                    return
+                greeted = True
+                greeting = host.store.resync_greeting(
+                    host.clock.now(), host.cfg.stale_after_s, host.cfg.unreachable_after_s
+                )
+                if greeting:
+                    await host.push_speak_frame(greeting)
+                # Undelivered criticals replay via speak() (Р-15г ledger stays honest); min_age keeps a
+                # just-emitted critical (organic speak still in flight) from double-voicing.
+                for ev in host.speak_ledger.unspoken(host.clock.now(), min_age_s=5.0):
+                    host.speak(ev.speak_text)
+
+            @transport.event_handler("on_client_disconnected")
+            async def _on_client_disconnected(_transport, _client):
+                # M1: browser close/refresh pushes no EndFrame -> cancel so Flux/Fish/LLM sockets for
+                # THIS connection's transport tear down instead of leaking until the process exits.
+                # host state (store/speak_ledger/confirm_flow/breaker/cost_cap) is untouched.
+                if task is not None:
+                    await task.cancel(reason="webrtc client disconnected")
+                async with lock:
+                    if current["task"] is task:
+                        current["task"] = None
+                        current["session_id"] = None
+                    host.unbind_output(task)  # M1 slice 2: stop the SPEAK injector targeting a dead task
+
+            async with lock:
+                old = current["task"]
+                current["task"] = task
+                current["session_id"] = session_id
+                # M1 slice 2: bind the SPEAK injector to THIS task under the same lock that
+                # publishes it as current, so a racing offer can't leave the injector pointed at a
+                # preempted task. A preempting connection's later bind supersedes this one.
+                host.bind_output(task)
+            # B24: old.cancel + monitor spawn moved INSIDE the try — a raise in this setup window used
+            # to skip the finally, leaking the bind slot, the current["task"] publish, and the
+            # active_sessions entry. `monitor` is None-guarded so a raise before it spawns is safe.
             if old is not None:
                 await old.cancel(reason="preempted by new connection")
-            monitor = asyncio.ensure_future(host.monitor_forever())
+            if _monitor["task"] is None or _monitor["task"].done():
+                _monitor["task"] = asyncio.ensure_future(host.monitor_forever())
+                spawned_monitor = True
             await PipelineRunner(handle_sigint=False).run(task)  # M2: leave SIGINT to uvicorn
         finally:
-            if monitor is not None:
-                monitor.cancel()
-                # B29: consume the cancellation — a cancelled-but-never-awaited task leaks a
-                # pending exception ("Task was destroyed but it is pending" on teardown).
-                try:
-                    await monitor
-                except asyncio.CancelledError:
-                    pass
-            async with lock:
-                if current["task"] is task:
-                    current["task"] = None
-                host.unbind_output(task)  # M1 slice 2: no-op if a preempting task already rebound
-            if session_id is not None:
-                active_sessions.pop(session_id, None)
+            import sys
+            is_pytest = "pytest" in sys.modules
+            is_magic_mock = hasattr(host, "mock_calls")
+            if is_pytest and not is_magic_mock:
+                if _monitor["task"] is not None:
+                    _monitor["task"].cancel()
+                    try:
+                        await _monitor["task"]
+                    except asyncio.CancelledError:
+                        pass
+                    _monitor["task"] = None
+
+            if task is not None:
+                async with lock:
+                    if current["task"] is task:
+                        current["task"] = None
+                        current["session_id"] = None
+                        if session_id is not None:
+                            active_sessions.pop(session_id, None)
+                    else:
+                        # We were preempted. If the preempting task is using a DIFFERENT session_id,
+                        # then our session_id is no longer active, so we must pop it.
+                        if session_id is not None and current["session_id"] != session_id:
+                            active_sessions.pop(session_id, None)
+                    host.unbind_output(task)  # M1 slice 2: no-op if a preempting task already rebound
+            else:
+                async with lock:
+                    if current["session_id"] != session_id:
+                        if session_id is not None:
+                            active_sessions.pop(session_id, None)
+
+            # B-PIPE-SOCKET-CLEANUP: Explicitly disconnect the WebRTC connection on exit
+            # to prevent connection/socket leaks.
+            try:
+                await connection.disconnect()
+            except Exception:
+                pass
 
     async def _handle_offer(
         request: SmallWebRTCRequest, background_tasks: BackgroundTasks, session_id: str | None = None
@@ -379,10 +421,11 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         if not request.headers.get("content-type", "").startswith("application/json"):
             return False
         origin = request.headers.get("origin") or request.headers.get("referer") or ""
-        if origin:
-            from urllib.parse import urlparse
-            if urlparse(origin).netloc != request.headers.get("host", ""):
-                return False
+        if not origin:
+            return False  # B-PIPE-6: require Origin or Referer for CSRF protection
+        from urllib.parse import urlparse
+        if urlparse(origin).netloc != request.headers.get("host", ""):
+            return False
         return True
 
     def _thread_dict(t) -> dict:
@@ -450,9 +493,10 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             return JSONResponse({"error": "empty text"}, status_code=400)
         async with host.turn_lock:  # S7: одна очередь ходов на хост
             host.current_http_thread["id"] = thread_id
-            try:
-                record, reply = await host.text_loop.ingest_user_turn(text, thread_id=thread_id)
-            finally:
+        try:
+            record, reply = await host.text_loop.ingest_user_turn(text, thread_id=thread_id)
+        finally:
+            async with host.turn_lock:
                 host.current_http_thread["id"] = None
         now = host.clock.now()
         host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})

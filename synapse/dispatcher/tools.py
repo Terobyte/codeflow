@@ -11,6 +11,7 @@ a no-op that returns the first call's result instead of re-executing.
 """
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -142,22 +143,36 @@ class ToolHandlers:
     def __init__(self, bridge: KoraBridge, journal: TurnJournal) -> None:
         self.bridge = bridge
         self._journal = journal
-        self._dedup: dict[str, _DedupEntry] = {}
-        self._current_turn_id: str | None = None
+        # Keyed by turn_id -> {tool_name: _DedupEntry}
+        self._dedup: dict[str, dict[str, _DedupEntry]] = {}
+        self._current_turn_id_var = contextvars.ContextVar("current_turn_id", default=None)
+
+    @property
+    def _current_turn_id(self) -> str | None:
+        return self._current_turn_id_var.get()
+
+    @_current_turn_id.setter
+    def _current_turn_id(self, val: str | None) -> None:
+        self._current_turn_id_var.set(val)
 
     def begin_turn(self, turn_id: str) -> None:
         self._current_turn_id = turn_id
+        self._dedup[turn_id] = {}
+        if len(self._dedup) > 64:
+            oldest_key = next(iter(self._dedup))
+            self._dedup.pop(oldest_key, None)
 
     async def _guarded(
         self, name: str, args: dict[str, Any], fn: Callable[[], Any]
     ) -> tuple[dict[str, Any], bool]:
-        entry = self._dedup.get(name)
-        # B14: a dedup hit requires SAME turn AND SAME args — a retry re-issues identical args;
-        # a genuinely different same-name call must execute, not return the prior result.
-        if entry is not None and entry.turn_id == self._current_turn_id and entry.args == args:
+        turn_id = self._current_turn_id or ""
+        turn_dedup = self._dedup.setdefault(turn_id, {})
+        entry = turn_dedup.get(name)
+        # B14: a dedup hit requires SAME turn AND SAME args
+        if entry is not None and entry.args == args:
             return entry.result, True
         result = await fn()
-        self._dedup[name] = _DedupEntry(turn_id=self._current_turn_id or "", result=result, args=args)
+        turn_dedup[name] = _DedupEntry(turn_id=turn_id, result=result, args=args)
         return result, False
 
     async def submit_task(self, text: str) -> dict[str, Any]:

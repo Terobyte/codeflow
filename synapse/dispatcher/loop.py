@@ -9,6 +9,7 @@ is known).
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from typing import Any, Callable, Protocol
 
 from synapse.bridge.confirm import ConfirmFlow
@@ -33,6 +34,7 @@ class LLMClient(Protocol):
 # (get_task_status -> request_cancel) lost the follow-up. Loop until the model stops
 # calling tools, capped so a pathological LLM can't spin forever (industry default 5-20).
 _MAX_TOOL_PASSES = 5
+_MAX_CACHED_THREADS = 64
 
 
 class DispatcherTurnLoop:
@@ -58,7 +60,7 @@ class DispatcherTurnLoop:
         self._task_dictionary = task_dictionary or {}
         # UI-3 (спека §4, находка A): пер-тред контекст. История LLM ключуется по треду.
         self._thread_feed_reader = thread_feed_reader
-        self._histories: dict[str, list[dict[str, Any]]] = {}
+        self._histories: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 
     def _history_for(self, thread_id: str) -> list[dict[str, Any]]:
         """Пер-тред контекст (спека §4, находка A): история LLM ключуется по треду.
@@ -75,6 +77,10 @@ class DispatcherTurnLoop:
                     elif kind == "assistant":
                         hist.append({"role": "assistant", "content": str(e.get("text", ""))})
             self._histories[thread_id] = hist
+            while len(self._histories) > _MAX_CACHED_THREADS:
+                self._histories.popitem(last=False)
+        else:
+            self._histories.move_to_end(thread_id)
         return hist
 
     async def ingest_user_turn(self, transcript: str, thread_id: str = "voice") -> tuple[TurnRecord, str]:
@@ -90,35 +96,44 @@ class DispatcherTurnLoop:
         history = self._history_for(thread_id)
         history.append({"role": "user", "content": transcript})
 
-        text, tool_calls = await self._complete(history)
-        record.llm_output = text
-        passes = 0
-        # Р-2: a tool turn needs at least one more completion with the tool results in context —
-        # that call produces the text the dispatcher actually says. B10: keep going while the
-        # model keeps chaining tools, bounded by _MAX_TOOL_PASSES; on cap exhaustion the tail
-        # tool_calls are dropped (same behavior the old 2-pass shape had on pass 2).
-        while tool_calls and passes < _MAX_TOOL_PASSES:
-            # UI-3: канонический шейп — tool-результату предшествует assistant-ход с
-            # tool_use-анонсом (без него Anthropic Messages API отклоняет историю).
-            history.append({
-                "role": "assistant",
-                "content": text or "",
-                "tool_calls": [
-                    {"id": c.id, "name": c.name, "arguments": c.arguments} for c in tool_calls
-                ],
-            })
-            for call in tool_calls:
-                await self._dispatch_tool(call, history)
+        text = ""
+        history_snapshot = len(history)  # save length before LLM adds messages
+        try:
             text, tool_calls = await self._complete(history)
+            record.llm_output = text
+            passes = 0
+            # Р-2: a tool turn needs at least one more completion with the tool results in context —
+            # that call produces the text the dispatcher actually says. B10: keep going while the
+            # model keeps chaining tools, bounded by _MAX_TOOL_PASSES; on cap exhaustion the tail
+            # tool_calls are dropped (same behavior the old 2-pass shape had on pass 2).
+            while tool_calls and passes < _MAX_TOOL_PASSES:
+                # UI-3: канонический шейп — tool-результату предшествует assistant-ход с
+                # tool_use-анонсом (без него Anthropic Messages API отклоняет историю).
+                history.append({
+                    "role": "assistant",
+                    "content": text or "",
+                    "tool_calls": [
+                        {"id": c.id, "name": c.name, "arguments": c.arguments} for c in tool_calls
+                    ],
+                })
+                for call in tool_calls:
+                    await self._dispatch_tool(call, history)
+                text, tool_calls = await self._complete(history)
+                if text:
+                    record.llm_output = text
+                passes += 1
             if text:
-                record.llm_output = text
-            passes += 1
-
-        if text:
-            history.append({"role": "assistant", "content": text})
-
-        record.latency_ms = (self._clock.now() - now) * 1000.0
-        self._journal.check_grounding(record, had_active_task)
+                history.append({"role": "assistant", "content": text})
+        except Exception:
+            # Roll back ALL messages added during this turn (user msg + any LLM/tool messages)
+            del history[history_snapshot - 1:]  # remove the user message and everything after
+            # B-PIPE-4: close the journal turn on error — the caller won't get a chance since
+            # the exception propagates (normal path leaves end_turn() to the caller for tts_texts).
+            self._journal.end_turn()
+            raise
+        finally:
+            record.latency_ms = (self._clock.now() - now) * 1000.0
+            self._journal.check_grounding(record, had_active_task)
         return record, text
 
     async def _complete(self, history: list[dict[str, Any]]) -> tuple[str, list[ToolCall]]:
@@ -138,7 +153,10 @@ class DispatcherTurnLoop:
         if handler is None:
             result: Any = {"error": f"unknown tool {call.name}"}
         else:
-            result = await handler(**call.arguments)
+            try:
+                result = await handler(**call.arguments)
+            except TypeError as exc:
+                result = {"error": f"invalid arguments for {call.name}: {exc}"}
         history.append(
             {"role": "tool", "tool_call_id": call.id, "name": call.name,
              "content": json.dumps(result, ensure_ascii=False)}

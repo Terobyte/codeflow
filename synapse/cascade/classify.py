@@ -51,10 +51,16 @@ def classify_error(
 def _classify_google_429(body: dict[str, Any]) -> tuple[ErrorKind | None, float | None]:
     error = body.get("error")
     details = error.get("details", []) if isinstance(error, dict) else body.get("details", [])
+    if not isinstance(details, list):
+        details = []
     retry_after: float | None = None
     quota_kind: ErrorKind | None = None
-    for detail in details or []:
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
         detail_type = detail.get("@type", "")
+        if not isinstance(detail_type, str):
+            detail_type = ""
         if detail_type.endswith("RetryInfo"):
             delay = detail.get("retryDelay")
             if isinstance(delay, str):
@@ -62,7 +68,12 @@ def _classify_google_429(body: dict[str, Any]) -> tuple[ErrorKind | None, float 
                 if match:
                     retry_after = float(match.group(1))
         elif detail_type.endswith("QuotaFailure"):
-            for violation in detail.get("violations", []):
+            violations = detail.get("violations", [])
+            if not isinstance(violations, list):
+                violations = []
+            for violation in violations:
+                if not isinstance(violation, dict):
+                    continue
                 metric = "".join(str(v) for v in violation.values())
                 if "PerDay" in metric:
                     quota_kind = ErrorKind.RPD

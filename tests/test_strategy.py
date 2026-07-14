@@ -156,3 +156,24 @@ async def test_strategy_tail_tier_event_naming():
     # on_tail_tier side effect lands on the next loop tick -- yield once before asserting.
     await asyncio.sleep(0)
     assert "on_tail_tier" in events_called
+
+
+def test_google_429_malformed_body_graceful_handling():
+    # details is a string
+    kind, retry_after = classify_error(429, {"error": {"details": "some_string"}}, {})
+    assert kind == ErrorKind.RPM
+    assert retry_after is None
+
+    # details is a list of strings
+    kind, retry_after = classify_error(429, {"error": {"details": ["some_string"]}}, {})
+    assert kind == ErrorKind.RPM
+    assert retry_after is None
+
+    # details contains a dict with non-list violations
+    kind, retry_after = classify_error(
+        429,
+        {"error": {"details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": "not_a_list"}]}},
+        {}
+    )
+    assert kind == ErrorKind.RPM
+    assert retry_after is None

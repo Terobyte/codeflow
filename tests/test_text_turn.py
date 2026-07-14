@@ -165,7 +165,7 @@ def _api_host(tmp_path):
 
 
 class FakeRequest:
-    def __init__(self, body=None, json_ct=True, origin=None, host="testserver"):
+    def __init__(self, body=None, json_ct=True, origin="http://testserver", host="testserver"):
         self._body = body or {}
         self.headers = {"content-type": "application/json" if json_ct else "text/plain",
                         "host": host}
