@@ -109,5 +109,5 @@ def test_manifest_theme_matches_organic_bg():
     assert data["theme_color"] == "#f5ead8"
     assert data["background_color"] == "#f5ead8"
     # pinned fields untouched by the redesign
-    assert data["name"] == "Синапс"
+    assert data["name"] == "CodeFlow"
     assert data["start_url"] == "/client/"

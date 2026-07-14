@@ -69,7 +69,7 @@ async def test_manifest_route_serves_pwa_fields():
     assert resp.status_code == 200
     assert resp.media_type == "application/manifest+json"
     data = json.loads(resp.body)
-    assert data["name"] == "Синапс"
+    assert data["name"] == "CodeFlow"
     assert data["start_url"] == "/client/"
     assert data["display"] == "standalone"
     sizes = {icon["sizes"] for icon in data["icons"]}

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Синапс</title>
+  <title>CodeFlow</title>
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="apple-touch-icon" href="./apple-touch-icon.png">
   <meta name="mobile-web-app-capable" content="yes">
@@ -31,18 +31,16 @@
   <div id="shell">
     <aside id="sidebar">
       <div id="side-head">
-        <h1>Си<span class="flow">напс</span></h1>
-        <button id="side-close" type="button" aria-label="закрыть меню">✕</button>
+        <!-- Вордмарк = логотип: Caprasimo, «Flow» терракотой с волнистым подчёркиванием -->
+        <h1>Code<span class="flow logo-wave">Flow</span></h1>
+        <button id="side-close" type="button" aria-label="закрыть меню">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
       </div>
-      <svg class="logo-wave" viewBox="0 0 64 8" aria-hidden="true" focusable="false">
-        <path d="M0 4 Q8 0 16 4 T32 4 T48 4 T64 4" fill="none" stroke="currentColor" stroke-width="2"/>
-      </svg>
-      <div id="disp-toggle-row">
-        <span id="disp-toggle-label">Диспетчер · реалтайм</span>
-        <button id="disp-toggle" type="button" role="switch" aria-checked="true"
-                aria-label="Диспетчер реалтайм"></button>
-      </div>
-      <button id="new-thread" type="button">＋ новый тред</button>
+      <button id="new-thread" type="button">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        Новая задача
+      </button>
       <nav id="side-scroll">
         <h2>Проекты</h2>
         <ul id="projects-list"></ul>
@@ -50,6 +48,12 @@
         <h2 id="loose-h" hidden>Без проекта</h2>
         <ul id="threads-list"></ul>
       </nav>
+      <div id="disp-toggle-row">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></svg>
+        <span id="disp-toggle-label">Диспетчер · реалтайм</span>
+        <button id="disp-toggle" type="button" role="switch" aria-checked="true"
+                aria-label="Диспетчер реалтайм"></button>
+      </div>
       <a id="kora-card" href="#/activity">
         <span id="kora-card-dot"></span>
         <span id="kora-card-text">
@@ -62,8 +66,10 @@
     <div id="backdrop" hidden></div>
     <main id="main">
       <header id="topbar">
-        <button id="menu-btn" type="button" aria-label="меню">☰</button>
-        <div id="view-title">Синапс</div>
+        <button id="menu-btn" type="button" aria-label="меню">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <div id="view-title">CodeFlow</div>
         <span id="thread-badge" role="status" aria-live="polite" hidden></span>
         <span id="stage-chip" hidden></span>
         <div id="thread-tabs" hidden>
@@ -92,22 +98,41 @@
       </section>
       <p id="conn-status" role="status" aria-live="assertive" hidden></p>
       <footer id="composer">
-        <button id="proj-chip" type="button" title="активный проект"></button>
-        <button id="mic-btn" type="button" data-state="idle" aria-label="микрофон">🎙</button>
-        <textarea id="msg-input" rows="1" placeholder="Опиши задачу…" autocomplete="off" enterkeyhint="send"></textarea>
-        <button id="msg-send" type="button" aria-label="отправить">➤</button>
+        <div id="composer-pill">
+          <button id="proj-chip" type="button" title="активный проект"></button>
+          <button id="mic-btn" type="button" data-state="idle" aria-label="микрофон">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+          </button>
+          <textarea id="msg-input" rows="1" placeholder="Скажите или напишите задачу…" autocomplete="off" enterkeyhint="send"></textarea>
+          <button id="msg-send" type="button" aria-label="отправить">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 14 0"/><path d="m13 6 6 6-6 6"/></svg>
+          </button>
+        </div>
       </footer>
     </main>
     <div id="live-overlay" hidden>
-      <div id="live-orb" aria-hidden="true"></div>
+      <div id="live-glow" aria-hidden="true"></div>
+      <div id="live-orb-wrap" aria-hidden="true">
+        <span id="live-ring"></span>
+        <div id="live-orb">
+          <svg viewBox="0 0 24 24" width="46" height="46" fill="none" stroke="#f5ead8" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+        </div>
+      </div>
       <p id="live-status" aria-live="polite">Диспетчер слушает…</p>
       <div id="live-wave" aria-hidden="true">
-        <span></span><span></span><span></span><span></span><span></span>
+        <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+        <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
       </div>
       <div id="live-controls">
-        <button id="live-mute" type="button" aria-pressed="false">Заглушить</button>
-        <button id="live-end" type="button">Завершить — в чат</button>
+        <button id="live-mute" type="button" aria-pressed="false" aria-label="Микрофон вкл/выкл" title="Микрофон вкл/выкл">
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+        </button>
+        <button id="live-end" type="button">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          Завершить — в чат
+        </button>
       </div>
+      <p id="live-note">Реалтайм с диспетчером · разговор сохранится в чате</p>
     </div>
   </div>
   <div id="picker" hidden>

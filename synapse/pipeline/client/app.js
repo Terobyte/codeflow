@@ -26,6 +26,19 @@ function iconSvg(paths, size = 12) {
 }
 const ICON_PLAY = ["M8 5v14l11-7z"];
 const ICON_PAUSE = ["M7 5h4v14H7z", "M13 5h4v14h-4z"];
+// stroke-иконки аватаров (канон макета): Кора — код-скобки, Диспетчер — workflow-узлы.
+function strokeIcon(parts, size = 14) {
+  const svg = svgEl("svg", { viewBox: "0 0 24 24", width: size, height: size, fill: "none",
+    stroke: "currentColor", "stroke-width": "2.75",
+    "stroke-linecap": "round", "stroke-linejoin": "round" });
+  parts.forEach(([tag, attrs]) => svg.appendChild(svgEl(tag, attrs)));
+  return svg;
+}
+const AV_KORA = [["polyline", { points: "16 18 22 12 16 6" }],
+                 ["polyline", { points: "8 6 2 12 8 18" }]];
+const AV_DISP = [["circle", { cx: "6", cy: "19", r: "3" }],
+                 ["path", { d: "M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15" }],
+                 ["circle", { cx: "18", cy: "5", r: "3" }]];
 
 const FETCH_TIMEOUT_MS = 15000;
 async function getJSON(url) {
@@ -116,6 +129,12 @@ const KORA_MODELS = ["claude-opus-4-8", "claude-sonnet-5", "claude-fable-5"];
 // («ок»/«ошибка») больше не схлопываются в одну запись ленты.
 function feedKey(e) { return (e.id || "") + "|" + (e.ts || 0) + "|" + (e.kind || "") + "|" + (e.text || ""); }
 
+// узкий экран: длинный плейсхолдер макета не влезает в композер-пилюлю рядом с чипом
+const narrowMq = window.matchMedia("(max-width: 480px)");
+function taskPlaceholder() {
+  return narrowMq.matches ? "Задача…" : "Скажите или напишите задачу…";
+}
+
 // ---------- активный проект: дом рожает треды-ветки в нём ----------
 // Персистится в localStorage; валидируется против загруженного списка — удалённый
 // на сервере проект не должен молча утаскивать новые треды в никуда.
@@ -187,14 +206,14 @@ function render() {
     pollFeed();
   } else if (r.view === "activity") {
     $("view-title").textContent = "Активность Коры";
-    $("msg-input").placeholder = "Опиши задачу…";
+    $("msg-input").placeholder = taskPlaceholder();
     $("thread-badge").hidden = true;
     renderStageChip(null);
     feedThread = null;
     pollActivity();
   } else {
-    $("view-title").textContent = "Синапс";
-    $("msg-input").placeholder = "Опиши задачу…";
+    $("view-title").textContent = "CodeFlow";
+    $("msg-input").placeholder = taskPlaceholder();
     $("thread-badge").hidden = true;
     renderStageChip(null);
     feedThread = null;
@@ -228,6 +247,10 @@ function renderBadge(t) {
 
 function renderStageChip(t) {
   const chip = $("stage-chip");
+  // ГОТОВО-чип дублирует бейдж исхода («✓ готово») — прячем, одна пилюля на топбар
+  if (t && t.stage === "done" && outcomeLabel(t.last_outcome)) {
+    chip.hidden = true; chip.textContent = ""; return;
+  }
   const label = t && STAGES[t.stage];
   chip.textContent = label || "";
   chip.hidden = !label;
@@ -241,10 +264,16 @@ function threadCard(t, cur, showProj) {
   const a = el("a", "thread-card" + (cur.view === "thread" && cur.id === t.id ? " active" : ""));
   a.href = "#/thread/" + encodeURIComponent(t.id);
   const o = outcomeLabel(t.last_outcome);
-  a.appendChild(el("span", "tc-title", (o ? o.icon + " " : "") + t.title));
-  if (STAGES[t.stage]) a.appendChild(el("span", "tc-stage", STAGES[t.stage]));
+  // канон макета: строка «точка-статус + заголовок», под ней «время · проект | пилюля стадии»
+  const row = el("div", "tc-row");
+  row.appendChild(el("span", "tc-dot" + (t.stage ? " stage-" + t.stage : "")));
+  row.appendChild(el("span", "tc-title", (o ? o.icon + " " : "") + t.title));
+  a.appendChild(row);
   const proj = showProj ? projects.find((p) => p.id === t.project_id) : null;
-  a.appendChild(el("span", "tc-meta", relTime(t.updated_ts) + (proj ? " · " + proj.name : "")));
+  const sub = el("div", "tc-sub");
+  sub.appendChild(el("span", "tc-meta", relTime(t.updated_ts) + (proj ? " · " + proj.name : "")));
+  if (STAGES[t.stage]) sub.appendChild(el("span", "tc-stage stage-" + t.stage, STAGES[t.stage]));
+  a.appendChild(sub);
   wrap.appendChild(a);
   const ar = el("button", "tc-archive");
   ar.type = "button";
@@ -390,15 +419,23 @@ function addEntry(e) {
   if (e.kind === "user" || e.kind === "assistant" || e.kind === "text") {
     const role = e.kind === "user" ? "user" : e.kind === "assistant" ? "disp" : "kora";
     li.classList.add("msg", role === "user" ? "msg-user" : role === "disp" ? "msg-disp" : "msg-kora");
-    const bubble = el("div", "msg-bubble");
-    if (role !== "user") {
-      bubble.appendChild(el("span", "msg-avatar", role === "disp" ? "Д" : "К"));
+    if (role === "user") {
+      const body = el("div", "msg-body");
+      body.appendChild(el("p", "msg-text", e.text || ""));
+      li.appendChild(body);
+    } else {
+      // канон макета: аватар-иконка + имя роли над пузырём + play под ним
+      const av = el("span", "msg-avatar");
+      av.appendChild(strokeIcon(role === "disp" ? AV_DISP : AV_KORA));
+      li.appendChild(av);
+      const col = el("div", "msg-col");
+      col.appendChild(el("span", "msg-who", role === "disp" ? "Диспетчер" : "Кора"));
+      const body = el("div", "msg-body");
+      body.appendChild(el("p", "msg-text", e.text || ""));
+      col.appendChild(body);
+      col.appendChild(playButton(role));
+      li.appendChild(col);
     }
-    const body = el("div", "msg-body");
-    body.appendChild(el("p", "msg-text", e.text || ""));
-    if (role !== "user") body.appendChild(playButton(role));
-    bubble.appendChild(body);
-    li.appendChild(bubble);
   } else if (e.kind === "thinking") {
     // PF8: thinking остаётся светлым collapsible, отдельно от тёмной tool-карточки.
     const det = document.createElement("details");

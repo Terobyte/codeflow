@@ -1,6 +1,6 @@
 {
-  "name": "Синапс",
-  "short_name": "Синапс",
+  "name": "CodeFlow",
+  "short_name": "CodeFlow",
   "description": "Голосовой агент-программист: пиши код на своей машине голосом или текстом.",
   "lang": "ru",
   "dir": "ltr",
