@@ -1,272 +1,48 @@
-# Синапс UI v2 — план реализации слайсов UI-4..UI-5
+# Синапс UI v2 — план реализации слайсов UI-4..UI-5 (живой остаток)
 
-## UX-аудит: ориентир на Codex (добавлено 2026-07-13)
+**Task 1–11 сданы и закоммичены** — таблица коммитов, решения, факты план-фазы и File
+Structure переехали в `2026-07-14-synapse-ui-v2-slices-4-5-archive.md`. Здесь — только то,
+что ещё НЕ сделано. Спека: `docs/superpowers/specs/2026-07-13-synapse-ui-v2-design.md` (v4).
 
-> Этот блок задаёт продуктовый критерий для UI-4/UI-5 и **не отменяет** ниже существующие
-> инварианты, порядок задач, тесты или DoD. При конфликте источником истины остаются Global
-> Constraints и конкретные шаги задач; аудит помогает выбрать представление и порядок UI-работы.
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development
+> (recommended) или superpowers:executing-plans. Домашний воркфлоу: каждый оставшийся шаг —
+> tero-ран.
 
-Цель — брать у Codex не пиксели, а ментальную модель: **один тред = одна задача; весь её
-контекст, ход работы, состояние и следующее безопасное действие видны внутри этого треда**.
-Синапс при этом остаётся voice-first, mobile-first клиентом, а не пытается копировать IDE.
-
-### P0 — обязательный продуктовый результат UI-4
-
-1. **Стадийный флоу должен быть видимым и управляемым, а не только существовать на сервере.**
-   В шапке треда — компактный чип стадии; в ленте — гейт-карточки с понятным следующим
-   действием: «Запрос готов → Отправить Коре», «План готов → Пиши код», «Правки».
-   Выбор модели относится к конкретному запуску. Быстрый путь к коду и «Пиши код» требуют
-   явного второго подтверждения с понятным последствием. Ошибка busy должна объяснять, что
-   Кора занята, и в каком треде/запуске это видно.
-
-2. **Activity не должна выводить пользователя из SPA.** Карточка Коры и разворачивание
-   thinking/tool-лога открывают панель либо секцию текущего shell, а не отдельную страницу.
-   Переход на `./logs` сейчас способен оборвать голосовую WebRTC-сессию, что противоречит
-   ключевому свойству UI-1..UI-3 — голос переживает навигацию между домом и тредом.
-
-3. **Композер должен принимать рабочие задачи, а не одну строку текста.** Заменить input на
-   растущий textarea: Enter отправляет, Shift+Enter вставляет строку; сохранить большую
-   самостоятельную голосовую кнопку и её видимые состояния. Это необходимо для многострочных
-   требований, путей, логов и вставок кода.
-
-### P1 — правила визуального и системного UX
-
-- Дом — быстрый, но информативный: заметное действие «Открыть агента», недавние треды с
-  проектом, стадией и исходом последнего запуска. Не прятать основной старт только в сайдбар.
-- Лента использует progressive disclosure: реплики открыты; tool-вызов показывает название и
-  краткий итог; reasoning свёрнут по умолчанию; итог и ошибка — отдельные заметные карточки.
-- Статус Коры контекстен: «свободна» либо «работает в <треде> · <стадия>», с переходом к
-  соответствующему треду. Глобальный статус без связи с задачей создаёт две несвязанные модели.
-- Убрать эмодзи как единственный носитель смысла у действий/статусов: использовать единый набор
-  иконок и текст для необратимых действий. Цвет — вторичный сигнал, не единственный.
-- Выбор активного проекта должен быть явным: чип с названием и явным сбросом, а не скрытый
-  жест «тапнуть ещё раз». Для выбора папки полезны недавние проекты, поиск/ввод пути и пояснение
-  рабочей директории агента.
-
-### Проверка готового UX
-
-Пользователь за несколько секунд отвечает на четыре вопроса, не читая сырые логи: «над чем я
-работаю?», «на какой стадии задача?», «что сейчас делает Кора?», «какое следующее действие и
-потребует ли оно записи кода?». На телефоне это возможно без открытия drawer; при живом голосе
-ни одно из этих действий не должно рвать сессию.
-
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Домашний воркфлоу: каждый слайс исполняется tero-раном; этот план — канон для ран-файлов.
-
-**Goal:** Стадийный флоу тредов (UI-4): FSM COLLECT→PROPOSE→SPEC_PLAN→CODE→DONE, гейт-карточки и gate-эндпоинт, гейт-режим `docs_only`, модель пер-запуск, привязка треда к проекту. Гигиена (UI-5): чистый контекст нового треда, компакт, rename, архив. Спека: `docs/superpowers/specs/2026-07-13-synapse-ui-v2-design.md` (v4). Пререквизит: UI-1..UI-3 сданы + Codex-редизайн дома (`7b2e541`…`f3de0aa`, 327 тестов) + live-DoD Теро по слайсам 1–3.
-
-**Architecture:** Стадия — свойство треда (`Thread.stage` — ПОЛЕ живёт с UI-2; метод `set_stage` НОВЫЙ, сегодня существует только `set_outcome` без всякой валидации), двигается ТОЛЬКО через `ThreadStore.set_stage` с таблицей легальных переходов; исход запуска ортогонален стадии (S2, `last_outcome` уже есть). Гейт-действия сходятся в ОДНОЙ хост-функции `gate_action(thread_id, action, model, confirm)` в `build_host` — её зовут и HTTP-роут `POST /api/threads/{id}/gate`, и новый голосовой инструмент диспетчера (S4: «голосовые эквиваленты добавляются туда же»). Запуск стадии = обычный `KoraRunner.start` с `RunSpec(gate_mode=..., model=...)` — поля есть с UI-2, потребители появляются здесь. `docs_only` — третья проверка в `_gate_decision` ПОСЛЕ секрет-денилиста и in-workspace (сужение, не замена). Свод (запрос) персистится на треде (`request_text`) — носитель между COLLECT и запусками. Гейт-карточки = записи ленты `kind: "gate_card"` — рендерятся `app.js` (`addEntry`, SPA-шелл; thread.js удалён) как кнопки, персист/регидрация бесплатны (лента уже переживает рестарт; в LLM-контекст не попадают — регидрация UI-3 берёт только user/assistant).
-
-**Tech Stack:** как UI-1..3 — vanilla JS (textContent-only), FastAPI-роуты до mount'ов, pytest (паттерны `_endpoint`/`SimpleNamespace`-хост из `tests/test_text_turn.py`), никаких новых зависимостей.
-
-## Global Constraints
+## Global Constraints (продолжают действовать)
 
 - Коммиты: короткие, lowercase, по-человечески; **НИКОГДА** никакой AI-атрибуции/Co-Authored-By; без `feat:`/`fix:` префиксов.
-- **NO-EXFIL (Р-15)**: сырые кора-шаги НИКОГДА не в LLM-контекст диспетчера; компакт (UI-5) жмёт ТОЛЬКО реплики user/assistant этого треда; gate_card-записи ленты в регидрацию не попадают (фильтр UI-3 по kind сохраняется).
-- **Синглтон «одна активная задача»** (TaskStore) не меняется. Гейт-запуск при чужом живом ране → 409, не supersede (S6: UI-путь НИКОГДА не зовёт start поверх живого рана).
+- **NO-EXFIL (Р-15)**: сырые кора-шаги НИКОГДА не в LLM-контекст диспетчера.
+- **Синглтон «одна активная задача»** (TaskStore) не меняется.
 - **XSS-дисциплина**: только `textContent`/`style`, никакого `innerHTML` (лексические тесты).
 - Ключи только из `.env` через `SynapseConfig.from_env()`.
-- **Живой сервер на 7860 не рестартовать без явного слова Теро**; проверки — тестами/вторым портом (staging 7861, tailnet :8443).
-- Анти-CSRF UI-3 (`_csrf_ok`) обязателен на всех НОВЫХ мутирующих роутах.
-- Замороженные тесты UI-1..3 не меняются; исключения перечислены в Task 1 Step 4 и Task 4 Step 4 (намеренные изменения поведения по спеке).
-- Запуск тестов: `.venv/bin/python -m pytest tests/ -q` (сейчас **334 зелёных** на HEAD `8a1b1cc` — план писался на `f3de0aa`/327, но `8a1b1cc` projects-own-threads добавил 7; baseline-гейт = 334, НЕ 327; каждый таск гоняет свой файл + полную суиту перед коммитом).
-
-## Факты, добытые в план-фазе (проверено по коду 2026-07-13, HEAD `f3de0aa`; ревизия после критики Теро (7 находок: блокер code→collect, wiring/строки/автоподхват/auto-title/точка компакта/замороженный тест))
-
-> ⚠️ **Строки сдвинулись:** факты собраны на `f3de0aa`, текущий HEAD — `8a1b1cc` (projects-own-threads). Номера ниже актуализированы под `8a1b1cc` там, где перепроверены, но **исполнитель обязан грепать по символам, не по номерам** — любой номер здесь справочный.
-
-1. **RunSpec уже несёт всё** (`bridge/runspec.py`): `thread_id, project_root, gate_mode="full", model=None` — сигнатуры `start/_run` менять не надо, UI-4 только ПОТРЕБЛЯЕТ gate_mode/model.
-2. **Снапшот-паттерн готов**: декларации слотов — kora.py:345-347 (`__init__`), установка в `_run` — kora.py:393-394, очистка в finally — kora.py:**401-406** (finally :401; identity-guard = строковое сравнение `self._run_owner == task_id` :402; сброс `_run_owner`/`_run_root`/`_run_model` :403-405; `_terminalize_if_running` :406). Т.е. слотов уже ТРИ (`_run_owner`/`_run_root`/`_run_model`); `gate_mode` добавляется ЧЕТВЁРТЫМ ТЕМ ЖЕ паттерном (декларация + set в `_run` + сброс в finally, внутри identity-guard). Честно: `spec.gate_mode` сегодня НИГДЕ в kora.py не читается — это НОВЫЙ потребитель поля, не зеркало существующего; fallback-цепочка (как `or self._cfg.kora_model`) не нужна — дефолт `"full"` уже стоит на датаклассе RunSpec.
-3. **`_gate_decision` (kora.py:507-546)** — чистая функция, категории явные. `docs_only` встаёт после `_is_secret_path` и после in-workspace-резолва: у нас уже есть `resolved` и `ws_resolved`. ⚠️ **Это не «строки перед return», а разрез if-блока:** kora.py:544-545 сегодня — `if resolved.is_relative_to(ws_resolved):` (:544) и `return True, str(resolved), "allow"` (:545), две строки. Вставлять «перед `return True`» некуда — надо вложить docs_only-deny ВНУТРЬ ветки `is_relative_to` ПЕРЕД обычным allow (см. Task 2 Step 3).
-4. **Мутирующие file-инструменты** по `_PATH_KEY`: `Write`, `Edit`, `NotebookEdit` (Read/Glob/Grep/LS — читающие, docs_only их НЕ трогает; `_SAFE_META_TOOLS` тоже).
-5. **Thread (threads.py:17-26)** уже хранит `stage` (дефолт "collect") и `last_outcome` — UI-4 добавляет поля `request_text`, `last_model`, `archived` + методы переходов; `_load/_persist` расширяются симметрично.
-6. **Точки старта запусков в app.py**: `_on_task_committed` (голос, :298) и `_http_task_committed` (:335) — обе зовут `kora_runner.start(task_id, text, RunSpec(...))`. Гейт-запуск — ТРЕТЬЯ точка, минуя ConfirmFlow (двухфазность уже отработана confirm-параметром/читкой ДО гейта): `store.start_task(...)` + `threads.append_task` + `runner.start`.
-7. **TaskStore.start_task(task_id, text, status, now)** (**`synapse/bridge/state.py`**:192) и `has_active_task()` (:186) — всё, что нужно гейту; task_id генерится как в **`synapse/bridge/confirm.py`**:24 (`_new_task_id`). ⚠️ Модули живут под `synapse/bridge/`, НЕ в корне пакета (`synapse/state.py`/`synapse/confirm.py` НЕ существуют). `_new_task_id` — модульно-приватный (leading underscore): тащить его через границу модуля = смелл; в Task 3 либо сделать публичным, либо продублировать 2 строки генерации id.
-8. **Промпт диспетчера** (prompt.py) — константы + `build_system_prompt(cfg, task_dictionary)` (сигнатура prompt.py:97 сегодня РОВНО `(cfg, task_dictionary=None)` — **параметра `stage_block` ЕЩЁ НЕТ**, Task 5 Step 3 его добавляет); loop.py:126 зовёт его внутри `_complete`, т.е. 1–5 раз за ход (`_MAX_TOOL_PASSES=5`) — stage_block обязан быть идемпотентным (он и есть: чистая строка от текущей стадии). ⚠️ **Блок `[СОСТОЯНИЕ]` НЕ строится в prompt.py** — там литерал `[СОСТОЯНИЕ]` встречается лишь как ТЕКСТ инструкции модели (prompt.py:17/22/23/42/53/57). Сам стейт рендерит `loop._render_state` (loop.py:148) и конкатенирует `loop._complete` (loop.py:128: `system_prompt + "\n\n" + state_block`). Значит «вставить stage_block до [СОСТОЯНИЕ]» ни на что не отображается — см. решение «Точка вставки stage_block» и Task 5 Step 3/4.
-9. **Инструменты диспетчера** (tools.py): автоматически из добавления схемы в `ALL_SCHEMAS` выводится ТОЛЬКО allowlist `_VALID_TOOL_NAMES` (loop.py:23). Всё остальное — руками, для КАЖДОГО нового инструмента три обязательных куска: (а) async-метод на `ToolHandlers` (иначе loop.py:139 вернёт `unknown tool`), (б) явный вызов `_guarded` внутри метода — dedup-латч сам не подключается, (в) явная регистрация в `register_all` (tools.py:251-256) с `cancel_on_interruption=False` — БЕЗ неё инструмент работает только в текстовом канале, голосовой pipecat-путь его не видит.
-10. **Исход запуска → тред** уже wired: `on_run_finished=threads.set_outcome` (app.py:258); `set_outcome` (threads.py:98) пишет только `last_outcome`+`updated_ts` и про стадии не знает. Переход code→done — НОВАЯ обёртка на месте этого wiring, не «дополнение существующего колбэка».
-11. **Console-раннер** (runners/console.py) строит свой KoraBridge без on_*-колбэков и на mock-LLM: новые инструменты с `on_*=None` вернут свой sentinel-исход (компакт не сработает) — приемлемо, консоль dev-only; в тесты не тянуть. ⚠️ **Строки `"unavailable"` в коде НЕТ** — реальный None-путь у существующих инструментов: `answer_kora`→`{"outcome":"no_pending_question"}` (tools.py:216), `request_cancel`→`no_active_task` (:207), `on_speak`/`on_task_committed`→молчаливый skip. Новые `on_propose`/`on_gate`/`on_bind` при None обязаны вернуть СВОЙ явный `{"outcome": "..."}` по образцу `answer_kora` (внутренний `_do()`+`_guarded`+`record_tool_call`, tools.py:213-220) — конкретную строку выбрать в Task 5, НЕ полагаться на несуществующий `"unavailable"`.
-12. **`_handle_question` identity-guard уже чистит `_pending_answer`** (kora.py:630-632) — межзапускный reset-тест (чат-2) проверяет СУЩЕСТВУЮЩЕЕ поведение на новой паре запусков SPEC_PLAN→CODE, кода не требует (если тест упадёт — это находка, чинить в kora.py). ⚠️ **Асимметрия guard'а:** чистка в finally identity-guarded, а сама доставка в `provide_answer` (kora.py:372-383) — НЕТ, доставляет в любой живой future. UI-путь supersede не делает (409 на занятом синглтоне → SPEC_PLAN завершается ДО старта CODE, finally уже обнулил `_pending_answer`), поэтому тест на чистый supersede проходит за счёт finally-очистки отменённого рана, а не за счёт guard'а в доставке. **Если тест упадёт — чинить именно `provide_answer` (добавить identity-guard рана на доставку), НЕ код стадии.**
-13. **Лента**: `append_feed` пишет любой dict; **`app.js`** рендерит фид по `KIND_ICONS` в `addEntry` (app.js:235-255; `#feed-list` в `#view-thread`) — неизвестный kind сейчас падает в дефолт-иконку `·` (`KIND_ICONS[e.kind] || "·"`, app.js:253), gate_card требует отдельной ветки в `addEntry` (кнопки+select). (thread.js удалён — рендер живёт в SPA-шелле, см. предупреждение в File Structure.) ⚠️ **app.js-строки сдвинул `8a1b1cc`** (project→thread-дерево вставлено ВЫШЕ этих функций): актуальные позиции — `renderBadge`:130, `threadCard`:141, `renderSidebar`:151-183, `addEntry`:235-255, `setKora`:291, `pollStatus`:295-303, awaiting/status-подпись :300-302, `view-title` пишется :98/230. Грепать по символу.
-14. **Модельный allowlist (S34)**: три id из спеки §4 — `claude-opus-4-8`, `claude-sonnet-5`, `claude-fable-5`; серверная константа, НЕ конфиг (конфиговый `kora_model` — дефолт, он в allowlist не обязан входить исторически — валидируем только пришедшее из UI/инструмента).
-15. **🟥 У ГОЛОСОВОГО LLM СЕГОДНЯ НЕТ СИСТЕМНОГО ПРОМПТА.** `build_system_prompt`/`PROMPT_V3` в проде зовётся РОВНО в одном месте — `loop.py:126` внутри `DispatcherTurnLoop._complete`; `ingest_user_turn` зовётся ТОЛЬКО из HTTP-роута `POST /api/threads/{id}/message` (webrtc_server.py:454). Голосовой каскад — ОТДЕЛЬНЫЙ путь: `build_session_pipeline` строит `context = LLMContext(tools=ALL_SCHEMAS)` (app.py:459) БЕЗ `messages`, а `cascade/services.py:35-39` создаёт `OpenRouterLLMService`/`AnthropicLLMService` БЕЗ `system_instruction`. Грепом по `synapse/pipeline/` и `synapse/cascade/` — НИ ОДНОГО `add_message`/`set_messages`/`role:system`/`system_instruction`. Значит голосовой LLM крутится на голых схемах инструментов. **Следствие для этого плана:** `stage_block` (Task 5) прокидывается ТОЛЬКО через `DispatcherTurnLoop._complete` = текст/HTTP; `STAGE_RULES_COLLECT/PROPOSE` и «двухфазность голоса = правило промпта» на голос НЕ ДОХОДЯТ ВООБЩЕ — существующая двухфазность (`confirm_task`) держится на детерминированном `ConfirmFlow`, а НЕ на промпте, поэтому «правило промпта» для гейта — НОВЫЙ несуществующий механизм. См. решение «Голосовой системный промпт».
-
-## Решения план-фазы (закрывают открытые вопросы спеки)
-
-- **Р3 whitelist docs-путей (`docs_only`)**: мутирующий инструмент разрешён, если resolved-путь (уже внутри клетки) попадает в: (а) поддерево `<root>/docs/`, (б) top-level `*.md` файлы корня (`<root>/plan.md`, `<root>/README.md`, …). Всё остальное — deny `docs_only_violation`. Читается весь проект как раньше.
-- **Конвенция план-файла (S2)**: `<root>/docs/plans/<thread_id>.md`. SPEC_PLAN-запуску путь диктуется в тексте задачи; гейт-проверка `write_code` — существование ровно этого файла **И `thread.last_outcome == "completed"`** (иначе `stale_plan`). ⚠️ **Только существования НЕДОСТАТОЧНО:** путь фиксирован на тред, одинаков для КАЖДОЙ попытки SPEC_PLAN. Достижимый баг без искусственного стейта: SPEC_PLAN #1 успешен → пишет план запроса A; юзер «Правки»→`revise`→перезапрос B→`send_to_kora`→SPEC_PLAN #2 падает ДО записи файла (по правилу «упал → стадия не меняется», stage остаётся spec_plan, `last_outcome=failed`, `set_outcome` трогает ТОЛЬКО last_outcome — threads.py:98-102). Файл всё ещё держит план A. Проверка «файл есть» → пройдёт → CODE поедет по чужому устаревшему плану пока юзер думает, что кодит B. `last_outcome=="completed"` рубит этот путь (провалившийся #2 даёт `failed`; занятость во время живого #2 уже ловит busy-синглтон). ⚠️ **Узкое гоночное окно (не airtight):** `has_active_task()` гаснет когда терминальный статус ставится в `_stream` по `ResultMessage`, а `on_run_finished`→`set_outcome`(last_outcome) зовётся ПОЗЖЕ в `_run.finally` (kora.py:406→409-416) после teardown SDK-клиента. В этот зазор `write_code` увидит busy=False но last_outcome ещё старый → ложный `stale_plan` на СВЕЖЕудачном плане. Само-лечится (повтор через миг проходит), урона нет; клиент на `stale_plan` может показать «план дописывается, повтори». Для v1 — принять с этой пометкой, не городить mtime-сверку. Тред без проекта — тот же путь внутри дефолт-воркспейса.
-- **Текст задач запусков**: SPEC_PLAN → `"Подготовь спеку и план по запросу ниже. План запиши в файл docs/plans/<thread_id>.md (создай директории). Запрос: <request_text>"`. CODE стадийный → `"Реализуй по плану docs/plans/<thread_id>.md. Исходный запрос: <request_text>"`. CODE быстрый (S1) → сам `request_text`.
-- **Свод**: новый инструмент диспетчера `propose_request(text)` — единственный переход collect→propose; кладёт `request_text`, пишет gate_card в ленту. [Правки]/`revise` стирают карточку логически (стадия назад; старая карточка в ленте остаётся историей, кнопки мертвы вне своей стадии — рендер сверяет стадию треда).
-- **Голосовой гейт**: инструмент `gate_action(action, model?)` бьёт в ту же хост-функцию; двухфазность голоса = правило промпта (зачитка «отправляю вот это — верно?» / «точно пишем код в <проект>?» → только после явного «да» звать инструмент) — паттерн возможности «г» (Р-16). HTTP-двухфазность = `confirm: true` (S5). ⚠️ **Правило промпта работает на голосе ТОЛЬКО если голосовой LLM получит системный промпт (факт 15 — сегодня НЕ получает).** Без «Голосового системного промпта» (ниже) голосовая двухфазность/стадийные правила не существуют, и голос-DoD (Task 7 Step 3, Task 12 Step 2) невыполним.
-- **🟥 Голосовой системный промпт (найдено r3, факт 15)**: голосовой `LLMContext` (app.py:459) сегодня без системного сообщения — ни стадийных правил, ни даже базового PROMPT_V3-управления на голосе НЕТ. Для стадийного флоу голосом нужно ВПРЫСНУТЬ `build_system_prompt(cfg, task_dictionary, stage_block=<по стадии voice_thread>)` как system-сообщение голосового контекста, освежая его каждый ход (кандидаты точки: в `_on_end_of_turn` под `turn_lock` перед генерацией — `context.set_messages([{role:system,…}, *history])`, ИЛИ при сборке контекста + рефреш на смене стадии). **Решение v1 (рекомендация):** добавить это отдельным шагом Task 5 (Step 3b) — иначе голос-DoD липовый. **Альтернатива, если Теро режет скоуп:** голосовое стадийное управление → M1.1, стадийная-FSM v1 живёт ТОЛЬКО на тексте/HTTP (`/message` + UI-карточки), голос v1 остаётся как есть (submit/confirm через ConfirmFlow, без стадий), а Task 7 Step 3 / Task 12 Step 2 голос-DoD переезжают в parking. ⚠️ **Это единственная находка с реальной скоуп-развилкой — слово за Теро; по умолчанию план идёт по рекомендации (Step 3b), пометив её как несущую.**
-- **Дефолт модели (находка E)**: `thread.last_model` (пишется при каждом гейт-запуске) → нет → `cfg.kora_model`.
-- **Бейдж «ждёт» (О2)**: 409 от gate при занятом синглтоне; клиент показывает подпись «Кора занята другим тредом — ждёт» на карточке. Авто-старта из очереди нет (v1).
-- **Компакт (S10)**: порог — новый конфиг `dispatcher_compact_after` (дефолт 40 сообщений истории). При превышении ПЕРЕД ходом: LLM-выжимка старшей половины истории (только user/assistant реплики) тем же `AnthropicLLMClient` → история = `[{"role":"user","content":"[КОМПАКТ] <выжимка>"}] + хвост`; в ленту — запись `kind:"event"` «контекст сжат». Сырая лента в файле не тронута (необратимого удаления нет).
-- **Точка вставки stage_block (B3)**: `[СОСТОЯНИЕ]` не строится в prompt.py (там только текст-инструкция), поэтому «вставить в промпт до [СОСТОЯНИЕ]» негде. Решение: `build_system_prompt` получает НОВЫЙ параметр `stage_block=""` и вклеивает его в конец возвращаемой строки промпта (ПОСЛЕ железных правил PROMPT_V3+OWED+словарь); `loop._complete` уже конкатенирует `system_prompt + "\n\n" + state_block` (loop.py:128) — т.е. порядок в system-сообщении получается `[правила + stage_block] \n\n [СОСТОЯНИЕ]`, что и есть искомое «стадийные правила ДО состояния». Никакого третьего конкатена в `_complete` — stage_block едет внутри `system_prompt`, `state_block` остаётся отдельным хвостом. `_complete` прокидывает `stage_block` в `build_system_prompt` (Task 5 Step 4).
-- **Привязка проекта (S2)**: `ProjectStore` не имеет name→id резолва (только `get(id)`/`list()`, projects.py:71-77) и НЕ гарантирует уникальность имён (`add` дефолтит имя из пути). Инструмент `bind_project(project_name)` сканирует `list()`, матчит по имени casefold; **ноль совпадений → отказ `unknown_project`, ≥2 совпадения → отказ `ambiguous_project`** (v1 не угадывает). HTTP-роут привязки в v1 НЕ делаем (был осиротевшим в File Structure) — привязка только голосом/диспетчером; UI-привязка в parking lot.
-- **Экран настроек (§2.3) НЕ в этом плане** — дефолт модели меняется конфигом; отдельный мини-слайс после live.
-
-## File Structure
-
-```
-synapse/threads.py                     MOD  stage-FSM (set_stage+таблица), request_text/last_model/archived,
-                                            bind_project (находка F), rename/archive, авто-title
-synapse/bridge/kora.py                 MOD  _run_gate_mode снапшот, docs_only-ветка в _gate_decision
-synapse/pipeline/app.py                MOD  build_host: gate_action-хелпер + per-thread gate-lock'и,
-                                            стадийный блок в text_loop/voice, wiring новых инструментов
-synapse/pipeline/webrtc_server.py      MOD  POST /api/threads/{id}/gate, GET /api/threads/{id},
-                                            PATCH /api/threads/{id}, POST /api/threads/{id}/archive,
-                                            DELETE /api/projects/{id}
-                                            (bind-project HTTP-роут ВЫРЕЗАН — v1 привязка только диспетчер-инструментом,
-                                             см. решение «Привязка проекта» и parking lot)
-synapse/dispatcher/tools.py            MOD  схемы+хендлеры propose_request / gate_action / bind_project
-synapse/dispatcher/loop.py             MOD  stage_block в _complete, компакт перед ходом (UI-5)
-synapse/prompt.py                      MOD  стадийные правила COLLECT/PROPOSE (пачкой вопросы, S29)
-synapse/config.py                      MOD  dispatcher_compact_after
-synapse/pipeline/client/index.html     MOD  #stage-chip рядом с #thread-badge в топбаре (thread.html УДАЛЁН — SPA-шелл)
-synapse/pipeline/client/app.js         MOD  чип стадии в renderBadge (thread-view) + threadCard (сайдбар),
-                                            gate_card-ветка в addEntry (кнопки+модель+двухфазный тап),
-                                            архив-фильтр, rename по тапу заголовка, поле стадии из GET /api/threads/{id}
-synapse/pipeline/client/style.css      MOD  чипы/карточки/кнопки
-tests/test_stages.py                   NEW  UI-4: FSM, gate_action, docs_only, план-файл, single-flight,
-                                            модельный allowlist, привязка, межзапускный reset
-tests/test_hygiene.py                  NEW  UI-5: чистый контекст, компакт, rename/авто-title, архив,
-                                            удаление проекта
-tests/test_ui_client.py                MOD  лексические тесты новых кусков app.js/index.html (НЕ thread.js — удалён)
-```
-
-> ⚠️ **thread.js / thread.html УДАЛЕНЫ** коммитом `7424c3c` (ui v3 SPA-редизайн, позже бейзлайна `f3de0aa`), это форсит `tests/test_ui_client.py:179-181` (`test_thread_page_files_are_gone`) и `:150`. Вся отрисовка треда переехала в SPA-шелл `index.html` (`#view-thread`/`#feed-list`, топбар `#view-title`+`#thread-badge`) + `app.js` (`addEntry` по `KIND_ICONS` — app.js:235-255; `renderBadge` — :130; `renderSidebar`/`threadCard` — :151-183/:141; статус-поллер `pollStatus`/`setKora` — :295-303/:291). НИКАКИХ правок thread.js/thread.html — их нет.
+- **Живой сервер на 7860 не рестартовать без явного слова Тео**; проверки — тестами/вторым портом (staging 7861, tailnet :8443).
+- Анти-CSRF (`_csrf_ok`) обязателен на всех НОВЫХ мутирующих роутах.
+- Запуск тестов: `.venv/bin/python -m pytest tests/ -q` (база на HEAD `dff3478` — **450 зелёных**, исключая незакрытый параллельный багхант `test_hunt0714_*.py`/`test_b_pipe_bugs.py`/`test_concurrency_race.py`).
 
 ---
----
 
-# СЛАЙС UI-4 «стадии»
-
-Живой продукт: в треде виден чип стадии; серьёзный запрос собирается диспетчером, сводится карточкой, уходит Коре на спеку-план в `docs_only`, план-файл открывает кнопку «Пиши код», код пишется вторым запуском с выбранной моделью. Быстрый путь — «сразу код» с явным confirm.
-
-### Task 1: FSM треда в ThreadStore
-
-**Files:** `synapse/threads.py`, `tests/test_stages.py`
-
-**Steps:**
-- [x] Step 1: Тесты `tests/test_stages.py`: (а) легальные переходы collect→propose→spec_plan→code→done, **propose/spec_plan/code→collect (revise — из ВСЕХ трёх рабочих стадий: спека:57/60/96 требует [Правки → СБОР] и после упавшего CODE-запуска, «тупиков в автомате нет» — S2)**, propose→code (быстрый путь); (б) нелегальные (collect→code, collect→spec_plan, code→propose, done→*) → `ValueError`; recovery-трасса: CODE-запуск упал (стадия остаётся code) → revise → collect → полный цикл заново; (в) `set_request` пишет request_text и персистит; (г) `bind_project`: null→значение ок ПОКА `task_ids` пуст, повторная привязка / привязка после запуска / значение→значение → отказ (находка F); (д) `last_model` персистится; (е) рестарт (`_load`) восстанавливает все новые поля.
-- [x] Step 2: `Thread`: поля `request_text: str | None = None`, `last_model: str | None = None`, `archived: bool = False`. `_STAGE_TRANSITIONS: dict[str, frozenset[str]]` на модуле. Методы `set_stage(thread_id, stage)` (валидация + persist), `set_request(thread_id, text)`, `set_last_model(thread_id, model)`, `bind_project(thread_id, project_id) -> bool` (guard находки F: `project_id is None and not task_ids`). `_persist`/`_load` — новые ключи (отсутствующие в старых файлах → дефолты, битые файлы — прежний skip).
-- [x] Step 3: Суита зелёная; коммит `ui-4: thread stage fsm, request/model/archived fields, project binding guard`.
-
-### Task 2: Гейт-режим docs_only в KoraRunner
-
-**Files:** `synapse/bridge/kora.py`, `tests/test_stages.py`
-
-**Steps:**
-- [x] Step 1: Тесты (стаб-раннер без SDK, паттерн test_runspec.py): в `gate_mode="docs_only"` — `Write` в `<ws>/docs/plans/x.md` → allow; `Write` в `<ws>/src/main.py` → deny `docs_only_violation`; `Edit` top-level `<ws>/plan.md` → allow; `Read`/`Grep` по всему проекту → allow; секрет (`<ws>/docs/.env`) → deny `secret_path` (порядок проверок!); `gate_mode="full"` — поведение байт-в-байт прежнее; вне рана (снапшот пуст) — дефолт full. Межзапускный reset (чат-2, факт 12): «SPEC_PLAN-запуск паркует AskUserQuestion → supersede CODE-запуском → `provide_answer` НЕ доставляется в новый ран, awaiting-флаг чист».
-- [x] Step 2: `_run_gate_mode` четвёртым слотом снапшота, три точки (факт 2): декларация `self._run_gate_mode: str | None = None` в `__init__` (рядом с kora.py:345-347), установка `self._run_gate_mode = spec.gate_mode` в `_run` (рядом с :393-394), сброс на `None` в identity-guard finally (внутри блока :401-406, рядом с `_run_owner`/`_run_root`/`_run_model`). **`None` = сентинел «рана нет» — честное зеркало `_current_root` (kora.py:463-466: `self._run_root if self._run_root is not None else default`)**; хелпер `_current_gate_mode()` тем же паттерном: `self._run_gate_mode if self._run_gate_mode is not None else "full"` (вне рана → `"full"`, fail-open корректен для docs_only). НЕ ставить дефолт `"full"` в слот — тогда `is not None` всегда истинно и зеркало ломается. Это ПЕРВЫЙ читатель `spec.gate_mode` в kora.py — до сих пор поле не потреблялось.
-- [x] Step 3: `_gate_decision`: константа `_MUTATING_FILE_TOOLS = frozenset({"Write", "Edit", "NotebookEdit"})`; после секрет-чека и `is_relative_to(ws_resolved)`, ПЕРЕД `return True`: если `_current_gate_mode() == "docs_only"` и инструмент мутирующий — путь обязан быть `resolved.is_relative_to(ws/"docs")` ИЛИ (`resolved.parent == ws_resolved` и суффикс `.md`), иначе `return False, "docs_only_violation", "docs_only_violation"` (категория-only, без пути — прецедент B21).
-- [x] Step 4: Суита; коммит `ui-4: docs_only gate mode — mutations narrowed to docs tree and top-level md`.
-
-### Task 3: gate_action в build_host + запуск стадий
-
-**Files:** `synapse/pipeline/app.py`, `tests/test_stages.py`
-
-**Steps:**
-- [x] Step 1: Тесты (SimpleNamespace-хост, паттерн `_api_host`): `send_to_kora` из propose → стадия spec_plan, задача в сторе RUNNING, `RunSpec.gate_mode == "docs_only"`, текст задачи содержит request_text и путь план-файла; `send_to_kora` с `fast=true`-карточкой (propose при отсутствии план-требования) требует `confirm` → без него `{"error":"confirm_required"}`; `write_code` без план-файла → `{"error":"no_plan_file"}`, **план-файл ЕСТЬ но `last_outcome != "completed"` (провалившаяся/отменённая прошлая SPEC_PLAN, файл устарел) → `{"error":"stale_plan"}` и стадия НЕ сдвинулась**, с файлом + `last_outcome=="completed"` (tmp_path) → стадия code, `gate_mode == "full"`, модель из аргумента едет в RunSpec и в `last_model`; невалидная модель → `{"error":"invalid_model"}` (S34); занятый синглтон → `{"error":"busy"}` и стадия НЕ сдвинулась (S6); `revise` → collect без запуска; двойной конкурентный вызов на один тред — второй ждёт lock и получает busy (single-flight); CODE-успех → `last_outcome completed` и стадия done (через новую обёртку `on_run_finished` — Step 3).
-- [x] Step 2: В `build_host` (рядом с C-guard-блоком): `_KORA_MODELS = frozenset({"claude-opus-4-8", "claude-sonnet-5", "claude-fable-5"})`; `gate_locks: dict[str, asyncio.Lock]`; асинхронный `gate_action(thread_id, action, model=None, confirm=False) -> dict`. Логика — СТРОГИЙ порядок (не «ветки, потом хвост»): тред существует → per-thread lock → валидация модели → **для запуск-действий (`send_to_kora`/`write_code`) `store.has_active_task()`→busy ДО любого `set_stage`** (тест S6 требует «стадия НЕ сдвинулась» при busy — если двигать стадию в ветке до busy-чека, тест красный) → ветвление (валидация модели применяется ТОЛЬКО когда `model is not None`; `revise` модель не несёт и её не валидирует):
-  - `revise`: `set_stage(collect)` (легальность отдаёт ValueError → `{"error":"illegal_stage"}`), карточка-событие в ленту.
-  - `send_to_kora` (из propose): request_text обязателен; **быстрый путь** = `confirm`-требование (двухфазность S1/S5) — семантика кнопки решается на карточке: стадийная карточка шлёт `send_to_kora`, быстрая — `send_to_kora` + `fast: true` + `confirm: true`; fast → стадия code + `gate_mode="full"` + текст = request_text; стадийный → spec_plan + `docs_only` + текст по конвенции.
-  - `write_code` (из spec_plan): `confirm` обязателен; проверка план-файла `<root>/docs/plans/<id>.md` (root = проект треда или дефолт-воркспейс раннера) **И `threads.get(id).last_outcome == "completed"`** — иначе `{"error":"stale_plan"}` (существования файла мало, см. решение «Конвенция план-файла»: устаревший план от прошлой SPEC_PLAN-попытки не должен пускать CODE); стадия code, `gate_mode="full"`, текст «реализуй по плану…». ⚠️ **Дефолт-воркспейс раннера считается только в приватном `KoraRunner._workspace()` (kora.py:459-461: `cfg.kora_workspace_dir or ~/synapse-kora-workspace`)** — тот же кросс-модульный смелл, что план флагует для `_new_task_id` в факте 7. `gate_action` живёт в `build_host`-замыкании ВНЕ `KoraRunner`: либо завести публичный хелпер на раннере/cfg, либо продублировать 2-строчный дефолт в `gate_action` (НЕ дёргать `kora_runner._workspace()` через границу). `_resolve_project_root` (уже есть в app.py, факт про projects-own-threads) — предпочтительный источник root'а треда.
-  - Общий хвост запуска (ПОСЛЕ busy-чека выше, только для `send_to_kora`/`write_code`): `set_stage(целевая стадия)` → `task_id = _new_task_id(now)` (**из `synapse/bridge/confirm.py`:24, НЕ `synapse/confirm.py` — такого нет; `_new_task_id` приватный, при импорте через границу либо снять underscore, либо продублировать 2 строки генерации id — факт 7**) → `store.start_task(..., RUNNING, now)` → `threads.append_task` → `set_last_model` → `kora_runner.start(task_id, text, RunSpec(thread_id, project_root, gate_mode, model))` → gate_card-запись «запуск ушёл» в ленту. **busy-чек НЕ здесь — он ДО `set_stage` (см. порядок выше), иначе стадия сдвинется при занятом синглтоне.**
-- [x] Step 3: НОВАЯ обёртка на месте wiring `on_run_finished=threads.set_outcome` (app.py:258, факт 10 — `set_outcome` про стадии не знает): функция `_run_finished(thread_id, outcome)` в `build_host` — зовёт `threads.set_outcome(thread_id, outcome)` и, если `threads.get(thread_id).stage == "code"` и `outcome == "completed"`, дополнительно `set_stage(thread_id, "done")`; `KoraRunner` получает её вместо голого `set_outcome`.
-- [x] Step 4: `SynapseHost` получает `gate_action` полем; суита; коммит `ui-4: gate_action host helper — stage runs, plan-file check, model allowlist, single-flight`.
-
-### Task 4: HTTP-гейт и API стадий
-
-**Files:** `synapse/pipeline/webrtc_server.py`, `tests/test_stages.py`
-
-**Steps:**
-- [x] Step 1: Тесты (паттерн `_endpoint`+`FakeRequest`): `POST /api/threads/{id}/gate` — CSRF 403; body `{action, model?, confirm?, fast?}` → прокси в `host.gate_action`, `{"error": "busy"}` → HTTP 409, `invalid_model`/`confirm_required`/`no_plan_file`/`stale_plan`/`illegal_stage` → 400 с телом, успех → свежий `_thread_dict`; неизвестный тред 404. `GET /api/threads/{id}` отдаёт `_thread_dict` (+`request_text`). Расширенный `_thread_dict` (webrtc_server.py:388-391) добавляет ТОЛЬКО `request_text`/`last_model`/`archived` — `stage` там УЖЕ есть, повторно не добавлять; новые три поля не существуют ни на дата-классе `Thread`, ни в `_thread_dict` (grep нулевой) → Task 1 Step 2 их заводит на модели, сериализатор подхватит.
-- [x] Step 2: Роуты `api_thread_get`, `api_thread_gate` ДО mount'а; `_thread_dict` расширяется новыми полями — существующие тесты UI-3 это НЕ ломает (проверено: `test_message_turn_is_thread_scoped_and_persisted` смотрит только status_code и kinds ленты, `_thread_dict` не трогает; правок в `tests/test_text_turn.py` не требуется).
-- [x] Step 3: Суита; коммит `ui-4: gate endpoint with csrf/409, thread detail api`.
-
-### Task 5: Инструменты диспетчера и стадийный промпт
-
-**Files:** `synapse/dispatcher/tools.py`, `synapse/prompt.py`, `synapse/dispatcher/loop.py`, `synapse/pipeline/app.py`, `tests/test_stages.py`
-
-**Steps:**
-- [x] Step 1: Тесты: `propose_request` (в collect) → `set_request` + стадия propose + gate_card в ленте + dedup-латч работает; `gate_action`-инструмент бьёт в ту же хост-функцию (мок), возвращает её dict; `bind_project` — имя из ProjectStore casefold-матчем: точное имя → guard находки F пробрасывается, неизвестное → `unknown_project`, дубль-имя → `ambiguous_project`; стадийный блок в системном промпте: collect-тред получает COLLECT-правила, propose — PROPOSE, тред в code/done — без блока; голосовой ход без открытого треда — промпт байт-в-байт прежний (регресс-якорь). **Проверка порядка system-сообщения: stage_block идёт ВНУТРИ `system_prompt` ПЕРЕД хвостом `\n\n[СОСТОЯНИЕ]` (assert по подстроке).** **Нет активного треда: `propose_request` с `voice_thread["id"]=None` АВТО-СОЗДАЁТ тред (как `_on_task_committed`) и кладёт свод в него; `gate_action`/`bind_project` с id=None → `{"outcome":"no_active_thread"}` (не молчаливый no-op).**
-- [x] Step 2: tools.py: схемы `PROPOSE_REQUEST_SCHEMA` (text), `GATE_ACTION_SCHEMA` (action enum + model? + confirm?), `BIND_PROJECT_SCHEMA` (project_name) → в `ALL_SCHEMAS`; `KoraBridge` получает `on_propose`, `on_gate`, `on_bind` колбэки. **None-путь: каждый хендлер при `on_*=None` возвращает СВОЙ явный `{"outcome": "<sentinel>"}` (напр. `dispatcher_unavailable`) — строки `"unavailable"` в коде нет, образец — `answer_kora`→`no_pending_question` (tools.py:213-220, факт 11).** `bind_project`-хендлер резолвит `project_name`: `[p for p in projects.list() if p["name"].casefold()==name.casefold()]` → 0 → `unknown_project`, ≥2 → `ambiguous_project`, 1 → `threads.bind_project(thread_id, p["id"])` (guard находки F). Хендлеры по образцу answer_kora — все ТРИ куска из факта 9 обязательны: метод на `ToolHandlers` с явным `_guarded` (журналирование + dedup) И регистрация каждого в `register_all` с `cancel_on_interruption=False` (без неё инструмент не существует для голосового pipecat-пути).
-- [x] Step 3: prompt.py: `build_system_prompt(cfg, task_dictionary=None, stage_block="")` (НОВЫЙ третий параметр, дефолт `""` — старые вызовы и голос без треда не трогаются); константы `STAGE_RULES_COLLECT` (копи контекст, вопросы ПАЧКОЙ в одном ходе — S29, лимит уточнений; свод готов → зачитай и по «верно» зови propose_request), `STAGE_RULES_PROPOSE` (изменения → обратно propose_request; «отправляй» → gate_action send_to_kora; «сразу код» → зачитка «точно пишем код в <проект>?» и только после явного да gate_action confirm=true — Р-16-паттерн). **`stage_block` вклеивается в КОНЕЦ возвращаемой строки промпта (ПОСЛЕ железных правил); литерала `[СОСТОЯНИЕ]` в prompt.py НЕТ (факт 8), «до состояния» обеспечивается тем, что `loop._complete` дописывает `\n\n`+state_block ПОСЛЕ всего промпта.**
-- [x] Step 3b (🟥 голосовой системный промпт — факт 15, решение «Голосовой системный промпт»): голосовой `LLMContext` (app.py:459) сегодня БЕЗ system-сообщения → стадийные правила и двухфазность на голос не доходят. Впрыснуть `build_system_prompt(cfg, task_dictionary, stage_block=<stage_block_for(voice_thread["id"])>)` как system-сообщение голосового контекста, освежая каждый ход (кандидат: в `_on_end_of_turn` под `host.turn_lock` перед генерацией — `context.set_messages([{ "role":"system", "content": … }, *текущие])`, свериться с тем, как pipecat-агрегаторы держат messages, чтобы не затереть накопленный tool-хвост). Тест: голосовой контекст после хода в collect-треде содержит system-сообщение с COLLECT-правилами; голос без треда — базовый промпт без stage_block. **Если Теро выбрал descope-альтернативу — этот Step удаляется, стадии остаются text/HTTP-only, голос-DoD ниже переезжают в parking.** ⚠️ Не выдумывать pipecat-инъекцию наугад: если точка впрыска неочевидна из кода агрегаторов — это load-bearing неизвестное, гонять живым probe (урок сл.3), не гадать.
-- [x] Step 4: loop.py: `_complete` принимает stage_block через новый колбэк `stage_block_for(thread_id)` (конструктор-параметр `DispatcherTurnLoop.__init__`, сегодня его НЕТ — loop.py:39-50; None → "") и передаёт его в `build_system_prompt(self._cfg, self._task_dictionary, stage_block=...)` (loop.py:126) — порядок в system-сообщении остаётся `[правила+stage_block] \n\n [СОСТОЯНИЕ]` (loop.py:128 не трогаем). ⚠️ `_complete` сегодня принимает ТОЛЬКО `history` и треда НЕ знает — **просто расширить сигнатуру до `_complete(self, history, thread_id)` и передавать `thread_id` из обоих call-site'ов в `ingest_user_turn` (loop.py:93 и :112), где он уже в скоупе как аргумент метода.** НЕ заводить мутабельное поле `self._current_thread_id`/замыкание — параметр проще и без гонок. app.py прокидывает лямбду по `threads.get(thread_id).stage` и вяжет `on_propose/on_gate/on_bind` на оба бриджа (голосовой тред = `voice_thread["id"]`, HTTP = `current_http_thread["id"]` — паттерн C-guard'а). ⚠️ **Нет активного треда (id = None):** `voice_thread["id"]` пуст пока не создан тред; `current_http_thread["id"]` = None ВНЕ окна `async with turn_lock` (webrtc_server.py, `finally` чистит). Молчаливый `threads.set_request(None, …)` НЕ-опнет (гвард как `set_outcome` threads.py:98-104), а хендлер вернёт success-shape → LLM поверит, что свод ушёл. Решение: **`on_propose` при id=None АВТО-СОЗДАЁТ тред** ровно как `_on_task_committed` (app.py:298-306: `threads.create(title=text, project_id=…)` + запись id обратно в `voice_thread["id"]`) — свод логически стартует тред; **`on_gate`/`on_bind` при id=None возвращают явный `{"outcome":"no_active_thread"}`** (гейтить/привязывать нечего). Тест в Step 1.
-- [x] Step 5: Суита; коммит `ui-4: dispatcher stage tools and collect/propose prompt rules`.
-
-### Task 6: UI стадий — чип, gate-карточки, модель (SPA-шелл, thread.js УДАЛЁН)
-
-**Files:** `synapse/pipeline/client/app.js`, `index.html`, `style.css`, `tests/test_ui_client.py`
-
-> ⚠️ **thread.js/thread.html не существуют** (коммит `7424c3c`, force тестом `test_thread_page_files_are_gone`). Всё делаем в SPA-шелле: `index.html` (`#view-thread`/`#feed-list`/`#view-title`/`#thread-badge`) + `app.js` (`addEntry` :235-255, `renderBadge` :130, `threadCard` :141, `pollStatus`/`setKora` :295-303/:291). Лексические тесты — по `app.js`/`index.html`, НЕ по thread.js.
-
-**Steps:**
-- [x] Step 1: Лексические тесты (`tests/test_ui_client.py`, по строкам `app.js`): содержит `gate_card`, `/gate`, названия стадий-чипа (`СБОР`/`ЗАПРОС`/`СПЕКА·ПЛАН`/`КОД`/`ГОТОВО`), двухфазный маркер (`точно`), селектор модели (`<select>`/имена трёх моделей), `innerHTML` отсутствует (XSS-дисциплина, `textContent`/`el()` only); `index.html` содержит `id="stage-chip"`. thread.js в тестах не упоминать.
-- [x] Step 2: index.html: `<span id="stage-chip" hidden></span>` рядом с `#thread-badge` в `#topbar`. app.js — **чип стадии**: `render()` уже делает `const t = threads.find(x => x.id === r.id)` (app.js:97) и `stage` УЖЕ едет в `_thread_dict` (webrtc_server.py:388-391) в тот же поллящийся `threads[]` (`loadLists`, 5s) — писать стадию в `#stage-chip` из `t.stage` (`textContent`, показать/скрыть `hidden`), БЕЗ отдельного `GET /api/threads/{id}` ради чипа (этот GET нужен Task 4 для `request_text`, но не для стадии). **Бейджи awaiting/статус УЖЕ ЕСТЬ** — `pollStatus`/`setKora` (app.js:295-303/:291) читает `awaiting_answer`/`task_status` и строит подпись «ждёт ответа/работает/свободна» (app.js:300-302); НЕ переписывать с нуля, стадийный чип — ДОБАВКА рядом. **gate_card-рендер** — новая ветка в `addEntry` (app.js:235-255) для `e.kind==="gate_card"`: контейнер с кнопками (текст по стадии карточки из `e`), `<select>` из трёх моделей (дефолт — last_model/пусто), кнопки живы ТОЛЬКО когда стадия карточки == текущая стадия треда (сверять с `t.stage`/`#stage-chip`); первый тап `write_code`/быстрого пути перекрашивает кнопку в «точно пишем код?» (`textContent`) — второй тап `postJSON('/api/threads/{id}/gate', {action, model, confirm:true})`; ответ 409 → подпись «Кора занята — ждёт». Всё через `el()`/`textContent`, ноль `innerHTML`.
-- [x] Step 3: app.js: чип стадии в `threadCard` (app.js:141) рядом с заголовком треда в сайдбаре (`el("span","tc-stage",...)`). style.css: чипы/карточки/кнопки/select.
-- [x] Step 4: Суита; коммит `ui-4: stage chip and gate cards with model picker, two-phase code button`.
+# СЛАЙС UI-4 «стадии» — хвост
 
 ### Task 7: Интеграционный смоук UI-4 + DoD
 
+**Steps 1–2 сданы** (staging-прогон стадийного пути и быстрого пути/отказов — см. архив).
+
 **Steps:**
-- [x] Step 1: Staging на 7861 (`staging_7861.py`-паттерн: реальный конфиг, ИЗОЛИРОВАННЫЙ `journal_dir`, Кора включена, проект = тестовая tmp-папка): пройти стадийный путь руками через UI/curl — collect-реплики → propose_request → карточка → send_to_kora → живой SPEC_PLAN-запуск в docs_only (проверить gate_deny на Write вне docs в ленте Коры) → план-файл появился → «Пиши код» активна → CODE-запуск → done. **Проверено live 2026-07-14 (см. заметку ниже).**
-- [x] Step 2: Быстрый путь и отказы: «сразу код» без confirm → 400; занятый синглтон → 409 и «ждёт». **Проверено live 2026-07-14.**
-- [ ] Step 3: **Live-DoD (Теро, телефон)**: голосом собрать запрос в треде → «отправляй» → услышать/увидеть спеку-план → «пиши код» с читкой → код в проекте. ✋ не отмечать без живого прогона. ⚠️ **Зависит от Task 5 Step 3b (голосовой системный промпт, факт 15)** — без него голос стадиями не управляет; если Теро выбрал descope, этот Step → parking, а голос-путь смоук-тестится в старом (до-стадийном) режиме.
+- [ ] Step 3: **Live-DoD (Тео, телефон)**: голосом собрать запрос в треде → «отправляй» → услышать/увидеть спеку-план → «пиши код» с читкой → код в проекте. ✋ не отмечать без живого прогона. Голосовой системный промпт (Task 5 Step 3b) уже сделан — голос стадиями управляет.
 - [ ] Step 4: Суита + коммит хвостов; parking lot в конец плана.
 
 ---
----
 
-# СЛАЙС UI-5 «гигиена»
+# СЛАЙС UI-5 «гигиена» — хвост
 
-Живой продукт: тредов много и они не текут друг в друга; длинный тред жмётся сам; треды переименовываются и архивируются; удаление проекта не рвёт треды.
-
-### Task 8: Чистый контекст нового треда (формальный якорь)
-
-**Files:** `tests/test_hygiene.py`
-
-**Steps:**
-- [ ] Step 1: Тесты поверх UI-3-механики (без нового кода, если зелёные — фиксация; красные — чинить loop.py): два треда через один `DispatcherTurnLoop` — история Б не содержит реплик А ни в каком виде; регидрация холодного треда не тащит gate_card/event/кора-kinds (только user/assistant); [СОСТОЯНИЕ]-блок остаётся глобальным (один и тот же в обоих тредах).
-- [ ] Step 2: Суита; коммит `ui-5: clean-context anchors for per-thread dispatcher isolation`.
-
-### Task 9: Компакт длинного треда (S10)
-
-**Files:** `synapse/dispatcher/loop.py`, `synapse/config.py`, `synapse/pipeline/app.py`, `tests/test_hygiene.py`
-
-**Steps:**
-- [ ] Step 1: Тесты (мок-LLM): история длиннее `dispatcher_compact_after` → перед ходом старшая половина заменяется ОДНИМ `[КОМПАКТ]`-сообщением (выжимка = отдельный вызов LLM с промптом «сожми диалог, сохрани решения/имена/пути»), хвост нетронут, следующий ход отвечает с учётом выжимки; лента получает `kind:"event"` «контекст сжат» (через новый опциональный колбэк `on_compact(thread_id)`); сырой feed-файл не изменился; NO-EXFIL — в выжимку не попали кора-kinds (по построению: жмётся история, куда они не входят); tool_use-хвосты (assistant с tool_calls + role:tool) режутся ТОЛЬКО целыми группами — оборванная пара tool_use/tool_result ломает Anthropic API. **Фикстура ОБЯЗАНА содержать хотя бы одну многопроходную tool-call-группу, чей середина падает НИЖЕ `cut=len//2`** (иначе однородные 2-сообщенные ходы пройдут `len//2` при ЛЮБОй реализации и тест не проверит границу); assert: результат не начинается с `role:"tool"`/`role:"assistant"` без предшествующего user — т.е. `history[cut]` после сжатия = `user`. **Анти-rebind-якорь (критично, см. Step 2): ВТОРОЙ `ingest_user_turn` на тот же тред после компакта видит сжатую историю — assert, что `self._histories[thread_id]` (не только локальная `history` первого хода) остался сжат; иначе компакт «работает один ход» и всплывает обратно.**
-- [ ] Step 2: config.py: `dispatcher_compact_after: int = 40` на `@dataclass(frozen=True)` (дефолт 40 живёт на датаклассе) + **`from_env` тем же two-step, что `kora_max_turns` (config.py:129-137): `x = _num("DISPATCHER_COMPACT_AFTER", int); if x is not None: kwargs["dispatcher_compact_after"] = x`** — `_num` (config.py:120) на малформе/отсутствии возвращает None (НЕ бросает, конструктор НЕ падает), тогда остаётся дефолт датакласса. ⚠️ **НЕ `_num(...) or 40`** — это затрёт валидный явный `DISPATCHER_COMPACT_AFTER=0` сорокой и разойдётся с паттерном, на который сам же ссылается. loop.py: `_maybe_compact(thread_id, history)` вставляется ПОСЛЕ `history = self._history_for(thread_id)` (loop.py:90) и ДО `history.append(...)` — «в начале метода» history ещё не существует. **🟥 In-place, НЕ rebind:** `_history_for` отдаёт ЖИВУЮ ссылку на `self._histories[thread_id]` (loop.py:77-78), поэтому компакт обязан мутировать список на месте — `history[:] = compacted` (или явно `self._histories[thread_id] = compacted`). Ребинд локальной `history = compacted` дойдёт до `_complete` ЭТОГО хода, но `self._histories[thread_id]` останется несжатым → на следующем ходу всё всплывёт обратно (ловится анти-rebind-якорем Step 1). `on_compact` и `stage_block_for` (Task 5) — оба НОВЫЕ опциональные конструктор-параметры `DispatcherTurnLoop`, сегодня их нет; компакт-вызов идёт мимо `ALL_SCHEMAS` (tools=[]).
-  - **🟥 Граница разреза — КОНКРЕТНЫЙ алгоритм, не «по целым группам» на словах** (сам план зовёт оборванную tool_use/tool_result-пару «ломает Anthropic API» — значит алгоритм обязан быть механическим). Turn-группа в `history` переменной длины: `[user, assistant(+tool_calls), tool, tool, …, assistant(final)]`, и может кончаться голым `role:"tool"` без финального assistant, если `_MAX_TOOL_PASSES` исчерпан (loop.py:100 + гвард `if text:` на :117 — пустой финальный `text` не аппендит assistant). Наивный `history[len//2:]` режет ВНУТРИ группы при неравных группах в старшей половине (обычный случай, раз propose/gate/bind — tool-ходы). **Правило: `cut = len(history)//2`; продвинуть `cut` вперёд до первого `i >= cut` с `history[i]["role"] == "user"` (user ВСЕГДА начинает свежую группу — loop.py:91 аппендит user перед любыми assistant/tool этого хода); жать `history[:cut]`, `history[cut:]` — дословно.** Если после `cut` user'а нет (хвост — одна группа) — не жать (нечего резать чисто).
-- [ ] Step 3: app.py: `on_compact` → `threads.append_feed(..., {"kind":"event","text":"контекст сжат"})`.
-- [ ] Step 4: Суита; коммит `ui-5: dispatcher history compaction per thread with feed notice`.
-
-### Task 10: Заголовки: авто-title и rename (S30)
-
-**Files:** `synapse/threads.py`, `synapse/pipeline/webrtc_server.py`, `synapse/pipeline/app.py`, `synapse/pipeline/client/app.js`, `tests/test_hygiene.py`
-
-**Steps:**
-- [ ] Step 1: Честный скоуп (критика 2026-07-13, находка 5): сентинель `"новый тред"` носят ТОЛЬКО треды из `POST /api/threads` без title (webrtc_server.py:427) — т.е. треды домашнего композера; голосовой и HTTP commit создают тред с `title=text` задачи (app.py:304/339) — им auto-title не нужен и не сработает (no-op по построению, это ок). Тесты: `maybe_autotitle(thread_id, text)` ставит title из первой реплики (обрезка 80, как create) ТОЛЬКО если title == "новый тред"; message-роут зовёт его на каждом user-ходе (второй ход не переименовывает — title уже не сентинель); тред, созданный commit-путём с осмысленным title, не переименовывается; `PATCH /api/threads/{id}` `{title}` — CSRF, 404, пустой title → 400, успех персистится; лексический тест кнопки rename в **`app.js`** (не thread.js — удалён).
-- [ ] Step 2: threads.py `rename`/`maybe_autotitle`; роут `api_thread_patch`; вызов autotitle в message-роуте (композерный путь). **app.js**: тап по заголовку треда → `prompt()` → `postJSON` PATCH (v1-паттерн проектов). ⚠️ **Тап-таргет = `#view-title`, НЕ `#thread-badge`.** `#view-title` (index.html:44, в `#topbar`) — видимый заголовок треда, пишется прямо в `render()` (`$("view-title").textContent = t.title`, app.js:98; обновляется в `pollStatus` app.js:230). `#thread-badge`/`renderBadge` (app.js:130) — это ИСХОД-бейдж («✓ готово»/«✖ ошибка»), `hidden=true` пока `last_outcome` пуст (app.js:110/131), т.е. невидим на любом треде до конца рана → тап по нему недостижим ровно когда rename нужен. Оба элемента живут в `#topbar` (index.html:42-45), НЕ в `#view-thread`.
-- [ ] Step 3: Суита; коммит `ui-5: thread auto-title from first message, rename endpoint and ui`.
-
-### Task 11: Архив тредов и удаление проекта (S31)
-
-**Files:** `synapse/threads.py`, `synapse/projects.py`, `synapse/pipeline/webrtc_server.py`, `synapse/pipeline/client/app.js`, `tests/test_hygiene.py`
-
-**Steps:**
-- [ ] Step 1: Тесты: `POST /api/threads/{id}/archive` → `archived=true`, тред пропадает из `GET /api/threads`, виден с `?archived=1`; файл и лента на месте; **архив ИМЕННО живого треда → 409, а архив ДРУГОГО треда пока первый исполняется → OK** (детект per-thread, не глобальный — см. Step 2); `DELETE /api/projects/{id}` → проект удалён из стора, у его тредов `project_id=None` + `kind:"event"` «проект удалён» в лентах, треды живы; CSRF на обоих.
-- [ ] Step 2: threads.py `set_archived` + фильтр в `list(include_archived=False)` + `unbind_project(project_id)` (пробег по тредам). projects.py `remove(project_id)` (атомарный rewrite под тем же lock). Роуты `api_thread_archive`, `api_projects_delete`. ⚠️ **«Живой тред» = per-thread, НЕ глобальный `has_active_task()`:** синглтон говорит лишь ЧТО задача бежит, не В КАКОМ треде — архив-409 обязан быть `store.has_active_task() and threads.thread_for_task(store.task.id) == thread_id` (зеркало `_awaiting_thread_id`, app.py:270-273; `thread_for_task` — threads.py:106). Голый глобальный чек ложно-409-нет архив ДРУГОГО треда пока первый исполняется.
-- [ ] Step 3: app.js: «⋯»-действие или свайп не строим — маленькая кнопка «архив» в строке треда + «удалить» у проекта с `confirm()`-диалогом; списки фильтруют archived.
-- [ ] Step 4: Суита; коммит `ui-5: thread archive, project delete unbinds threads`.
+Task 8–11 сданы (чистый контекст, компакт, авто-title/rename, архив тредов + удаление
+проекта — см. архив). Остался только финальный смоук и закрытие плана.
 
 ### Task 12: Финальный смоук UI-5 + закрытие плана
 
 **Steps:**
 - [ ] Step 1: Staging-прогон: длинный диалог до компакта (порог временно занизить env'ом? нет — конфиг из .env стагинга), rename с телефона/браузера, архив, удаление проекта.
-- [ ] Step 2: **Live-DoD (Теро)**: после его слова — рестарт живого сервера на HEAD; стадийный цикл голосом end-to-end на реальном проекте (⚠️ **требует Task 5 Step 3b — голосового системного промпта, факт 15**; при descope — цикл проверяется на тексте/HTTP, голос остаётся до-стадийным); старые треды/ленты живы после рестарта.
+- [ ] Step 2: **Live-DoD (Тео)**: после его слова — рестарт живого сервера на HEAD; стадийный цикл голосом end-to-end на реальном проекте; старые треды/ленты живы после рестарта.
 - [ ] Step 3: Обновить память проекта; ✔ чекбоксы; parking lot ниже.
 
 ## Parking lot (входящий из UI-1..3 + новое)
@@ -275,5 +51,5 @@ tests/test_ui_client.py                MOD  лексические тесты н
 - Экран настроек §2.3 (дефолт модели из UI, версия сервера).
 - Очередь тредов с авто-стартом (v1 — только бейдж «ждёт»); per-thread workspace (S19); голосовое добавление проекта (S11); hotword/PTT (О1).
 - `docs_only` не покрывает переименование/удаление через будущие инструменты (mv/rm живут в Bash — Bash denied целиком, риска нет до M1.1-эскалации).
-- **Прямой режим «чат ↔ Кора» (Теро, 2026-07-13).** Тумблер, выключающий диспетчера: realtime-микрофон гаснет, текст из композера уходит НАПРЯМУЮ Коре (мимо каскада/арбитра). Ценность: вбить много текста и контекста разом, без пересказа диспетчером. Решить при реализации: как живёт с turn_lock и синглтоном задачи; куда пишется в ленту; где тумблер (рядом с mic-btn?).
-- **Кора говорит в чате сама, без посредника (Теро, 2026-07-13).** Сообщения Коры появляются в ленте треда напрямую: свёрнуты по умолчанию (разворачиваемые), свой цвет — визуально отличимы от реплик диспетчера. Кнопка «озвучить» на сообщении → TTS по запросу, и голос Коры ≠ голос диспетчера (второй voice-id в TTS-сервисе). ⚠️ Напряжение с Р-15 NO-EXFIL: сырой вывод Коры МОЖНО показывать в UI, но он по-прежнему не должен попадать в LLM-контекст диспетчера — рендер в ленту в обход истории.
+- **Прямой режим «чат ↔ Кора» (Тео, 2026-07-13).** Тумблер, выключающий диспетчера: realtime-микрофон гаснет, текст из композера уходит НАПРЯМУЮ Коре (мимо каскада/арбитра). Ценность: вбить много текста и контекста разом, без пересказа диспетчером. Решить при реализации: как живёт с turn_lock и синглтоном задачи; куда пишется в ленту; где тумблер (рядом с mic-btn?).
+- **Кора говорит в чате сама, без посредника (Тео, 2026-07-13).** Сообщения Коры появляются в ленте треда напрямую: свёрнуты по умолчанию (разворачиваемые), свой цвет — визуально отличимы от реплик диспетчера. Кнопка «озвучить» на сообщении → TTS по запросу, и голос Коры ≠ голос диспетчера (второй voice-id в TTS-сервисе). ⚠️ Напряжение с Р-15 NO-EXFIL: сырой вывод Коры МОЖНО показывать в UI, но он по-прежнему не должен попадать в LLM-контекст диспетчера — рендер в ленту в обход истории.
