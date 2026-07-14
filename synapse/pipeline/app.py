@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
 import itertools
 import logging
 from collections import deque
 from typing import Any
 
-from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import LLMFullResponseEndFrame, TTSSpeakFrame
 from pipecat.pipeline.llm_switcher import LLMSwitcher
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -191,14 +192,16 @@ class SynapseHost:
             await t.queue_frame(TTSSpeakFrame(text=text, append_to_context=False))
 
     def speak(self, text: str) -> None:
-        """SPEAK entry point (called by on_speak). Registers the ledger ALWAYS (Р-15г: a
-        critical that DID get its SPEAK stops counting as an unpaired-critical alert), then:
+        """SPEAK entry point (called by on_speak). Registers the ledger ALWAYS and synchronously
+        (Р-15г: a critical that DID get its SPEAK stops counting as an unpaired-critical alert; an
+        in-flight SPEAK must not false-alarm the watchdog either), then:
         - live output task + running loop -> schedule an out-of-band TTSSpeakFrame injection.
-          Does NOT also call arbiter_policy.push_speak (that would double the utterance -- the
-          injected frame itself travels through the arbiter downstream).
+          The done-callback REVERTS the optimistic registration IFF the injection raised (B01) —
+          a dropped critical must re-arm the watchdog, not stay recorded as delivered. Does NOT
+          also call arbiter_policy.push_speak (the injected frame travels the arbiter downstream).
         - live output task but NO running loop (e.g. a sync test path) -> arbiter fallback.
         - no live output task -> arbiter fallback (frame-driven, drained when a frame flows)."""
-        self.speak_ledger.register_speak_text(text, self.clock.now())
+        marked = self.speak_ledger.register_speak_text(text, self.clock.now())
         t = self._output_task
         if t is not None and not t.has_finished():
             try:
@@ -207,20 +210,23 @@ class SynapseHost:
                 self.arbiter_policy.push_speak(text)
                 return
             fut = asyncio.ensure_future(self.push_speak_frame(text))
-            # B9: without a done-callback, a raise inside push_speak_frame (queue_frame on a task
-            # torn down mid-emit) is never retrieved AND the ledger was already marked spoken
-            # (line above) — so the dropped critical produces neither audio nor a
-            # CRITICAL_WITHOUT_SPEAK alert. Surface the failure instead of swallowing it.
-            fut.add_done_callback(self._on_speak_frame_done)
+            # B01/B9: the ledger was marked spoken up front (above). If push_speak_frame raises
+            # (queue_frame on a task torn down mid-emit), that optimistic mark is a LIE — the
+            # critical produced no audio. Revert it in the callback so the Р-15г
+            # CRITICAL_WITHOUT_SPEAK watchdog fires instead of the drop vanishing silently.
+            fut.add_done_callback(functools.partial(self._on_speak_frame_done, marked=marked))
         else:
             self.arbiter_policy.push_speak(text)
 
-    def _on_speak_frame_done(self, fut: "asyncio.Future[Any]") -> None:
+    def _on_speak_frame_done(self, fut: "asyncio.Future[Any]", *, marked: list[str]) -> None:
         if fut.cancelled():
+            self.speak_ledger.revert_speak(marked)  # cancelled → never delivered → re-arm watchdog
             return
         exc = fut.exception()
         if exc is not None:
+            # NOT delivered → revert the optimistic mark so the Р-15г watchdog alerts.
             logger.warning("push_speak_frame injection failed; SPEAK dropped: %r", exc)
+            self.speak_ledger.revert_speak(marked)
 
     async def monitor_forever(self) -> None:
         """R8: periodically drives speak_ledger.check()/store.liveness() so the Р-15г/Р-11
@@ -297,6 +303,13 @@ class SynapseHost:
                     self.threads.set_stage(thread_id, "collect")
                 except ValueError:
                     return {"error": "illegal_stage"}
+                # B07: regressing to collect invalidates any prior run's outcome. write_code's only
+                # staleness signals are last_outcome=="completed" + plan-file existence, neither tied
+                # to the current request_text — so a completed spec_plan from request A would keep
+                # write_code satisfied, and the NEXT propose (request B) would launch A's on-disk
+                # plan. Reset the outcome so write_code refuses (stale_plan) until a fresh spec_plan
+                # completes for the new request.
+                self.threads.set_outcome(thread_id, None)
                 self.threads.append_feed(thread_id,
                                          {"ts": self.clock.now(), "kind": "event", "text": "правки → сбор"})
                 return {"ok": True, "stage": "collect"}
@@ -313,7 +326,14 @@ class SynapseHost:
                     gate_mode = "docs_only"
                     text = (f"Подготовь спеку и план по запросу ниже. План запиши в файл "
                             f"docs/plans/{thread_id}.md (создай директории). Запрос: {request_text}")
-                self._launch_run(th, target_stage, gate_mode, text, model)
+                # B06: _launch_run's first act is set_stage, which raises ValueError on an illegal
+                # transition (e.g. send_to_kora straight from `collect`). Guard it like `revise`
+                # does — an unhandled ValueError escapes gate_action as a 500 / voice-path crash.
+                # set_stage runs BEFORE any store mutation, so a caught raise leaves no partial state.
+                try:
+                    self._launch_run(th, target_stage, gate_mode, text, model)
+                except ValueError:
+                    return {"error": "illegal_stage"}
                 return {"ok": True, "stage": target_stage}
             if action == "write_code":
                 if not confirm:
@@ -328,7 +348,10 @@ class SynapseHost:
                     return {"error": "stale_plan"}
                 text = (f"Реализуй по плану docs/plans/{thread_id}.md. "
                         f"Исходный запрос: {th.request_text}")
-                self._launch_run(th, "code", "full", text, model)
+                try:  # B06: same illegal-transition guard as send_to_kora above.
+                    self._launch_run(th, "code", "full", text, model)
+                except ValueError:
+                    return {"error": "illegal_stage"}
                 return {"ok": True, "stage": "code"}
             return {"error": "unknown_action"}
 
@@ -336,10 +359,13 @@ class SynapseHost:
         """Общий хвост запуска стадийного рана: set_stage → task_id → store.start_task →
         append_task → set_last_model → kora_runner.start → gate_card в ленту."""
         from synapse.bridge.state import TaskStatus
-        # task_id тем же форматом, что confirm._new_task_id (факт 7: приватный через границу —
-        # дублируем 2 строки генерации, не тащим leading-underscore символ).
-        import time as _time
-        task_id = f"task-{int(self.clock.now() * 1000)}-{next(_GATE_TASK_SEQ)}"
+        # B11: gate-minted IDs live in their OWN `gate-` namespace, DISJOINT from confirm's
+        # `task-…` IDs. The two mint sites are independent itertools.count(1) generators with the
+        # same `{ms}-{seq}` tail, so a shared prefix let a voice/confirm task and a UI-gate task
+        # collide on the identical string at the same clock tick+seq → _task_index silently
+        # overwrote → a task's live log misrouted into another (possibly cross-project) thread.
+        # Distinct prefixes make cross-module collision structurally impossible.
+        task_id = f"gate-{int(self.clock.now() * 1000)}-{next(_GATE_TASK_SEQ)}"
         self.threads.set_stage(th.id, stage)
         self.store.start_task(task_id, text, TaskStatus.RUNNING, self.clock.now())
         self.threads.append_task(th.id, task_id)
@@ -357,6 +383,32 @@ class SynapseHost:
 
 
 _GATE_TASK_SEQ = itertools.count(1)
+
+
+class _CostCountingLLMSwitcher(LLMSwitcher):
+    """B04: counts a paid-tier attempt on a SUCCESSFUL generation, closing the R9 hole where
+    `CostCap.record_paid_attempt` was reachable ONLY via the failover error path — so a healthy
+    tier1 turn (the common case) made a real billed call that never counted and the daily cap was
+    structurally inert. A completed generation pushes an `LLMFullResponseEndFrame` DOWNSTREAM out
+    of the switcher; the ParallelPipeline filters ensure only the ACTIVE tier's frames escape, so
+    one such frame == one completed paid attempt. Gated on `active_tier_index()==0`: the INITIAL
+    tier is the one the failover path never pre-counts (`strategy._advance` already counts every
+    tier it switches TO), so this counts exactly the attempt that was being missed without
+    double-counting a failover-then-success."""
+
+    def __init__(self, services, *, strategy_type, cost_cap: CostCap,
+                 labels: list, clock: Clock) -> None:
+        super().__init__(services, strategy_type=strategy_type)
+        self._cost_cap = cost_cap
+        self._labels = labels
+        self._clock = clock
+
+    async def push_frame(self, frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
+            idx = self.strategy.active_tier_index()
+            if idx == 0 and self._labels[idx].paid:
+                self._cost_cap.record_paid_attempt(self._clock.now())
+        await super().push_frame(frame, direction)
 
 
 def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
@@ -665,7 +717,12 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     services, labels = build_tier_services(host.cfg)
     generation_guard = GenerationGuard()
     strategy_type = build_strategy_type(host.breaker, labels, host.cost_cap, generation_guard, host.clock)
-    llm_switcher = LLMSwitcher(services, strategy_type=strategy_type)
+    # B04: cost-counting switcher — increments the daily paid-call cap on a successful generation,
+    # not only on the failover error path (which never fired for a healthy tier1, the common case).
+    llm_switcher = _CostCountingLLMSwitcher(
+        services, strategy_type=strategy_type,
+        cost_cap=host.cost_cap, labels=labels, clock=host.clock,
+    )
     register_all(llm_switcher, host.handlers)
 
     # Cascade observability (Bug 3): the strategy exposes on_retry/on_tail_tier/on_all_failed

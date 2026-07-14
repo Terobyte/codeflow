@@ -195,6 +195,20 @@ class TaskStore:
         self._persist()
         return self._task
 
+    def stage_task(self, task_id: str, text: str, staged: dict[str, Any], now: float) -> TaskState:
+        """B12: atomically create a PENDING_CONFIRMATION task AND its staged blob in ONE persist.
+        ConfirmFlow.submit used to do start_task() then set_staged() as two separate writes, so a
+        crash between them left a PENDING_CONFIRMATION task with staged=null on disk — wedging the
+        flow forever (has_active_task() blocks every submit while confirm() rejects). One persist
+        closes the window; `_load` reconciles any state.json still carrying the old two-write scar."""
+        self._task = TaskState(
+            id=task_id, text=text, status=TaskStatus.PENDING_CONFIRMATION,
+            started_ts=now, last_event_ts=None, events=[],
+        )
+        self._staged = staged
+        self._persist()
+        return self._task
+
     def set_task_status(self, status: TaskStatus) -> None:
         if self._task is None:
             return
@@ -230,14 +244,20 @@ class TaskStore:
     def apply_event(self, event: KoraEvent) -> None:
         self._last_event_ts = event.ts
         if self._task is not None:
-            self._task.events.append(event)
-            self._task.last_event_ts = event.ts
             new_status = self._EVENT_STATUS.get(event.type)
-            # B3: never overwrite a terminal status — a second ResultMessage / a task_failed after
-            # task_completed (the SDK stream loop has no break) must not flip COMPLETED→FAILED or
-            # resurrect a finished task to RUNNING. Mirrors the guard in set_task_status (Bug 6).
-            if new_status is not None and self._task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                self._task.status = new_status
+            already_terminal = self._task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            terminal_event = new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            # B14: once the task is terminal, a REPEAT terminal signal (a second ResultMessage /
+            # a task_failed after task_completed — the SDK stream loop has no break) must be a
+            # true no-op for the record. The B3 guard below already protects `.status`, but the
+            # append was OUTSIDE it, so the duplicate terminal event still grew `task.events`
+            # (rendered as a phantom extra line in snapshot/render_state). Skip the append too.
+            if not (already_terminal and terminal_event):
+                self._task.events.append(event)
+                self._task.last_event_ts = event.ts
+                # B3: never overwrite a terminal status (COMPLETED→FAILED or resurrect to RUNNING).
+                if new_status is not None and not already_terminal:
+                    self._task.status = new_status
         self._persist()
 
     def liveness(self, now: float, stale_after_s: float, unreachable_after_s: float) -> Liveness:
@@ -427,13 +447,27 @@ class SpeakLedger:
         if entry is not None:
             entry.spoken = True
 
-    def register_speak_text(self, text: str, ts: float) -> None:
+    def register_speak_text(self, text: str, ts: float) -> list[str]:
         """Mark every pending critical whose SPEAK text matches as spoken. The console runner
         registers by event_id; the voice path only has Kora's ready text at on_speak time, so
-        match on speak_text (M0: register_critical wiring itself awaits the WebSocket Kora bridge)."""
-        for entry in self._pending.values():
+        match on speak_text (M0: register_critical wiring itself awaits the WebSocket Kora bridge).
+        Returns the ids it newly marked so the caller can REVERT them (B01) if the SPEAK it
+        optimistically registered turns out to have been dropped in delivery."""
+        marked: list[str] = []
+        for event_id, entry in self._pending.items():
             if not entry.spoken and entry.event.speak_text == text:
                 entry.spoken = True
+                marked.append(event_id)
+        return marked
+
+    def revert_speak(self, event_ids: list[str] | None) -> None:
+        """B01: un-mark criticals whose optimistic SPEAK registration was not actually delivered
+        (the out-of-band injection raised). Reverting re-arms the Р-15г watchdog for the dropped
+        critical instead of leaving it permanently recorded as spoken."""
+        for event_id in event_ids or []:
+            entry = self._pending.get(event_id)
+            if entry is not None:
+                entry.spoken = False
 
     def unspoken(self, now: float, min_age_s: float) -> list[KoraEvent]:
         # M1 slice 5 (§2.7): undelivered criticals to replay on a reconnect resync. `min_age_s`

@@ -41,8 +41,8 @@ def record_session(phrases_path: str, out_dir: str, bg: str, resume: bool) -> in
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     phrases = _read_phrases(phrases_path)
-    manifest = _load_manifest(out) if resume else []
-    done_phrases = {entry["phrase"] for entry in manifest} if resume else set()
+    manifest = _load_manifest(out)
+    done_phrases = {entry["phrase"] for entry in manifest if entry.get("bg") == bg} if resume else set()
 
     sample_rate = 16000
     for idx, phrase in enumerate(phrases, start=1):

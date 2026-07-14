@@ -439,6 +439,18 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             return False
         return True
 
+    async def _json_body(request: Request):
+        """B10: a malformed JSON body on a mutating /api/* route must be a diagnosable 400 (the
+        exact pattern `/start` already uses), NOT an unhandled JSONDecodeError → 500. Returns
+        `(data, None)` on a well-formed object body, or `(None, <400 JSONResponse>)` otherwise."""
+        try:
+            data = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            return None, JSONResponse({"error": "malformed JSON body"}, status_code=400)
+        if not isinstance(data, dict):
+            return None, JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+        return data, None
+
     def _thread_dict(t) -> dict:
         return {"id": t.id, "title": t.title, "project_id": t.project_id, "stage": t.stage,
                 "last_outcome": t.last_outcome, "updated_ts": t.updated_ts,
@@ -461,7 +473,9 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         if not _csrf_ok(request):
             return JSONResponse({"error": "csrf"}, status_code=403)
         from synapse.projects import ProjectValidationError
-        data = await request.json()
+        data, err = await _json_body(request)
+        if err is not None:
+            return err
         try:
             proj = await host.projects.add(str(data.get("name") or ""), str(data.get("path") or ""))
         except ProjectValidationError as e:
@@ -486,7 +500,9 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def api_threads_create(request: Request):
         if not _csrf_ok(request):
             return JSONResponse({"error": "csrf"}, status_code=403)
-        data = await request.json()
+        data, err = await _json_body(request)
+        if err is not None:
+            return err
         pid = data.get("project_id")
         t = host.threads.create(
             str(data.get("title") or "новый тред"),
@@ -509,10 +525,16 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             return JSONResponse({"error": "text turns disabled (no anthropic key)"}, status_code=503)
         if host.threads.get(thread_id) is None:
             return JSONResponse({"error": "no such thread"}, status_code=404)
-        data = await request.json()
+        data, err = await _json_body(request)
+        if err is not None:
+            return err
         text = str(data.get("text") or "").strip()
         if not text:
             return JSONResponse({"error": "empty text"}, status_code=400)
+        # NB (B08): turn_lock is intentionally NOT held across ingest_user_turn — B-PIPE-5 requires
+        # releasing it before the LLM call so one slow client can't block others. The journal-level
+        # begin_turn backstop (journal.py) is what protects an in-flight turn's record from a
+        # concurrent begin_turn; full per-turn serialization stays the parked pipecat residual.
         async with host.turn_lock:  # S7: одна очередь ходов на хост
             host.current_http_thread["id"] = thread_id
         try:
@@ -536,7 +558,9 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         th = host.threads.get(thread_id)
         if th is None:
             return JSONResponse({"error": "no such thread"}, status_code=404)
-        data = await request.json()
+        data, err = await _json_body(request)
+        if err is not None:
+            return err
         title = str(data.get("title") or "").strip()
         if not title:
             return JSONResponse({"error": "empty title"}, status_code=400)
@@ -584,7 +608,9 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             return JSONResponse({"error": "csrf"}, status_code=403)
         if host.threads.get(thread_id) is None:
             return JSONResponse({"error": "no such thread"}, status_code=404)
-        data = await request.json()
+        data, err = await _json_body(request)
+        if err is not None:
+            return err
         action = str(data.get("action") or "")
         raw_model = data.get("model")
         model = str(raw_model) if raw_model is not None else None
@@ -610,7 +636,9 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def api_active_thread(request: Request):
         if not _csrf_ok(request):
             return JSONResponse({"error": "csrf"}, status_code=403)
-        data = await request.json()
+        data, err = await _json_body(request)
+        if err is not None:
+            return err
         tid = data.get("id")
         if tid is not None and host.threads.get(str(tid)) is None:
             return JSONResponse({"error": "no such thread"}, status_code=404)

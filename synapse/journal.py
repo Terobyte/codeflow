@@ -84,6 +84,14 @@ class TurnJournal:
         return self._current
 
     def begin_turn(self, transcript: str) -> TurnRecord:
+        # B08: an already-open turn OWNS `_current` until it is ended — a second begin_turn while
+        # one is in flight (a concurrent HTTP turn overlapping a voice turn's tool tail, the window
+        # `turn_lock` serialization is meant to close) must NOT hijack the open turn's record, or
+        # its tool calls/grounding/alerts would misattribute to the wrong turn. Return the ongoing
+        # record instead of clobbering it; with the caller serializing under turn_lock this is a
+        # no-op on the happy path (each turn ends — on error — before the next begins).
+        if self._current is not None:
+            return self._current
         self._turn_counter += 1
         self._current = TurnRecord(
             turn_id=f"t{self._turn_counter}",

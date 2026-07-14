@@ -104,12 +104,23 @@ class DispatcherTurnLoop:
         # локальной `history` дошёл бы до _complete ЭТОГО хода, но self._histories[thread_id]
         # остался бы несжатым → на следующем ходу всё всплыло бы обратно.
         await self._maybe_compact(thread_id, history)
-        history.append({"role": "user", "content": transcript})
+
+        # B02: run the WHOLE turn (LLM call + tool loop) on a LOCAL snapshot of the shared history,
+        # never mutating the shared list across the `await self._complete(...)` suspension. Two
+        # concurrent turns on the SAME thread otherwise interleave their appends into the one shared
+        # list — user messages stack with no separating assistant turn, each _complete sees the
+        # other's in-flight messages, and the error-path rollback (`del history[snapshot-1:]`) cut
+        # from an index the other turn had already grown, discarding its data too. Only the final
+        # (user, assistant) pair is committed to the shared history, atomically, after this turn's
+        # own completion returns. The shared history holds only user/assistant across turns —
+        # consistent with feed rehydration and compaction (both user/assistant only); intra-turn
+        # tool messages live in `working` and are discarded, exactly as a cold rehydrate would.
+        working = list(history)
+        working.append({"role": "user", "content": transcript})
 
         text = ""
-        history_snapshot = len(history)  # save length before LLM adds messages
         try:
-            text, tool_calls = await self._complete(history, thread_id)
+            text, tool_calls = await self._complete(working, thread_id)
             record.llm_output = text
             passes = 0
             # Р-2: a tool turn needs at least one more completion with the tool results in context —
@@ -119,7 +130,7 @@ class DispatcherTurnLoop:
             while tool_calls and passes < _MAX_TOOL_PASSES:
                 # UI-3: канонический шейп — tool-результату предшествует assistant-ход с
                 # tool_use-анонсом (без него Anthropic Messages API отклоняет историю).
-                history.append({
+                working.append({
                     "role": "assistant",
                     "content": text or "",
                     "tool_calls": [
@@ -127,23 +138,26 @@ class DispatcherTurnLoop:
                     ],
                 })
                 for call in tool_calls:
-                    await self._dispatch_tool(call, history)
-                text, tool_calls = await self._complete(history, thread_id)
+                    await self._dispatch_tool(call, working)
+                text, tool_calls = await self._complete(working, thread_id)
                 if text:
                     record.llm_output = text
                 passes += 1
-            if text:
-                history.append({"role": "assistant", "content": text})
         except Exception:
-            # Roll back ALL messages added during this turn (user msg + any LLM/tool messages)
-            del history[history_snapshot - 1:]  # remove the user message and everything after
-            # B-PIPE-4: close the journal turn on error — the caller won't get a chance since
-            # the exception propagates (normal path leaves end_turn() to the caller for tts_texts).
+            # Nothing was committed to the shared history yet (the turn ran on `working`), so
+            # there is nothing to roll back — just close the journal turn (B-PIPE-4: the caller
+            # won't get a chance since the exception propagates).
             self._journal.end_turn()
             raise
         finally:
             record.latency_ms = (self._clock.now() - now) * 1000.0
             self._journal.check_grounding(record, had_active_task)
+        # Commit this turn's user msg + final assistant reply to the SHARED history in one
+        # synchronous burst (no await between the two appends → no concurrent turn can interleave
+        # and stack a second user with no assistant between).
+        history.append({"role": "user", "content": transcript})
+        if text:
+            history.append({"role": "assistant", "content": text})
         return record, text
 
     async def _complete(

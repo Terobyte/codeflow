@@ -133,6 +133,16 @@ class ConfirmFlow:
                 self._staged = _Staged(**persisted)
             except (TypeError, ValueError):
                 self._staged = None
+        # B12: reconcile the crash-between-writes scar. A PENDING_CONFIRMATION task with NO staged
+        # blob (submit persisted start_task but died before set_staged, pre-atomic-stage_task) can
+        # never be resolved by the normal flow — has_active_task() blocks every submit while
+        # confirm() rejects («Подтверждать нечего», self._staged is None). Drop the dangling task on
+        # construction so the flow un-wedges. Unreachable now that submit stages atomically, but a
+        # state.json written by an older build can still carry the scar across a restart.
+        if (self._staged is None
+                and store.task is not None
+                and store.task.status == TaskStatus.PENDING_CONFIRMATION):
+            store.clear_task()
 
     @property
     def staged(self) -> _Staged | None:
@@ -151,8 +161,9 @@ class ConfirmFlow:
                 task_id=task_id, text=text, readback_text=readback,
                 rereadback_count=0, awaiting_user_turn=True, last_readback_ts=now,
             )
-            self._store.start_task(task_id, text, TaskStatus.PENDING_CONFIRMATION, now)
-            self._store.set_staged(asdict(self._staged))
+            # B12: ONE atomic persist for task + staged. The old two-write pair (start_task then
+            # set_staged) had a crash window that wedged the flow forever if it hit between them.
+            self._store.stage_task(task_id, text, asdict(self._staged), now)
             return SubmitResult(outcome=ConfirmOutcome.STAGED, task_id=task_id, readback_text=readback)
         task_id = _new_task_id(now)
         self._store.start_task(task_id, text, TaskStatus.RUNNING, now)

@@ -297,6 +297,16 @@ def apply_event_to_store(
     Speak dispatch deliberately diverges from FakeKora.emit: lifecycle-only (NO-EXFIL backstop),
     while critical registration mirrors it for ALL events."""
     journal.record_kora_event(event)
+    # B20 + B09: critical registration is hoisted OUT of the lifecycle gate AND must run BEFORE
+    # the speak dispatch below. `register_critical` is what CREATES the pending ledger entry;
+    # `register_speak` only MARKS an existing one and is a silent no-op if the entry doesn't
+    # exist yet. The old order (register_speak first, register_critical after) meant a CRITICAL
+    # lifecycle event with speak_text was recorded spoken=False → a false CRITICAL_WITHOUT_SPEAK.
+    # This matches FakeKora.emit's order (register_critical first). Hoisting also arms the ledger
+    # for a non-lifecycle CRITICAL (which only heartbeats): speak being structurally
+    # lifecycle-only, such an event now trips the Р-15г alert LOUDLY instead of vanishing.
+    if event.cls == EventClass.CRITICAL:
+        speak_ledger.register_critical(event)
     if event.type in _LIFECYCLE_TYPES:
         store.apply_event(event)
         # NO-EXFIL (slice 4): speak stays STRUCTURALLY lifecycle-only — a non-lifecycle event's
@@ -308,13 +318,6 @@ def apply_event_to_store(
             speak_ledger.register_speak(event.id, event.ts)
     else:
         store.heartbeat(event.ts)
-    # B20: critical registration is hoisted OUT of the lifecycle gate. A CRITICAL event that
-    # only heartbeats the store must still arm the ledger — otherwise the Р-15г
-    # CRITICAL_WITHOUT_SPEAK watchdog is blind to it (silent drop). Speak being structurally
-    # lifecycle-only, a non-lifecycle CRITICAL now trips that alert LOUDLY instead of vanishing.
-    # Deliberate, documented divergence from FakeKora.emit (see class docstring).
-    if event.cls == EventClass.CRITICAL:
-        speak_ledger.register_critical(event)
 
 
 class KoraRunner:
@@ -550,7 +553,18 @@ class KoraRunner:
         raw = (tool_input or {}).get(key)
         if not isinstance(raw, str) or not raw.strip():
             if tool_name in _READ_SEARCH_TOOLS:
-                return True, None, "allow"  # defaults to cwd, which is inside the workspace
+                # Defaults to cwd (the workspace). B03: the workspace ROOT itself can resolve
+                # under a secret dir segment (e.g. a project pinned to ~/.ssh via B05) — a
+                # no-path Grep/Glob/LS would then read secret contents with zero containment.
+                # Resolve the root and run the SAME secret check the with-path branch does,
+                # BEFORE allowing the cwd default.
+                try:
+                    ws_resolved = self._current_root().resolve()
+                except (OSError, RuntimeError, ValueError):
+                    return False, "path resolution failed", "path_error"
+                if _is_secret_path(ws_resolved):
+                    return False, "secret_path", "secret_path"
+                return True, None, "allow"
             return False, f"missing_path: {tool_name}", "missing_path"
         workspace = self._current_root()
         p = Path(raw)

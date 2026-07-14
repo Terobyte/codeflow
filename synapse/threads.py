@@ -116,7 +116,10 @@ class ThreadStore:
         t.updated_ts = self._clock.now()
         self._persist(t)
 
-    def set_outcome(self, thread_id: str, outcome: str) -> None:
+    def set_outcome(self, thread_id: str, outcome: str | None) -> None:
+        """Исход последнего запуска. `None` (B07) СБРАСЫВАЕТ исход — revise регрессирует стадию в
+        collect и обязан обнулить «completed» от прошлого запроса, иначе write_code примет старый
+        план как свежий для нового запроса."""
         t = self._threads.get(thread_id)
         if t is None:
             return

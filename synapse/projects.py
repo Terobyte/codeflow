@@ -12,7 +12,13 @@ from pathlib import Path
 
 # Проверяются и сырой абсолютный путь, и resolved (macOS: /etc -> /private/etc).
 _SYSTEM_ROOTS = ("/System", "/Library", "/usr", "/etc", "/private/etc", "/bin", "/sbin")
-_FORBIDDEN_HOME_SUBDIRS = (".config", ".gnupg", "Library/Keychains")
+# B05: this denylist is the FIRST line of defence — it decides where Kora's workspace root may
+# be pinned. It must cover every secret-dir segment `bridge/kora.py::_SECRET_DIR_SEGMENTS`
+# treats as sensitive, or a project rooted at ~/.ssh (etc.) sails past validation and ARMS the
+# gate's no-path exfiltration hole (B03). Keep in sync with _SECRET_DIR_SEGMENTS.
+_FORBIDDEN_HOME_SUBDIRS = (
+    ".config", ".gnupg", "Library/Keychains", ".ssh", ".aws", ".kube", ".docker",
+)
 
 
 class ProjectValidationError(ValueError):
