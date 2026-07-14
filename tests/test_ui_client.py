@@ -35,7 +35,7 @@ def test_index_is_spa_shell():
     body = (CLIENT_DIR / "index.html").read_text(encoding="utf-8")
     for token in (
         "shell", "sidebar", "menu-btn", "new-thread", "projects-list", "add-project",
-        "threads-list", "loose-h", "kora-card", "kora-card-sub", "./logs",
+        "threads-list", "loose-h", "kora-card", "kora-card-sub", "#/activity", "activity-list",
         "view-home", "view-thread", "feed-list", "typing",
         "mic-btn", "msg-input", "msg-send", "proj-chip", 'data-state="idle"', "bot-audio",
         "manifest.webmanifest", "apple-touch-icon", "app.js", "style.css",
@@ -46,6 +46,7 @@ def test_index_is_spa_shell():
     assert "kora-dot" not in body
     assert "status-widget.js" not in body  # светофор нативный, не инжект-виджет
     assert "не подключено" not in body     # статус виден только когда есть что сказать
+    assert "./logs" not in body             # activity остаётся внутри SPA, WebRTC не рвётся
 
 
 def test_app_js_is_spa_router_and_xss_safe():
@@ -179,6 +180,20 @@ def test_client_files_served_from_disk_not_startup_ram():
 def test_thread_page_files_are_gone():
     assert not (CLIENT_DIR / "thread.html").exists()
     assert not (CLIENT_DIR / "thread.js").exists()
+
+
+def test_stage_ui_is_xss_safe_and_has_gate_controls():
+    app = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
+    index = (CLIENT_DIR / "index.html").read_text(encoding="utf-8")
+    for token in (
+        "gate_card", "/gate", "СБОР", "ЗАПРОС", "СПЕКА·ПЛАН", "КОД", "ГОТОВО",
+        "точно", 'el("select"', "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5",
+        "renderStageChip", "#/activity", "pollActivity",
+    ):
+        assert token in app, f"stage UI missing {token!r}"
+    assert 'id="stage-chip"' in index
+    assert '<textarea id="msg-input"' in index
+    assert "innerHTML" not in app
 
 
 def test_browse_dir_is_caged_to_home(tmp_path):

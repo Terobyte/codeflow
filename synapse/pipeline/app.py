@@ -43,6 +43,7 @@ from synapse.dispatcher.tools import ALL_SCHEMAS, KoraBridge, ToolHandlers, regi
 from synapse.journal import AlertKind, TurnJournal
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
 from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook, make_guarded_assistant_aggregator
+from synapse.prompt import STAGE_RULES_COLLECT, STAGE_RULES_PROPOSE, build_system_prompt
 from synapse.threads import ThreadStore
 
 logger = logging.getLogger(__name__)
@@ -434,6 +435,71 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     turn_lock = asyncio.Lock()
     current_http_thread = TaskLocalThreadDict()
 
+    def _stage_block_for(thread_id: str | None) -> str:
+        th = threads.get(thread_id) if thread_id else None
+        if th is None:
+            return ""
+        if th.stage == "collect":
+            return STAGE_RULES_COLLECT
+        if th.stage == "propose":
+            return STAGE_RULES_PROPOSE
+        return ""
+
+    def _propose_for(thread_id: str | None, text: str, *, project_id: str | None = None) -> dict:
+        """Commit a dispatcher-approved request summary to its thread.
+
+        Voice has no thread until a meaningful summary exists; creating it here makes the
+        successful tool result truthful instead of silently writing to a None id.
+        """
+        th = threads.get(thread_id) if thread_id else None
+        if th is None:
+            th = threads.create(
+                title=text,
+                project_id=project_id if project_id and projects.get(project_id) else None,
+            )
+            if thread_id is None:
+                voice_thread["id"] = th.id
+        if th.stage != "collect":
+            return {"outcome": "illegal_stage"}
+        try:
+            threads.set_request(th.id, text)
+            threads.set_stage(th.id, "propose")
+        except ValueError:
+            return {"outcome": "illegal_stage"}
+        threads.append_feed(th.id, {
+            "ts": clock.now(), "kind": "gate_card", "stage": "propose", "action": "send_to_kora",
+        })
+        return {"outcome": "proposed", "thread_id": th.id, "stage": "propose"}
+
+    def _voice_propose(text: str) -> dict:
+        result = _propose_for(voice_thread["id"], text, project_id=voice_project["id"])
+        if result.get("thread_id"):
+            voice_thread["id"] = result["thread_id"]
+        return result
+
+    def _http_propose(text: str) -> dict:
+        tid = current_http_thread["id"]
+        if tid is None:
+            # The HTTP message route normally creates its thread first. Preserve the same
+            # truthful no-thread behaviour as voice if a caller bypasses that route.
+            return {"outcome": "no_active_thread"}
+        return _propose_for(tid, text)
+
+    async def _gate_for(thread_id: str | None, action: str, *, model: str | None = None,
+                        confirm: bool = False, fast: bool = False) -> dict:
+        if thread_id is None:
+            return {"outcome": "no_active_thread"}
+        return await _h["host"].gate_action(thread_id, action, model=model, confirm=confirm, fast=fast)
+
+    async def _voice_gate(action: str, **kwargs: Any) -> dict:
+        return await _gate_for(voice_thread["id"], action, **kwargs)
+
+    async def _http_gate(action: str, **kwargs: Any) -> dict:
+        return await _gate_for(current_http_thread["id"], action, **kwargs)
+
+    def _project_bound(project_id: str) -> dict:
+        return {"outcome": "project_bound", "project_id": project_id}
+
     def _awaiting_thread_id() -> str | None:
         task = store.task
         th = threads.thread_for_task(task.id) if task is not None else None
@@ -486,6 +552,12 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         on_task_committed=_on_task_committed if kora_runner else None,
         on_cancel=kora_runner.request_cancel if kora_runner else None,
         on_answer=_voice_answer if kora_runner else None,
+        on_propose=_voice_propose,
+        on_gate=_voice_gate,
+        on_bind=_project_bound,
+        projects=projects,
+        threads=threads,
+        thread_id_for=lambda: voice_thread["id"],
     )
     handlers = ToolHandlers(bridge, journal)
 
@@ -497,6 +569,12 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         on_task_committed=None,
         on_cancel=kora_runner.request_cancel if kora_runner else None,
         on_answer=_http_answer if kora_runner else None,
+        on_propose=_http_propose,
+        on_gate=_http_gate,
+        on_bind=_project_bound,
+        projects=projects,
+        threads=threads,
+        thread_id_for=lambda: current_http_thread["id"],
     )
 
     def _http_task_committed(task_id: str, text: str) -> None:
@@ -520,6 +598,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             AnthropicLLMClient(cfg.anthropic_api_key, cfg.tier2_model),
             http_handlers, confirm_flow, store, journal, clock, cfg,
             thread_feed_reader=threads.read_feed,
+            stage_block_for=_stage_block_for,
         )
 
     # breaker needs only the tier COUNT, not the service instances themselves -- those are
@@ -553,6 +632,9 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         turn_lock=turn_lock,
         current_http_thread=current_http_thread,
     )
+    # Kept on the long-lived host so the independently constructed voice session can refresh
+    # its system prompt from the same stage resolver as the HTTP DispatcherTurnLoop.
+    host.stage_block_for = _stage_block_for
     _h["host"] = host  # fills the on_speak holder -- must precede any runtime SPEAK
     return host
 
@@ -622,6 +704,16 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
             host.handlers.begin_turn(record.turn_id)
             # R3: every user turn must reach confirm_flow.note_user_turn() before the LLM runs.
             host.confirm_flow.note_user_turn(transcript, host.clock.now())
+            # UI-4: voice uses pipecat's own live context, not DispatcherTurnLoop. Refresh the
+            # single system item in place before the user aggregator starts generation, keeping
+            # its accumulated assistant/tool tail intact.
+            voice_system = build_system_prompt(
+                host.cfg, stage_block=host.stage_block_for(host.voice_thread["id"])
+            )
+            context.set_messages([
+                {"role": "system", "content": voice_system},
+                *(m for m in context.get_messages() if m.get("role") != "system"),
+            ])
 
     context = LLMContext(tools=ALL_SCHEMAS)
     # S1: replicate LLMContextAggregatorPair's own __init__ recipe (user first, then the

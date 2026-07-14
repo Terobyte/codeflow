@@ -49,6 +49,7 @@ class DispatcherTurnLoop:
         cfg: SynapseConfig,
         task_dictionary: dict[str, str] | None = None,
         thread_feed_reader: Callable[[str], list[dict]] | None = None,
+        stage_block_for: Callable[[str], str] | None = None,
     ) -> None:
         self._llm = llm
         self._handlers = handlers
@@ -60,6 +61,7 @@ class DispatcherTurnLoop:
         self._task_dictionary = task_dictionary or {}
         # UI-3 (спека §4, находка A): пер-тред контекст. История LLM ключуется по треду.
         self._thread_feed_reader = thread_feed_reader
+        self._stage_block_for = stage_block_for
         self._histories: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 
     def _history_for(self, thread_id: str) -> list[dict[str, Any]]:
@@ -99,7 +101,7 @@ class DispatcherTurnLoop:
         text = ""
         history_snapshot = len(history)  # save length before LLM adds messages
         try:
-            text, tool_calls = await self._complete(history)
+            text, tool_calls = await self._complete(history, thread_id)
             record.llm_output = text
             passes = 0
             # Р-2: a tool turn needs at least one more completion with the tool results in context —
@@ -118,7 +120,7 @@ class DispatcherTurnLoop:
                 })
                 for call in tool_calls:
                     await self._dispatch_tool(call, history)
-                text, tool_calls = await self._complete(history)
+                text, tool_calls = await self._complete(history, thread_id)
                 if text:
                     record.llm_output = text
                 passes += 1
@@ -136,9 +138,12 @@ class DispatcherTurnLoop:
             self._journal.check_grounding(record, had_active_task)
         return record, text
 
-    async def _complete(self, history: list[dict[str, Any]]) -> tuple[str, list[ToolCall]]:
+    async def _complete(
+        self, history: list[dict[str, Any]], thread_id: str
+    ) -> tuple[str, list[ToolCall]]:
         state_block = self._render_state(self._clock.now())
-        system_prompt = build_system_prompt(self._cfg, self._task_dictionary)
+        stage_block = self._stage_block_for(thread_id) if self._stage_block_for is not None else ""
+        system_prompt = build_system_prompt(self._cfg, self._task_dictionary, stage_block=stage_block)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt + "\n\n" + state_block},
             *history,

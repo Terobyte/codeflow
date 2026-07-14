@@ -23,8 +23,14 @@
   dot.style.cursor = "pointer";
   dot.style.boxShadow = "0 0 4px rgba(0,0,0,.6)";
   dot.title = "Кора: статус неизвестен";
-  dot.addEventListener("click", () => {
-    location.href = "/client/logs";
+  // B-UX-9: точка доступна с клавиатуры — role=link + tab-фокус + Enter/Space, не только мышь
+  // (иначе <div> недостижим клавиатурой и AT). Навигация та же — АБСОЛЮТНЫЙ /client/logs.
+  dot.setAttribute("role", "link");
+  dot.tabIndex = 0;
+  const openLogs = () => { location.href = "/client/logs"; };
+  dot.addEventListener("click", openLogs);
+  dot.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openLogs(); }
   });
   document.body.appendChild(dot); // defer-скрипт: DOM уже распарсен, body есть
 

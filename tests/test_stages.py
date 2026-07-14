@@ -641,3 +641,146 @@ async def test_thread_gate_api_maps_host_errors_to_client_status(tmp_path, gate_
     response = await _endpoint(app, "api_thread_gate")(thread.id, _FakeRequest({"action": "write_code"}))
     assert response.status_code == status
     assert json.loads(response.body) == gate_result
+
+
+# ---------------------------------------------------------------------------
+# Task 5: dispatcher stage tools + stage-aware prompt
+# ---------------------------------------------------------------------------
+
+
+async def test_propose_request_commits_summary_card_and_dedups(tmp_path):
+    host = _gate_host(tmp_path)
+    host.handlers.begin_turn("turn-propose")
+    first = await host.handlers.propose_request("свод задачи")
+    second = await host.handlers.propose_request("свод задачи")
+    assert first == second
+    assert first["outcome"] == "proposed"
+    thread = host.threads.get(first["thread_id"])
+    assert thread is not None
+    assert host.voice_thread["id"] == thread.id
+    assert thread.request_text == "свод задачи" and thread.stage == "propose"
+    cards = [e for e in host.threads.read_feed(thread.id) if e.get("kind") == "gate_card"]
+    assert len(cards) == 1 and cards[0]["stage"] == "propose"
+
+
+async def test_gate_action_tool_proxies_host_function_and_none_thread_is_explicit(tmp_path):
+    host = _gate_host(tmp_path)
+    calls = []
+
+    async def fake_gate(thread_id, action, *, model=None, confirm=False, fast=False):
+        calls.append((thread_id, action, model, confirm, fast))
+        return {"ok": True, "stage": "spec_plan"}
+
+    host.gate_action = fake_gate
+    assert await host.handlers.gate_action("send_to_kora") == {"outcome": "no_active_thread"}
+    thread = host.threads.create("x")
+    host.voice_thread["id"] = thread.id
+    host.handlers.begin_turn("turn-gate")
+    result = await host.handlers.gate_action(
+        "send_to_kora", model="claude-sonnet-5", confirm=True, fast=True
+    )
+    assert result == {"ok": True, "stage": "spec_plan"}
+    assert calls == [(thread.id, "send_to_kora", "claude-sonnet-5", True, True)]
+
+
+async def test_bind_project_casefold_unknown_ambiguous_and_guard(tmp_path):
+    from synapse.dispatcher.tools import KoraBridge, ToolHandlers
+    from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
+    from synapse.bridge.state import TaskStore
+    from synapse.journal import TurnJournal
+
+    clock = FakeClock(0.0)
+    cfg = SynapseConfig()
+    store = TaskStore(clock)
+    journal = TurnJournal(str(tmp_path / "j"), clock)
+    confirm = ConfirmFlow(store, clock, KeywordClassifier(cfg.destructive_keywords), journal,
+                          cfg.affirm_words, cfg.deny_words, cfg.max_rereadbacks, cfg.confirm_timeout_s)
+    threads = ThreadStore(clock, tmp_path / "threads")
+    thread = threads.create("x")
+
+    class Projects:
+        def __init__(self, items): self.items = items
+        def list(self): return list(self.items)
+
+    projects = Projects([{"id": "p1", "name": "Работа"}])
+    bridge = KoraBridge(
+        store=store, confirm_flow=confirm, clock=clock, cfg=cfg,
+        on_bind=lambda pid: {"outcome": "project_bound", "project_id": pid},
+        projects=projects, threads=threads, thread_id_for=lambda: thread.id,
+    )
+    handlers = ToolHandlers(bridge, journal)
+    handlers.begin_turn("turn-bind")
+    assert await handlers.bind_project("работа") == {"outcome": "project_bound", "project_id": "p1"}
+    assert threads.get(thread.id).project_id == "p1"
+    other = threads.create("other")
+    bridge.thread_id_for = lambda: other.id
+    handlers.begin_turn("turn-unknown")
+    assert await handlers.bind_project("нет") == {"outcome": "unknown_project"}
+    projects.items.append({"id": "p2", "name": "РАБОТА"})
+    handlers.begin_turn("turn-ambiguous")
+    assert await handlers.bind_project("работа") == {"outcome": "ambiguous_project"}
+    # Находка F: вторую привязку треда, уже имевшего проект, стор отвергает.
+    projects.items.pop()
+    bridge.thread_id_for = lambda: thread.id
+    handlers.begin_turn("turn-guard")
+    assert await handlers.bind_project("работа") == {"outcome": "project_bind_rejected"}
+
+
+async def test_stage_block_is_before_state_and_absent_for_code_done(tmp_path):
+    from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
+    from synapse.bridge.state import TaskStore
+    from synapse.dispatcher.loop import DispatcherTurnLoop
+    from synapse.dispatcher.tools import KoraBridge, ToolHandlers
+    from synapse.prompt import STAGE_RULES_COLLECT, STAGE_RULES_PROPOSE
+
+    class CaptureLLM:
+        def __init__(self): self.messages = []
+        async def complete(self, messages, tools):
+            self.messages.append(messages)
+            return "", []
+
+    clock = FakeClock(0.0)
+    cfg = SynapseConfig()
+    store = TaskStore(clock)
+    journal = TurnJournal(str(tmp_path / "j"), clock)
+    confirm = ConfirmFlow(store, clock, KeywordClassifier(cfg.destructive_keywords), journal,
+                          cfg.affirm_words, cfg.deny_words, cfg.max_rereadbacks, cfg.confirm_timeout_s)
+    handlers = ToolHandlers(KoraBridge(store=store, confirm_flow=confirm, clock=clock, cfg=cfg), journal)
+    llm = CaptureLLM()
+    blocks = {"collect": STAGE_RULES_COLLECT, "propose": STAGE_RULES_PROPOSE, "code": "", "done": ""}
+    loop = DispatcherTurnLoop(llm, handlers, confirm, store, journal, clock, cfg,
+                              stage_block_for=lambda tid: blocks[tid])
+    for stage in ("collect", "propose", "code", "done"):
+        await loop.ingest_user_turn("проверка", thread_id=stage)
+        system = llm.messages[-1][0]["content"]
+        if blocks[stage]:
+            assert blocks[stage] in system
+            assert system.index(blocks[stage]) < system.index("\n\n[СОСТОЯНИЕ]")
+        else:
+            assert "СТАДИЯ " not in system
+
+
+def test_voice_system_prompt_refreshes_for_stage_and_stays_base_without_thread(tmp_path):
+    from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
+    from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
+    from synapse.pipeline.app import build_host, build_session_pipeline
+    from synapse.prompt import STAGE_RULES_COLLECT, build_system_prompt
+
+    cfg = SynapseConfig(
+        google_api_key="fake", openrouter_api_key="fake", anthropic_api_key="fake",
+        deepgram_api_key="fake", fish_audio_api_key="fake", fish_reference_id="fake",
+        journal_dir=str(tmp_path),
+    )
+    host = build_host(cfg)
+    session = build_session_pipeline(host)
+    stt = next(p for p in session.pipeline.processors if isinstance(p, DeepgramFluxSTTService))
+    context = next(p.context for p in session.pipeline.processors if isinstance(p, LLMUserAggregator))
+    handler = stt._event_handlers["on_end_of_turn"].handlers[0]
+    import asyncio
+    asyncio.run(handler(stt, "без треда"))
+    assert context.get_messages()[0] == {"role": "system", "content": build_system_prompt(cfg)}
+    host.journal.end_turn()
+    thread = host.threads.create("голос")
+    host.voice_thread["id"] = thread.id
+    asyncio.run(handler(stt, "в сборе"))
+    assert STAGE_RULES_COLLECT in context.get_messages()[0]["content"]

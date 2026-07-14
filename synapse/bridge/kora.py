@@ -253,7 +253,19 @@ def _message_to_log_entries(msg: Any, ts: float) -> list[dict[str, Any]]:
     elif name == "UserMessage":
         for block in _blocks(getattr(msg, "content", None)):
             if type(block).__name__ == "ToolResultBlock":
-                add("tool_result", "ошибка" if bool(getattr(block, "is_error", False)) else "ок")
+                # B-UX-4: two parallel tool results in ONE UserMessage share this `ts` and the
+                # coarse "ок"/"ошибка" text, so the client's ts|kind|text feedKey collapses them
+                # and drops the second. Stamp the SDK's stable, unique `tool_use_id` on the entry
+                # so feedKey can tell genuinely distinct results apart (stable across polls too).
+                e: dict[str, Any] = {
+                    "ts": ts,
+                    "kind": "tool_result",
+                    "text": "ошибка" if bool(getattr(block, "is_error", False)) else "ок",
+                }
+                tuid = getattr(block, "tool_use_id", None)
+                if tuid is not None:
+                    e["id"] = str(tuid)
+                entries.append(e)
 
     elif name == "ResultMessage":
         text = "задача упала" if bool(getattr(msg, "is_error", False)) else "задача завершена"

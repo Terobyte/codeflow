@@ -89,6 +89,10 @@ button:active, a:active, .thread-card:active, .project-row:active,
   font-size: 14.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .tc-meta { font-size: 13px; color: var(--dimmer); } /* B-UI-12: 12→13px читаемость на мобиле */
+.tc-stage, #stage-chip {
+  width: fit-content; color: var(--accent); border: 1px solid var(--border); background: var(--surface);
+  border-radius: 999px; font-size: 11px; font-weight: 650; letter-spacing: .04em; padding: 1px 7px;
+}
 
 /* статус-карточка Коры (вместо кружочка — Ж4) */
 #kora-card {
@@ -128,6 +132,8 @@ button:active, a:active, .thread-card:active, .project-row:active,
   border-radius: 999px; padding: 2px 10px; flex-shrink: 0;
 }
 #thread-badge.bad { color: var(--red); }
+#stage-chip { flex-shrink: 0; }
+#stage-chip.stage-done { color: var(--green); }
 
 /* ---------- вью ---------- */
 .view { flex: 1; overflow-y: auto; min-height: 0; padding: 16px; }
@@ -157,6 +163,27 @@ button:active, a:active, .thread-card:active, .project-row:active,
   border-radius: 8px; padding: 10px 12px; font-size: 14.5px; white-space: pre-wrap;
 }
 .feed-system { text-align: center; color: var(--dimmer); font-size: 13px; padding: 2px 0; }
+/* B-UX-3: gate_card (запуск) и event — приглушённые служебные строки, не сообщения-пузыри */
+.feed-gate_card, .feed-event {
+  color: var(--dim); font-size: 13px; padding: 4px 0; max-width: 760px; margin: 0 auto;
+}
+.feed-gate_card { color: var(--dim); }
+.gate-card {
+  align-self: stretch; max-width: 760px; margin: 0 auto; padding: 12px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+}
+.gate-title { margin: 0 0 8px; color: var(--text); font-weight: 650; }
+.gate-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.gate-action, .gate-model {
+  border: 1px solid var(--border); border-radius: 9px; background: var(--bg); color: var(--text);
+  padding: 7px 10px; font-size: 13px;
+}
+.gate-action:hover:not(:disabled), .gate-model:hover { background: var(--surface-2); }
+.gate-action:disabled { opacity: .5; cursor: default; }
+.gate-note { min-height: 1.4em; margin: 8px 0 0; color: var(--dim); font-size: 13px; }
+
+#activity-list { display: flex; flex-direction: column; gap: 8px; max-width: 760px; margin: 0 auto; }
+.activity-entry { padding: 10px 12px; border-radius: 9px; background: var(--surface); color: var(--dim); white-space: pre-wrap; overflow-wrap: break-word; }
 .feed-result {
   text-align: center; color: var(--green); font-size: 13.5px;
   border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px;
@@ -197,7 +224,7 @@ button:active, a:active, .thread-card:active, .project-row:active,
 #msg-input {
   flex: 1; font: inherit; padding: 12px 16px; border-radius: 22px;
   border: 1px solid var(--border); background: var(--surface); color: var(--text);
-  min-height: 44px;
+  min-height: 44px; max-height: 148px; resize: vertical; line-height: 1.35;
 }
 /* B-UI-3: outline снят, но фокус виден — акцентная рамка + кольцо-тень (не «слепой» инпут) */
 #msg-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(127, 179, 232, .25); }

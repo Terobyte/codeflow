@@ -28,7 +28,7 @@
         <h2 id="loose-h" hidden>Без проекта</h2>
         <ul id="threads-list"></ul>
       </nav>
-      <a id="kora-card" href="./logs">
+      <a id="kora-card" href="#/activity">
         <span id="kora-card-dot"></span>
         <span id="kora-card-text">
           <span id="kora-card-title">Кора</span>
@@ -43,6 +43,7 @@
         <button id="menu-btn" type="button" aria-label="меню">☰</button>
         <div id="view-title">Синапс</div>
         <span id="thread-badge" role="status" aria-live="polite" hidden></span>
+        <span id="stage-chip" hidden></span>
       </header>
       <section id="view-home" class="view">
         <div id="hero">
@@ -56,10 +57,14 @@
         <ol id="feed-list"></ol>
         <p id="typing" aria-live="polite" hidden>думаю<span class="dots"><span>.</span><span>.</span><span>.</span></span></p>
       </section>
+      <section id="view-activity" class="view" hidden>
+        <h2>Активность Коры</h2>
+        <ol id="activity-list"></ol>
+      </section>
       <p id="conn-status" role="status" aria-live="assertive" hidden></p>
       <footer id="composer">
         <button id="proj-chip" type="button" title="активный проект"></button>
-        <input id="msg-input" type="text" placeholder="Опиши задачу…" autocomplete="off" enterkeyhint="send">
+        <textarea id="msg-input" rows="1" placeholder="Опиши задачу…" autocomplete="off" enterkeyhint="send"></textarea>
         <button id="msg-send" type="button" aria-label="отправить">➤</button>
         <button id="mic-btn" type="button" data-state="idle" aria-label="микрофон">🎙</button>
       </footer>

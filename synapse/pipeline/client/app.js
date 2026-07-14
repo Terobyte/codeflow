@@ -43,8 +43,13 @@ function relTime(ts) {
 
 // ---------- роутер ----------
 function route() {
+  if (location.hash === "#/activity") return { view: "activity" };
   const m = location.hash.match(/^#\/thread\/([^/?&#]+)/);
-  return m ? { view: "thread", id: decodeURIComponent(m[1]) } : { view: "home" };
+  if (!m) return { view: "home" };
+  // B-UX-6: битые %-эскейпы в хеше кидают URIError из decodeURIComponent — ловим,
+  // иначе одно кривое звено рушит весь render-цикл (route зовётся на каждый рендер).
+  try { return { view: "thread", id: decodeURIComponent(m[1]) }; }
+  catch { return { view: "home" }; }
 }
 
 let threads = [];
@@ -56,6 +61,7 @@ const renderedKeys = new Set();     // подписи уже отрисован�
                                 // дубли (B-CORE-7).
 let feedInFlight = false;       // сериализуем параллельные pollFeed (B-CORE-7)
 let listsLoaded = false;        // первая успешная загрузка списков состоялась (B-CORE-9)
+let listsSeq = 0;               // B-UX-5: секвенс-токен — устаревший ответ не затирает свежие данные
 let lastActiveThread = "";      // дедуп POST /api/active-thread (B-CORE-13)
 const LOAD_ERR = "нет связи с сервером — тяну снова…";
 
@@ -67,7 +73,14 @@ const OUTCOME = {
 };
 function outcomeLabel(outcome) { return OUTCOME[outcome] || null; }
 
-function feedKey(e) { return (e.ts || 0) + "|" + (e.kind || "") + "|" + (e.text || ""); }
+const STAGES = {
+  collect: "СБОР", propose: "ЗАПРОС", spec_plan: "СПЕКА·ПЛАН", code: "КОД", done: "ГОТОВО",
+};
+const KORA_MODELS = ["claude-opus-4-8", "claude-sonnet-5", "claude-fable-5"];
+
+// B-UX-4: id (tool_use_id) в ключе — два параллельных ToolResult с одинаковыми ts|kind|text
+// («ок»/«ошибка») больше не схлопываются в одну запись ленты.
+function feedKey(e) { return (e.id || "") + "|" + (e.ts || 0) + "|" + (e.kind || "") + "|" + (e.text || ""); }
 
 // ---------- активный проект: дом рожает треды-ветки в нём ----------
 // Персистится в localStorage; валидируется против загруженного списка — удалённый
@@ -93,21 +106,31 @@ function render() {
   closeDrawer();
   $("view-home").hidden = r.view !== "home";
   $("view-thread").hidden = r.view !== "thread";
+  $("view-activity").hidden = r.view !== "activity";
   if (r.view === "thread") {
     const t = threads.find((x) => x.id === r.id);
     $("view-title").textContent = t ? t.title : "тред";
     $("msg-input").placeholder = "Сообщение…";
     renderBadge(t);
+    renderStageChip(t);
     if (feedThread !== r.id) {
       feedThread = r.id;
       renderedKeys.clear();
       $("feed-list").replaceChildren();
     }
     pollFeed();
+  } else if (r.view === "activity") {
+    $("view-title").textContent = "Активность Коры";
+    $("msg-input").placeholder = "Опиши задачу…";
+    $("thread-badge").hidden = true;
+    renderStageChip(null);
+    feedThread = null;
+    pollActivity();
   } else {
     $("view-title").textContent = "Синапс";
     $("msg-input").placeholder = "Опиши задачу…";
     $("thread-badge").hidden = true;
+    renderStageChip(null);
     feedThread = null;
   }
   // Голос адресуется открытому треду; дом = авто-тред диспетчера в активном проекте.
@@ -137,12 +160,21 @@ function renderBadge(t) {
   b.hidden = false;
 }
 
+function renderStageChip(t) {
+  const chip = $("stage-chip");
+  const label = t && STAGES[t.stage];
+  chip.textContent = label || "";
+  chip.hidden = !label;
+  chip.className = t && t.stage ? "stage-" + t.stage : "";
+}
+
 // ---------- сайдбар: дерево проект → его треды-ветки ----------
 function threadCard(t, cur, showProj) {
   const a = el("a", "thread-card" + (cur.view === "thread" && cur.id === t.id ? " active" : ""));
   a.href = "#/thread/" + encodeURIComponent(t.id);
   const o = outcomeLabel(t.last_outcome);
   a.appendChild(el("span", "tc-title", (o ? o.icon + " " : "") + t.title));
+  if (STAGES[t.stage]) a.appendChild(el("span", "tc-stage", STAGES[t.stage]));
   const proj = showProj ? projects.find((p) => p.id === t.project_id) : null;
   a.appendChild(el("span", "tc-meta", relTime(t.updated_ts) + (proj ? " · " + proj.name : "")));
   return a;
@@ -209,8 +241,12 @@ function renderHome() {
 }
 
 async function loadLists() {
+  const my = ++listsSeq;
   try {
     const [tData, pData] = await Promise.all([getJSON("/api/threads"), getJSON("/api/projects")]);
+    // B-UX-5: пока ждали ответ, стартовал более новый loadLists — этот устарел, не затираем
+    // им свежие данные (last-to-resolve-wins гонка, как у pollFeed/browse).
+    if (my !== listsSeq) return;
     threads = tData.threads;
     projects = pData.projects;
     // B-CORE-9: первая удачная загрузка снимает баннер «нет связи», если он висел.
@@ -227,7 +263,7 @@ async function loadLists() {
   const r = route();
   if (r.view === "thread") {
     const t = threads.find((x) => x.id === r.id);
-    if (t) { $("view-title").textContent = t.title; renderBadge(t); }
+    if (t) { $("view-title").textContent = t.title; renderBadge(t); renderStageChip(t); }
   }
 }
 
@@ -248,10 +284,100 @@ function addEntry(e) {
     if (/fail|ошибк|прерв|отмен/i.test(e.text || "")) li.classList.add("bad");
   } else if (e.kind === "task") {
     li.textContent = "▶ " + (e.text || "");
+  } else if (e.kind === "gate_card") {
+    renderGateCard(li, e);
+  } else if (e.kind === "event") {
+    li.textContent = "• " + (e.text || "");
   } else {
     li.textContent = (KIND_ICONS[e.kind] || "·") + " " + (e.text || "");
   }
   $("feed-list").appendChild(li);
+}
+
+function gateButton(label, action, opts = {}) {
+  const button = el("button", "gate-action", label);
+  button.type = "button";
+  return { button, action, opts };
+}
+
+function renderGateCard(li, entry) {
+  const current = route();
+  const thread = current.view === "thread" ? threads.find((t) => t.id === current.id) : null;
+  const stage = entry.stage || "";
+  const live = !!thread && thread.stage === stage;
+  li.classList.add("gate-card");
+  li.appendChild(el("p", "gate-title", stage === "propose" ? "Запрос готов" :
+    stage === "spec_plan" ? "План готов" : stage === "code" ? "Правки или запуск" : "Запуск Коры"));
+  if (entry.action === "run_started") {
+    li.appendChild(el("p", "gate-note", "Кора запущена" + (entry.model ? " · " + entry.model : "")));
+    return;
+  }
+  const select = el("select", "gate-model");
+  select.setAttribute("aria-label", "Модель Коры");
+  const preferred = entry.model || (thread && thread.last_model) || "";
+  const automatic = el("option", "", "модель по умолчанию");
+  automatic.value = "";
+  select.appendChild(automatic);
+  KORA_MODELS.forEach((model) => {
+    const option = el("option", "", model);
+    option.value = model;
+    option.selected = model === preferred;
+    select.appendChild(option);
+  });
+  li.appendChild(select);
+
+  const actions = el("div", "gate-actions");
+  const buttons = [];
+  if (stage === "propose") {
+    buttons.push(gateButton("Отправить Коре", "send_to_kora", { confirm: true }));
+    buttons.push(gateButton("Сразу писать код", "send_to_kora", { fast: true, dangerous: true }));
+    buttons.push(gateButton("Правки", "revise"));
+  } else if (stage === "spec_plan") {
+    buttons.push(gateButton("Пиши код", "write_code", { dangerous: true }));
+    buttons.push(gateButton("Правки", "revise"));
+  } else if (stage === "code") {
+    buttons.push(gateButton("Правки", "revise"));
+  }
+  const note = el("p", "gate-note");
+  buttons.forEach(({ button, action, opts }) => {
+    button.disabled = !live;
+    button.addEventListener("click", async () => {
+      if (!live || button.disabled) return;
+      if (opts.dangerous && !button.dataset.confirmed) {
+        button.dataset.confirmed = "true";
+        button.textContent = "точно пишем код?";
+        note.textContent = "Второй тап запустит запись кода в проект.";
+        return;
+      }
+      const payload = { action, model: select.value || null, confirm: !!opts.confirm || !!opts.dangerous };
+      if (opts.fast) payload.fast = true;
+      actions.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+      note.textContent = "запускаю…";
+      try {
+        const response = await postJSON(`/api/threads/${encodeURIComponent(current.id)}/gate`, payload);
+        if (response.status === 409) {
+          note.textContent = "Кора занята — ждёт";
+          return;
+        }
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          note.textContent = "⛔ " + (body.error || "не удалось запустить");
+          return;
+        }
+        await Promise.all([loadLists(), pollFeed()]);
+      } catch {
+        note.textContent = "⛔ сеть недоступна";
+      } finally {
+        if (note.textContent !== "Кора занята — ждёт") {
+          actions.querySelectorAll("button").forEach((b) => { b.disabled = !live; });
+        }
+      }
+    });
+    actions.appendChild(button);
+  });
+  if (!live) note.textContent = "стадия изменилась — карточка больше не активна";
+  li.appendChild(actions);
+  li.appendChild(note);
 }
 
 function nearBottom() {
@@ -302,6 +428,22 @@ async function pollStatus() {
   setKora(COLORS[data.color] || "#888", sub);
 }
 
+async function pollActivity() {
+  if (route().view !== "activity") return;
+  let data;
+  try { data = await getJSON("./kora-log"); }
+  catch { return; }
+  if (route().view !== "activity") return;
+  const list = $("activity-list");
+  list.replaceChildren();
+  data.entries.forEach((entry) => {
+    const item = el("li", "activity-entry");
+    item.textContent = (entry.kind || entry.type || "событие") + ": " + (entry.text || entry.detail || "");
+    list.appendChild(item);
+  });
+  if (!data.entries.length) list.appendChild(el("li", "activity-entry", "пока нет событий"));
+}
+
 // ---------- композер: текст ----------
 function setConn(text) {
   $("conn-status").textContent = text;
@@ -347,7 +489,13 @@ $("msg-send").addEventListener("click", sendMessage);
 // B-CORE-15: не отправляем во время IME-композиции (китайский/японский/эмодзи-клавиатура iOS —
 // Enter там подтверждает набор, а не сообщение).
 $("msg-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) sendMessage();
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+    // B-UX-2: Enter не обходит guard кнопки — sendMessage синхронно ставит msg-send.disabled=true
+    // в самом начале, так что этот чек фенсит окно и не даёт двойной отправки.
+    if ($("msg-send").disabled) return;
+    e.preventDefault();
+    sendMessage();
+  }
 });
 
 // ---------- голос: vendored SDK → session-less POST /api/offer, видимые стейты ----------
@@ -451,12 +599,14 @@ async function probeSession() {
   // кратко лгать, а лишний реконнект дороже задержки.
   if (++aliveMisses < 3) return;
   aliveMisses = 0;
-  // зомби: клиент думает «on», сервер сессию не держит → тихий реконнект на месте
+  // зомби: клиент думает «on», сервер сессию не держит → тихий реконнект на месте.
+  // B-UX-1: connecting=true ПЕРВЫМ — до обнуления client и await-разрыва — иначе mic-btn
+  // (if (connecting) return) не фенсит окно, и тап по кнопке гоняется с авто-реконнектом.
+  connecting = true;
   const c = client;
   client = null;
-  await c.disconnect().catch(() => {});
-  connecting = true;
   setMicState("connecting");
+  await c.disconnect().catch(() => {});
   setConn("связь потеряна — переподключаю…");
   try {
     await connectVoice();
@@ -477,8 +627,25 @@ function syncScrollLock() {
   const anyModal = !picker.hidden || $("shell").classList.contains("drawer-open");
   document.body.style.overflow = anyModal ? "hidden" : "";
 }
-function openDrawer() { $("shell").classList.add("drawer-open"); $("backdrop").hidden = false; syncScrollLock(); }
-function closeDrawer() { $("shell").classList.remove("drawer-open"); $("backdrop").hidden = true; syncScrollLock(); }
+// B-UX-10: сайдбар — off-canvas на мобайле, но ВСЕГДА виден на десктопе (>768px). inert/aria-hidden
+// обязаны быть медиа-осознанными: убираем сайдбар из tab-порядка ТОЛЬКО когда он реально спрятан
+// (мобайл И drawer закрыт), иначе десктопный сайдбар стал бы inert (closeDrawer зовётся на каждый render).
+const drawerMq = window.matchMedia("(max-width: 768px)");
+function syncDrawerA11y() {
+  const off = drawerMq.matches && !$("shell").classList.contains("drawer-open");
+  $("sidebar").inert = off;
+  $("sidebar").setAttribute("aria-hidden", off ? "true" : "false");
+}
+function openDrawer() {
+  $("shell").classList.add("drawer-open"); $("backdrop").hidden = false; syncScrollLock();
+  syncDrawerA11y();
+  requestAnimationFrame(() => $("side-close").focus()); // фокус внутрь открытого drawer
+}
+function closeDrawer() {
+  $("shell").classList.remove("drawer-open"); $("backdrop").hidden = true; syncScrollLock();
+  syncDrawerA11y();
+}
+drawerMq.addEventListener("change", syncDrawerA11y);
 $("menu-btn").addEventListener("click", openDrawer);
 $("side-close").addEventListener("click", closeDrawer);
 $("backdrop").addEventListener("click", closeDrawer);
@@ -501,9 +668,19 @@ const pickerDirs = $("picker-dirs");
 const pickerError = $("picker-error");
 let pickerCur = null;
 let latestBrowse = 0; // B-CORE-12: игнорируем ответ не от последнего browse (быстрые тапы папок)
+let pickerPrevFocus = null; // B-UX-8: куда вернуть фокус после закрытия модалки-пикера
 
-function openPicker() { picker.hidden = false; pickerError.textContent = ""; syncScrollLock(); browse(null); }
-function closePicker() { picker.hidden = true; syncScrollLock(); }
+function openPicker() {
+  // B-UX-8: aria-modal-диалог обязан переместить фокус внутрь себя и вернуть его при закрытии.
+  pickerPrevFocus = document.activeElement;
+  picker.hidden = false; pickerError.textContent = ""; syncScrollLock(); browse(null);
+  $("picker-choose").focus();
+}
+function closePicker() {
+  picker.hidden = true; syncScrollLock();
+  if (pickerPrevFocus && pickerPrevFocus.focus) pickerPrevFocus.focus();
+  pickerPrevFocus = null;
+}
 
 async function browse(path) {
   const my = ++latestBrowse;
@@ -517,15 +694,23 @@ async function browse(path) {
   pickerPath.textContent = data.path;
   pickerError.textContent = "";
   pickerDirs.replaceChildren();
+  // B-UX-7: строки пикера доступны с клавиатуры — tab-фокус + role=button + Enter/Space,
+  // не только мышиный click (иначе <li> недостижимы клавиатурой и скринридером).
+  const pickerRow = (label, go) => {
+    const li = el("li", "", label);
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.addEventListener("click", go);
+    li.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); }
+    });
+    return li;
+  };
   if (data.parent) {
-    const up = el("li", "", "‹ назад");
-    up.addEventListener("click", () => browse(data.parent));
-    pickerDirs.appendChild(up);
+    pickerDirs.appendChild(pickerRow("‹ назад", () => browse(data.parent)));
   }
   data.dirs.forEach((name) => {
-    const li = el("li", "", "📁 " + name);
-    li.addEventListener("click", () => browse(data.path + "/" + name));
-    pickerDirs.appendChild(li);
+    pickerDirs.appendChild(pickerRow("📁 " + name, () => browse(data.path + "/" + name)));
   });
 }
 
@@ -555,7 +740,8 @@ pollStatus();
 setInterval(loadLists, 5000);
 setInterval(pollFeed, 3000);
 setInterval(pollStatus, 3000);
+setInterval(pollActivity, 3000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) { loadLists(); pollFeed(); pollStatus(); probeSession(); }
+  if (!document.hidden) { loadLists(); pollFeed(); pollStatus(); pollActivity(); probeSession(); }
 });
 window.addEventListener("online", () => probeSession());

@@ -12,6 +12,7 @@ a no-op that returns the first call's result instead of re-executing.
 from __future__ import annotations
 
 import contextvars
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -77,12 +78,41 @@ ANSWER_KORA_SCHEMA = FunctionSchema(
     required=["text"],
 )
 
+PROPOSE_REQUEST_SCHEMA = FunctionSchema(
+    name="propose_request",
+    description="Сохранить согласованный свод запроса и показать пользователю карточку следующего шага.",
+    properties={"text": {"type": "string", "description": "Короткий согласованный свод задачи."}},
+    required=["text"],
+)
+
+GATE_ACTION_SCHEMA = FunctionSchema(
+    name="gate_action",
+    description="Выполнить разрешённое действие стадийной карточки после явного подтверждения пользователя.",
+    properties={
+        "action": {"type": "string", "enum": ["send_to_kora", "write_code", "revise"]},
+        "model": {"type": "string", "description": "Необязательная модель запуска."},
+        "confirm": {"type": "boolean", "description": "Явное подтверждение опасного запуска кода."},
+        "fast": {"type": "boolean", "description": "Быстрый путь сразу к коду."},
+    },
+    required=["action"],
+)
+
+BIND_PROJECT_SCHEMA = FunctionSchema(
+    name="bind_project",
+    description="Привязать текущий тред к проекту по его имени, пока задача ещё не запускалась.",
+    properties={"project_name": {"type": "string", "description": "Имя проекта из списка проектов."}},
+    required=["project_name"],
+)
+
 ALL_SCHEMAS = [
     SUBMIT_TASK_SCHEMA,
     CONFIRM_TASK_SCHEMA,
     GET_TASK_STATUS_SCHEMA,
     REQUEST_CANCEL_SCHEMA,
     ANSWER_KORA_SCHEMA,
+    PROPOSE_REQUEST_SCHEMA,
+    GATE_ACTION_SCHEMA,
+    BIND_PROJECT_SCHEMA,
 ]
 
 
@@ -114,6 +144,16 @@ class KoraBridge:
     # KoraRunner.provide_answer; returns True iff a question was actually pending. Fires INSIDE
     # ToolHandlers._do (answer_kora), like the other on_* callbacks.
     on_answer: Callable[[str], bool] | None = None
+    # UI-4: staging tools are deliberately callbacks, so voice and HTTP select their own
+    # current thread without sharing mutable routing state.
+    on_propose: Callable[[str], Any] | None = None
+    on_gate: Callable[..., Any] | None = None
+    on_bind: Callable[[str], Any] | None = None
+    # bind_project resolves names here (not in the LLM) and uses these stores only after the
+    # bridge callback confirms this dispatcher channel has an active thread.
+    projects: Any = None
+    threads: Any = None
+    thread_id_for: Callable[[], str | None] | None = None
 
 
 def _submit_result_to_dict(res: SubmitResult) -> dict[str, Any]:
@@ -146,10 +186,20 @@ class ToolHandlers:
         # Keyed by turn_id -> {tool_name: _DedupEntry}
         self._dedup: dict[str, dict[str, _DedupEntry]] = {}
         self._current_turn_id_var = contextvars.ContextVar("current_turn_id", default=None)
+        # B13: begin_turn on the voice path runs inside a pipecat event-handler task, whose
+        # ContextVar mutation does NOT propagate back to the context that later reads the latch
+        # (the STT handler's task copies the context; `asyncio.run` in the test does the same).
+        # A ContextVar alone (needed for concurrent-HTTP-turn isolation) leaves the voice latch
+        # inert. `_last_turn_id` is a plain attribute fallback: it survives the child-context exit
+        # and is unambiguous where it's consulted, because the fallback is ONLY reached when the
+        # reading context never set its own turn id — which is the single-flow voice case, not the
+        # concurrent-HTTP case (there every ingest_user_turn calls begin_turn in its own task, so
+        # the ContextVar wins and the shared attribute is never read).
+        self._last_turn_id: str | None = None
 
     @property
     def _current_turn_id(self) -> str | None:
-        return self._current_turn_id_var.get()
+        return self._current_turn_id_var.get() or self._last_turn_id
 
     @_current_turn_id.setter
     def _current_turn_id(self, val: str | None) -> None:
@@ -157,6 +207,7 @@ class ToolHandlers:
 
     def begin_turn(self, turn_id: str) -> None:
         self._current_turn_id = turn_id
+        self._last_turn_id = turn_id  # B13: cross-context fallback (see __init__)
         self._dedup[turn_id] = {}
         if len(self._dedup) > 64:
             oldest_key = next(iter(self._dedup))
@@ -234,6 +285,68 @@ class ToolHandlers:
         self._journal.record_tool_call("answer_kora", {"text": text}, {**result, "deduped": deduped})
         return result
 
+    async def _callback(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        result = callback(*args, **kwargs)
+        return await result if inspect.isawaitable(result) else result
+
+    async def propose_request(self, text: str) -> dict[str, Any]:
+        async def _do() -> dict[str, Any]:
+            if self.bridge.on_propose is None:
+                return {"outcome": "dispatcher_unavailable"}
+            result = await self._callback(self.bridge.on_propose, text)
+            return result if isinstance(result, dict) else {"outcome": "proposed"}
+
+        result, deduped = await self._guarded("propose_request", {"text": text}, _do)
+        self._journal.record_tool_call("propose_request", {"text": text}, {**result, "deduped": deduped})
+        return result
+
+    async def gate_action(
+        self, action: str, model: str | None = None, confirm: bool = False, fast: bool = False
+    ) -> dict[str, Any]:
+        async def _do() -> dict[str, Any]:
+            if self.bridge.on_gate is None:
+                return {"outcome": "dispatcher_unavailable"}
+            result = await self._callback(
+                self.bridge.on_gate, action, model=model, confirm=confirm, fast=fast
+            )
+            return result if isinstance(result, dict) else {"outcome": "gate_completed"}
+
+        args = {"action": action, "model": model, "confirm": confirm, "fast": fast}
+        result, deduped = await self._guarded("gate_action", args, _do)
+        self._journal.record_tool_call("gate_action", args, {**result, "deduped": deduped})
+        return result
+
+    async def bind_project(self, project_name: str) -> dict[str, Any]:
+        async def _do() -> dict[str, Any]:
+            if self.bridge.on_bind is None:
+                return {"outcome": "dispatcher_unavailable"}
+            if self.bridge.projects is None or self.bridge.threads is None or self.bridge.thread_id_for is None:
+                return {"outcome": "dispatcher_unavailable"}
+            thread_id = self.bridge.thread_id_for()
+            if thread_id is None:
+                return {"outcome": "no_active_thread"}
+            matches = [
+                p for p in self.bridge.projects.list()
+                if str(p.get("name", "")).casefold() == project_name.casefold()
+            ]
+            if not matches:
+                return {"outcome": "unknown_project"}
+            if len(matches) > 1:
+                return {"outcome": "ambiguous_project"}
+            project = matches[0]
+            if not self.bridge.threads.bind_project(thread_id, project["id"]):
+                return {"outcome": "project_bind_rejected"}
+            callback_result = await self._callback(self.bridge.on_bind, project["id"])
+            if isinstance(callback_result, dict):
+                return callback_result
+            return {"outcome": "project_bound", "project_id": project["id"]}
+
+        result, deduped = await self._guarded("bind_project", {"project_name": project_name}, _do)
+        self._journal.record_tool_call(
+            "bind_project", {"project_name": project_name}, {**result, "deduped": deduped}
+        )
+        return result
+
 
 def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
     """Wraps each pure handler as a pipecat function-call callback (S7: the result is
@@ -263,9 +376,24 @@ def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
         result = await handlers.answer_kora(**params.arguments)
         await params.result_callback(result)
 
+    async def _propose_request(params: FunctionCallParams) -> None:
+        result = await handlers.propose_request(**params.arguments)
+        await params.result_callback(result)
+
+    async def _gate_action(params: FunctionCallParams) -> None:
+        result = await handlers.gate_action(**params.arguments)
+        await params.result_callback(result)
+
+    async def _bind_project(params: FunctionCallParams) -> None:
+        result = await handlers.bind_project(**params.arguments)
+        await params.result_callback(result)
+
     llm_or_switcher.register_function("submit_task", _submit_task, cancel_on_interruption=False)
     llm_or_switcher.register_function("confirm_task", _confirm_task, cancel_on_interruption=False)
     llm_or_switcher.register_function("request_cancel", _request_cancel, cancel_on_interruption=False)
     # E5 (S5): barge-in must NOT drop the answer — losing it would strand Kora blocked forever.
     llm_or_switcher.register_function("answer_kora", _answer_kora, cancel_on_interruption=False)
+    llm_or_switcher.register_function("propose_request", _propose_request, cancel_on_interruption=False)
+    llm_or_switcher.register_function("gate_action", _gate_action, cancel_on_interruption=False)
+    llm_or_switcher.register_function("bind_project", _bind_project, cancel_on_interruption=False)
     llm_or_switcher.register_function("get_task_status", _get_task_status, cancel_on_interruption=True)

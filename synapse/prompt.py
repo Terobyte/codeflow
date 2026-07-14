@@ -60,6 +60,21 @@ OWED_RULE_9 = (
     "по-прежнему передавай через request_cancel, а вопрос о статусе — через get_task_status."
 )
 
+# UI-4: these blocks are appended after the non-negotiable dispatcher rules. They are only
+# supplied for the two conversational stages; a running/code/done thread must retain the
+# conservative base prompt rather than being invited to start another staged request.
+STAGE_RULES_COLLECT = """\n\nСТАДИЯ COLLECT — СБОР:
+Собирай контекст задачи и задавай уточняющие вопросы пачкой в одном ходе. Не больше двух
+раундов уточнений: когда свод достаточно точен, зачитай короткий свод и после явного «верно» вызови
+propose_request(text). Не запускай Кору и не обещай писать код на этой стадии."""
+
+STAGE_RULES_PROPOSE = """\n\nСТАДИЯ PROPOSE — ЗАПРОС ГОТОВ:
+Покажи и при необходимости исправь свод через propose_request(text). На явное «отправляй»
+вызови gate_action(action="send_to_kora", confirm=true). На просьбу «сразу код» сначала
+зачитай последствие: «точно пишем код в выбранном проекте?»; только после явного да вызови
+gate_action(action="send_to_kora", fast=true, confirm=true). Для правок вызови
+gate_action(action="revise")."""
+
 
 def _require_replace(text: str, anchor: str, replacement: str) -> str:
     """B6: anchor-insertion must FAIL LOUD, not silently drop the OWED safety rules. A plain
@@ -94,17 +109,19 @@ def _apply_owed_additions(base: str) -> str:
     return text
 
 
-def build_system_prompt(cfg: SynapseConfig, task_dictionary: dict[str, str] | None = None) -> str:
+def build_system_prompt(
+    cfg: SynapseConfig, task_dictionary: dict[str, str] | None = None, stage_block: str = ""
+) -> str:
     """PROMPT_V3 (+ OWED additions, gated by cfg.include_owed_prompt_rules) + the
     task-dictionary block (§4/Р-9)."""
     base = _apply_owed_additions(PROMPT_V3) if cfg.include_owed_prompt_rules else PROMPT_V3
-    if not task_dictionary:
-        return base
-    entries = "\n".join(f"- {k}: {v}" for k, v in task_dictionary.items())
-    dictionary_block = (
-        "\n\nСЛОВАРЬ ЗАДАЧИ:\n"
-        "Транскрипт может содержать ошибки распознавания; канонические имена — в словаре "
-        "задачи ниже; критичные детали пользователю озвучивает Кора.\n"
-        f"{entries}"
-    )
-    return base + dictionary_block
+    dictionary_block = ""
+    if task_dictionary:
+        entries = "\n".join(f"- {k}: {v}" for k, v in task_dictionary.items())
+        dictionary_block = (
+            "\n\nСЛОВАРЬ ЗАДАЧИ:\n"
+            "Транскрипт может содержать ошибки распознавания; канонические имена — в словаре "
+            "задачи ниже; критичные детали пользователю озвучивает Кора.\n"
+            f"{entries}"
+        )
+    return base + dictionary_block + stage_block

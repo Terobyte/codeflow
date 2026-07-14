@@ -33,9 +33,12 @@ def make_handlers(tmp_path):
     return handlers, store, journal, speaks
 
 
-def test_five_schemas_present_with_expected_shape():
+def test_stage_schemas_present_with_expected_shape():
     names = {s.name for s in ALL_SCHEMAS}
-    assert names == {"submit_task", "confirm_task", "get_task_status", "request_cancel", "answer_kora"}
+    assert names == {
+        "submit_task", "confirm_task", "get_task_status", "request_cancel", "answer_kora",
+        "propose_request", "gate_action", "bind_project",
+    }
     assert SUBMIT_TASK_SCHEMA.required == ["text"]
     assert CONFIRM_TASK_SCHEMA.properties["decision"]["enum"] == ["confirm", "deny"]
     assert GET_TASK_STATUS_SCHEMA.required == []
