@@ -98,10 +98,19 @@ class GenerationGuard:
         self._committed_contexts.pop(generation, None)
 
 
-def make_guarded_assistant_aggregator(base_cls: type, guard: GenerationGuard) -> type:
+def make_guarded_assistant_aggregator(
+    base_cls: type, guard: GenerationGuard, on_commit: Any = None
+) -> type:
     """Returns a subclass of pipecat's LLMAssistantAggregator (`base_cls`) that consults
     `guard` before committing a generation's text to the LLM context (race order a), and
     registers the commit with `guard` right after (so race order b can scrub it later).
+
+    `on_commit` (optional, no-arg callable): fired synchronously right after a generation's
+    text is committed to the live context — B25's hook so the dispatcher's just-spoken answer
+    reaches the thread feed AT COMMIT time (≤ next pollFeed), instead of one turn late (the
+    next `_on_end_of_turn`'s context-diff flush) or only on disconnect. The wired callback is
+    `_flush_voice_context` in app.py; its cursor makes a commit-time flush idempotent with the
+    later turn/disconnect flushes, so no feed entry is duplicated.
 
     An instance of the returned class is wired into the live pipeline in app.py (built via
     LLMContextAggregatorPair's own __init__ recipe, since the pair offers no subclass hook),
@@ -122,6 +131,14 @@ def make_guarded_assistant_aggregator(base_cls: type, guard: GenerationGuard) ->
             # so this call always runs too. That is what keeps commit(N) ordered strictly
             # before start_generation(N+1) in the tool-loop case (critique MAJOR-1).
             guard.record_committed(gen, self._context)
+            # B25: flush the just-committed answer to the thread feed now. Guarded on
+            # is_aborted(gen): if a failover marked this generation aborted around the commit
+            # (its text is/was scrubbed from the context), don't leak the retracted text to the
+            # feed. Race order (b) — abort STRICTLY after this point — is the residual rare
+            # window a later real answer's flush supersedes. Empty content is skipped inside the
+            # flusher, so a pure tool-call turn writes nothing.
+            if on_commit is not None and not guard.is_aborted(gen):
+                on_commit()
             return result
 
     return GuardedLLMAssistantAggregator

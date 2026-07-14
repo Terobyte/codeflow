@@ -87,16 +87,18 @@ def _make_runner(tmp_path):
 def test_b21_gate_deny_reason_does_not_leak_absolute_path(tmp_path):
     runner, ws = _make_runner(tmp_path)
 
-    # (a) out-of-workspace escape — the classic disclosure oracle. Gate v2 (A12'): probe is a
-    # MUTATING Write — reads outside the workspace are now allowed (except secrets), so Write
-    # is the tool that still trips the outside_workspace deny this invariant guards.
-    allowed, detail, category = runner._gate_decision("Write", {"file_path": "/etc/passwd"})
-    assert allowed is False
-    resolved = str(Path("/etc/passwd").resolve())  # macOS: /private/etc/passwd
+    # (a) out-of-workspace SECRET escape — the classic disclosure oracle. Gate v3 (B24): plain
+    # mutating writes outside the workspace are now ALLOWED, so the deny this invariant guards is
+    # the secret-path one, which fires everywhere incl. outside ws. The reason must still be a bare
+    # category token, never the resolved absolute path.
+    secret_outside = os.path.expanduser("~/.ssh/id_rsa")
+    allowed, detail, category = runner._gate_decision("Write", {"file_path": secret_outside})
+    assert allowed is False and category == "secret_path"
+    resolved = str(Path(secret_outside).resolve())
     reason = detail or ""
     # POST-FIX: the reason is a category token only, never the resolved absolute path.
     assert resolved not in reason, f"deny reason leaks the resolved path: {reason!r}"
-    assert "/etc/passwd" not in reason, f"deny reason leaks the target path: {reason!r}"
+    assert secret_outside not in reason, f"deny reason leaks the target path: {reason!r}"
 
     # (b) secret-path deny reason must not leak the resolved absolute path either.
     secret = str(ws / ".env")

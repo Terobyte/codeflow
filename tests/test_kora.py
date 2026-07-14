@@ -365,17 +365,26 @@ def test_gate_allows_inside_workspace(tmp_path):
     assert runner._gate_decision("Write", {"file_path": "rel/inside.txt"})[0] is True  # relative → cwd
 
 
-def test_gate_denies_sibling_directory(tmp_path):
+def test_gate_allows_sibling_directory_write_nonsecret(tmp_path):
+    # B24 (gate v3, «везде она может писать»): a Write to a non-secret sibling dir outside the
+    # workspace is now ALLOWED. /ws-evil is still NOT under /ws (the resolve()/is_relative_to check
+    # keeps it out of the in-workspace branch — startswith would leak it); it's the new
+    # mutating-outside allow that accepts it, while a secret there still denies (secret check runs
+    # BEFORE this branch).
     runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
-    sibling = ws.parent / (ws.name + "-evil") / "a.txt"  # /ws-evil is NOT under /ws (startswith would leak it)
+    sibling = ws.parent / (ws.name + "-evil") / "a.txt"
     allowed, _detail, category = runner._gate_decision("Write", {"file_path": str(sibling)})
-    assert allowed is False and category == "outside_workspace"
+    assert allowed is True and category == "allow"
+    secret_sibling = ws.parent / (ws.name + "-evil") / ".env"
+    a2, _d2, c2 = runner._gate_decision("Write", {"file_path": str(secret_sibling)})
+    assert a2 is False and c2 == "secret_path"
 
 
-def test_gate_denies_home_escape(tmp_path):
+def test_gate_allows_home_write_nonsecret(tmp_path):
+    # B24: Кора пишет где угодно на машине, кроме секретов — обычный файл в $HOME разрешён.
     runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
     allowed, _detail, category = runner._gate_decision("Write", {"file_path": os.path.expanduser("~/synapse_escape_probe.txt")})
-    assert allowed is False and category == "outside_workspace"
+    assert allowed is True and category == "allow"
 
 
 def test_gate_denies_missing_path_for_mutating_tool(tmp_path):
@@ -406,21 +415,24 @@ def test_gate_denies_unknown_non_file_tools(tmp_path):
     assert allowed is False and category == "non_file_tool"
 
 
-def test_gate_allows_read_outside_workspace_but_not_secret(tmp_path):
-    # Gate v2 A2': читающие инструменты ходят по всей машине, кроме секретов; мутирующие —
-    # workspace-only, как раньше (A3').
+def test_gate_allows_read_and_write_outside_workspace_but_not_secret(tmp_path):
+    # Gate v3 (B24): и читающие, И мутирующие инструменты ходят по всей машине, кроме секретов
+    # (per-path secret-чек ДО allow). До B24 запись вне ws была outside_workspace-deny (A3').
     runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     (outside / "notes.txt").write_text("x", encoding="utf-8")
     allowed, _detail, category = runner._gate_decision("Read", {"file_path": str(outside / "notes.txt")})
     assert allowed is True and category == "allow"
-    # секрет вне workspace — по-прежнему deny (per-path чек ДО allow)
+    # секрет вне workspace (чтение) — по-прежнему deny
     allowed2, _d2, category2 = runner._gate_decision("Read", {"file_path": str(outside / ".env")})
     assert allowed2 is False and category2 == "secret_path"
-    # мутирующий вне workspace — deny без изменений
+    # мутирующий вне workspace — теперь ALLOW (B24)
     allowed3, _d3, category3 = runner._gate_decision("Write", {"file_path": str(outside / "notes.txt")})
-    assert allowed3 is False and category3 == "outside_workspace"
+    assert allowed3 is True and category3 == "allow"
+    # …но секрет вне workspace мутирующим — по-прежнему deny (secret-чек ДО allow)
+    allowed4, _d4, category4 = runner._gate_decision("Write", {"file_path": str(outside / ".env")})
+    assert allowed4 is False and category4 == "secret_path"
 
 
 def test_gate_pathless_read_stays_missing_path_deny(tmp_path):
@@ -533,14 +545,16 @@ async def test_pretool_hook_deny_carries_reason(tmp_path):
 
 async def test_gate_journals_explicit_deny_categories(tmp_path):
     runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
-    sibling = ws.parent / (ws.name + "-evil") / "a.txt"
+    # B24: a plain Write outside the workspace is now ALLOWED, so the mutating deny that still
+    # fires everywhere is the secret-path one (a secret file outside ws written by Write).
+    secret_outside = ws.parent / (ws.name + "-evil") / ".env"
     cases = [
         (("Read", {"file_path": str(ws / ".env")}), "secret_path"),
         (("WebSearch", {"query": "x"}), "egress"),  # gate v2 A1': Bash больше не deny-кейс
         (("WebFetch", {"url": "http://example.com"}), "egress"),
         (("Task", {"description": "x"}), "non_file_tool"),
         (("Write", {}), "missing_path"),
-        (("Write", {"file_path": str(sibling)}), "outside_workspace"),
+        (("Write", {"file_path": str(secret_outside)}), "secret_path"),
     ]
     for (tool, inp), _expected in cases:
         assert await _decision(runner, tool, inp) == "deny"

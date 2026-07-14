@@ -836,7 +836,9 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     # ТОЛЬКО assistant со строковым контентом: user-транскрипт пишет D1' напрямую из параметра
     # (не дублируем), role tool/system отфильтрованы. Aggregator сидит downstream TTS →
     # контекст = реально СКАЗАННОЕ (интеррапты уже обработаны pipecat). Зовётся из
-    # _on_end_of_turn (ответ предыдущего хода) и on_client_disconnected (последний ответ).
+    # _on_end_of_turn (ответ предыдущего хода), on_client_disconnected (последний ответ) и —
+    # B25 — из guarded-агрегатора СРАЗУ по коммиту ответа (on_commit), чтобы ответ появлялся в
+    # ленте в тот же момент, а не ходом позже. Курсор делает все три вызова идемпотентными.
     # NO-EXFIL не задет: в ленту идут только слова диспетчера, кора-виды в контексте не живут.
     _voice_cursor = {"n": 0}
 
@@ -862,7 +864,9 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     # always builds a plain LLMAssistantAggregator internally with no hook to substitute a
     # subclass.
     user_aggregator = LLMUserAggregator(context)
-    GuardedAssistantAggregator = make_guarded_assistant_aggregator(LLMAssistantAggregator, generation_guard)
+    GuardedAssistantAggregator = make_guarded_assistant_aggregator(
+        LLMAssistantAggregator, generation_guard, on_commit=_flush_voice_context
+    )
     assistant_aggregator = GuardedAssistantAggregator(context, _paired_user_aggregator=user_aggregator)
 
     # Two GenerationStartHooks, not one, around llm_switcher (research §2.2): a user turn's

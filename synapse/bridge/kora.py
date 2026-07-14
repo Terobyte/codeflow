@@ -577,14 +577,17 @@ class KoraRunner:
     def _system_prompt(self, workspace: Path, task_text: str) -> str:
         # LOAD-BEARING (§2d CASE 1): with setting_sources=[] Kora does not otherwise know its
         # cwd and will invent paths the gate then (correctly) denies — naming the workspace is
-        # what made the live smoke succeed. Gate v2 (A10'): текст соответствует новому гейту —
-        # Bash и чтение по всей машине открыты, запись файловыми инструментами workspace-only.
+        # what made the live smoke succeed. Gate v3 (B24, приказ Теро «везде она может писать»):
+        # текст соответствует новому гейту — Bash, чтение И запись открыты по всей машине, кроме
+        # секретных; дефолт для безымянного пути — workspace. (До B24 промпт говорил «писать только
+        # в workspace» и Кора ОТКАЗЫВАЛАСЬ от задачи на столе, даже не вызвав Write — staging 12:50.)
         return (
             f"Ты — Кора, исполнитель задач Синапса. Твоя рабочая директория: {workspace}. "
             f"Bash разрешён (рабочая директория — {workspace}); читать файлы можно по всей "
-            f"машине, кроме секретных. Создавать и изменять файлы можно только внутри "
-            f"{workspace} — инструментами Write/Edit. Секреты (.env, ключи, ~/.ssh) закрыты, "
-            f"в том числе через shell. Задача пользователя: {task_text}"
+            f"машине, кроме секретных. Создавать и изменять файлы можно где угодно на машине, "
+            f"кроме секретных — инструментами Write/Edit/NotebookEdit; если пользователь не назвал "
+            f"путь, пиши в {workspace}. Секреты (.env, ключи, ~/.ssh) закрыты, в том числе через "
+            f"shell. Задача пользователя: {task_text}"
         )
 
     def _build_options(self, task_id: str, text: str) -> Any:
@@ -619,12 +622,13 @@ class KoraRunner:
         """Pure containment decision (RISK-M6; gate v2 A1'-A8'). Returns
         (allowed, detail, category) — an EXPLICIT category, never string-parsed by the caller.
 
-        Политика gate v2 (заказ Теро: «Bash разрешить; чтение — везде кроме секретов; запись
-        файловыми инструментами — только workspace»):
+        Политика gate v3 (B24, заказ Теро: «Bash разрешить; чтение И запись — везде кроме
+        секретов»):
         - Bash → allow (кроме docs_only-режима и лексического секрет-скана команды);
         - читающие Read/Glob/Grep/LS с путём → allow ЛЮБОЙ путь, кроме секретного; каталог
           внутри ws — полный subtree-скан (B16), вне ws — bounded-скан (depth/cap, best-effort);
-        - мутирующие Write/Edit/NotebookEdit → без изменений: workspace-only + docs_only + секреты;
+        - мутирующие Write/Edit/NotebookEdit → allow ЛЮБОЙ путь, кроме секретного (B24); в
+          docs_only-режиме сужены до <ws>/docs/ (top-level .md корня) — вне = docs_only_violation;
         - WebFetch/WebSearch и прочие non-file → deny.
 
         Полный контракт категорий (A9'):
@@ -633,7 +637,8 @@ class KoraRunner:
           allow_egress        — Bash (detail = command[:200], попадает в журнал gate_allow);
           secret_path         — секретный путь/поддерево с секретом/секрет-токен в Bash-команде
                                 (detail category-only — B21, не светить resolved путь агенту);
-          outside_workspace   — МУТИРУЮЩИЙ инструмент вне workspace;
+          outside_workspace   — файловый инструмент вне workspace, не покрытый read/mutate веткой
+                                (defensive fallback; после B24 мутирующие вне ws разрешены);
           docs_only_violation — мутирующий вне docs-дерева ИЛИ Bash при gate_mode=docs_only (A6');
           missing_path        — файловый инструмент без пути (включая pathless Read — только
                                 Glob/Grep/LS умеют дефолт-к-cwd);
@@ -723,6 +728,15 @@ class KoraRunner:
             if (tool_name in _READ_SEARCH_TOOLS and resolved.is_dir()
                     and _bounded_subtree_has_secret(resolved)):
                 return False, "secret_path", "secret_path"
+            return True, str(resolved), "allow"
+        # B24 (gate v3, приказ Теро «везде она может писать»): мутирующие инструменты разрешены и
+        # ВНЕ workspace — секрет-чек выше (_is_secret_path на полном resolved-пути) уже отсёк любой
+        # секретный путь, симметрично чтению. docs_only-ран по-прежнему держит запись в <ws>/docs/
+        # (доки живут ВНУТРИ workspace, эта ветка — уже вне ws) → любой путь здесь в docs_only =
+        # docs_only_violation. Bash в docs_only закрыт отдельно выше (A6').
+        if tool_name in _MUTATING_FILE_TOOLS:
+            if self._current_gate_mode() == "docs_only":
+                return False, "docs_only_violation", "docs_only_violation"
             return True, str(resolved), "allow"
         return False, "outside_workspace", "outside_workspace"
 

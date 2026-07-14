@@ -1,33 +1,26 @@
-"""B25 regression (red) — dispatcher answer must reach the thread feed at answer-COMMIT,
-not one turn late / only on disconnect.
+"""B25 regression — dispatcher answer must reach the thread feed at answer-COMMIT, not one turn
+late / only on disconnect. Formerly a RED xfail-strict repro; the B25 fix (2026-07-14) turned it
+GREEN and the marker was removed.
 
-Root cause (docs/bugs.md B25): `_flush_voice_context` (synapse/pipeline/app.py:843-858) is
-event-wise attached to the START of the NEXT `_on_end_of_turn` (context diff) and to
-`flush_voice_feed` on disconnect — never to the moment the answer is committed. pipecat's
-`LLMAssistantAggregator.push_aggregation` (llm_response_universal.py:1595-1612) puts
+Root cause (docs/bugs.md B25): `_flush_voice_context` was event-wise attached only to the START
+of the NEXT `_on_end_of_turn` (context diff) and to `flush_voice_feed` on disconnect — never to
+the moment the answer is committed. pipecat's `LLMAssistantAggregator.push_aggregation` puts
 `{"role":"assistant","content":<str>}` into the live context exactly when the answer is fully
-spoken (the aggregator sits downstream of TTS), but our code does not listen to that event.
+spoken (the aggregator sits downstream of TTS). The fix adds a post-commit `on_commit` callback
+to GuardedAssistantAggregator that calls `_flush_voice_context` right there.
 
 This test drives the REAL guarded assistant aggregator to a commit — the same code path prod
-uses — WITHOUT a following user turn and WITHOUT `flush_voice_feed()`, then asserts the answer
-is already in the thread feed. Today it is not (the flusher never ran), so the final assert
-reds. The B25 fix (post-commit callback in GuardedAssistantAggregator → `_flush_voice_context`)
-flips it green.
+uses — WITHOUT a following user turn and WITHOUT `flush_voice_feed()`, then asserts the answer is
+already in the thread feed at commit time.
 
 Reuses the harness in test_live_to_chat.py (`_voice_host_or_skip`, `_context_of`): real
 build_host + build_session_pipeline, real STT/handler, one shared live LLMContext.
 """
 from __future__ import annotations
 
-import pytest
-
 from test_live_to_chat import _context_of, _voice_host_or_skip
 
 
-@pytest.mark.xfail(
-    reason="B25: dispatcher answer must reach thread feed at answer-commit, not next turn/disconnect",
-    strict=True,
-)
 async def test_dispatcher_answer_reaches_feed_at_commit(tmp_path):
     # importorskip lives in _voice_host_or_skip; import pipecat symbols only after it ran.
     from pipecat.processors.aggregators.llm_response_universal import (

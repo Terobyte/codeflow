@@ -269,6 +269,21 @@ class TaskStore:
         # No-task+awaiting stays OK (transient set_awaiting window, see test_answer_kora §4).
         if self._awaiting_answer and (self._task is None or self._task.status == TaskStatus.RUNNING):
             return Liveness.OK
+        # B23: a genuinely COMPLETED task means Кора finished and stopped emitting heartbeats —
+        # the ever-growing age of the last event is NOT a liveness signal, so report OK. Otherwise
+        # the dispatcher says «Кора не в сети» / refuses to dispatch after a completed task
+        # (staging 2026-07-14: STALE/UNREACHABLE alerts fired at 12:52/12:55 AFTER task_completed
+        # at 12:50). This mirrors _status_color's R2 treatment (COMPLETED beats a stale liveness),
+        # moved into liveness() so the dispatcher path sees the same truth.
+        # COMPLETED only, NOT FAILED: a task is set FAILED both genuinely (a Kora task_failed) AND
+        # by the S13 zombie-reconcile on boot (RUNNING-at-crash → FAILED, _load), and those two are
+        # indistinguishable from status alone — collapsing FAILED→OK here would make a dead-runner
+        # restart falsely report OK and break R6 (test_persistence_roundtrip_...). A zombie only
+        # ever lands on FAILED, never COMPLETED, so COMPLETED→OK is unconditionally safe. The
+        # residual (a genuinely-failed idle task still ages into UNREACHABLE) is parked as a design
+        # tension in bugs.md — it needs a distinct zombie marker to split the two FAILED sources.
+        if self._task is not None and self._task.status == TaskStatus.COMPLETED:
+            return Liveness.OK
         if self._last_event_ts is None:
             return Liveness.OK
         age = now - self._last_event_ts

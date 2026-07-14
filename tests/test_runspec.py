@@ -54,9 +54,12 @@ async def test_runspec_project_root_reaches_cwd_prompt_and_gate(tmp_path):
     assert opts.cwd == resolved                      # голова 1: cwd опций
     assert resolved in opts.system_prompt            # голова 2: путь в ТЕКСТЕ промпта
     allowed, _, _ = captured["gate_in_project"]
-    assert allowed                                   # голова 3: гейт-клетка = проект
-    denied, _, cat = captured["gate_in_default_ws"]
-    assert not denied and cat == "outside_workspace" # дефолт-воркспейс теперь ЧУЖОЙ
+    assert allowed                                   # голова 3: запись в проект разрешена
+    # B24 (gate v3): запись ВНЕ корня проекта больше НЕ deny — Кора пишет где угодно, кроме
+    # секретов, гейт-клетка не фенсит запись. Проект остаётся ДЕФОЛТОМ через cwd (голова 1) и
+    # текст промпта (голова 2), а не через запрет на выход.
+    allowed2, _, cat = captured["gate_in_default_ws"]
+    assert allowed2 and cat == "allow"
 
 
 async def test_runspec_none_project_root_falls_back_to_default_workspace(tmp_path):
