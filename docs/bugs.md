@@ -234,3 +234,68 @@ Proof (test node id per bug — B15's is xfail'd, the rest flip green after thei
 - `synapse/pipeline/webrtc_server.py:594-597` — delete-project removes the project then unbinds threads; a crash between leaves a dangling `project_id` (harmless: `_resolve_root_for` falls back). Order is backwards for crash-safety. — H4
 - `synapse/pipeline/webrtc_server.py:289-303` — trickle-ICE PATCH offer routes return `{"status":"success"}` without validating the session id (unlike the POST offer route that 404s); unproven (pipecat-internal drop behaviour). — H3
 - `synapse/journal.py:144-154` — `record_kora_event`'s `_write` has no `OSError` guard (unlike `alert`); a disk-full during a healthy Kora event would terminalize a genuinely-healthy task via the `_run` broad except. Timing-dependent, unproven. — H3
+
+---
+
+## Gate v2 residuals (tero run 2026-07-14-gate-v2-access, accepted by user)
+
+- **Bash is not path-gateable** — MAJOR/accepted: gate v2 opens Bash for Kora ("читать везде, писать в проект" — user order). A shell can `cat` any readable file (incl. secrets past the lexical token scan) and reach the network. Mitigations shipped: lexical secret-token scan of every command (deny `secret_path`), full command journaled on every gate_allow (audit trail), Bash fully denied in docs_only mode. Risk stated to user once and accepted.
+- **Bash-Kora can curl its own control plane** (P9) — MAJOR/accepted: with egress open, Kora can POST to `localhost:786x/api/*` (e.g. approve her own gate via `/api/threads/{id}/gate` — Kora-approves-Kora). localhost is NOT blocked (would break legit local tooling). Real fix is auth on /api/* beyond CSRF — parked P9, revisit before any non-tailnet exposure.
+
+---
+
+## 2026-07-14 — сбор проблем (live-тест Теро на staging :7861, НЕ чинить без отмашки; улики: /tmp/synapse-staging-7861/session-1784047140289.jsonl + threads/15e761850a89.feed.jsonl; run file ~/.claude/tero/runs/2026-07-14-gate-v3-write-liveness.md)
+
+### B23 — idle-Кора репортится как UNREACHABLE: liveness меряет возраст последнего события безусловно — MAJOR — open
+- class: state/liveness false-positive · location: `synapse/bridge/state.py:263-279` (потребители: `synapse/pipeline/app.py:260-266` monitor-алерт; `render_state`/`render_state_template` → промпт диспетчера, CANON_PHRASE «Кора не в сети — давно нет сигнала»; snapshot → get_task_status/kora-status)
+- symptom: `liveness()` возвращает STALE/UNREACHABLE по `now - _last_event_ts` даже когда задачи НЕТ или она давно COMPLETED/FAILED. Кора здорова и просто простаивает ≥120с/≥300с → диспетчер говорит «Кора не в сети», отказывается диспатчить новую задачу и предлагает «выключить старую» (которая давно completed). `_last_event_ts` персистится в state.json → свежая голосовая сессия наследует «просрочку» вчерашней задачи и стартует сразу с unreachable.
+- trigger: любой звонок после ≥5 минут простоя Коры. Live-repro 12:46: алерт `{"liveness":"unreachable"}` в 12:46:10 ДО task_started; после task_completed (12:50:36) снова stale (12:52:40) и unreachable (12:55:40).
+- expected vs actual: staleness — свойство ОЖИДАЕМОГО сигнала: без активной задачи (RUNNING/PENDING_CONFIRMATION/CANCEL_REQUESTED) Кора idle = OK · actual: idle = unreachable, диспетчер блокирует работу и врёт пользователю.
+- root cause: нет гейта на статус задачи перед возрастной проверкой; R6-персист (нужный для «рестарт при мёртвой Коре mid-task → stale сразу») усугубляет — часы наследуются между сессиями.
+- fix sketch: в `liveness()` после `_awaiting_answer`-ветки: task None или terminal → OK; остальное как есть. R6 сохраняется (mid-task рестарт восстанавливает RUNNING).
+
+### B24 — Кора отказывается создавать файлы вне workspace (рабочий стол) — политика v2 уже, чем хочет владелец — MAJOR/policy — open
+- class: policy/UX · location: `synapse/bridge/kora.py` — `_gate_decision` (Write/Edit/NotebookEdit вне ws → deny `outside_workspace`) + `_system_prompt` («Создавать и изменять файлы можно только внутри {workspace}»)
+- symptom: «создай helloworld.txt на рабочем столе» → Кора отказывается, даже tool не зовёт (журнал 12:50: 1 ход, ноль tool_use — остановил промпт). Формально это НЕ баг: работает политика «писать в проект», выбранная Теро в gate v2. Но 2026-07-14 Теро приказал расширить: **«везде она может писать»**.
+- expected (новый приказ) vs actual: Write/Edit/NotebookEdit разрешены везде, кроме секретных путей (симметрично чтению), docs_only-режим сохраняется; промпт: писать можно везде кроме секретов, дефолт-директория — workspace/папка проекта, если путь не назван · actual: запись только в workspace.
+- fix sketch: гейт v3 — убрать outside_workspace-deny для write-инструментов, секрет-чек (`_is_secret_path` по всем компонентам, включая файл ВНУТРИ секретной папки: ~/.ssh/new_key) оставить; переписать абзац промпта; перепин tests/test_kora, test_gate_v2, test_bughunt_w3 B21-проба (Write /etc/passwd → сменить на секретный путь, инвариант «deny detail без пути» сохранить).
+
+### B25 — ответы диспетчера попадают в ленту треда с лагом в целый ход; последний — только после «Завершить» — MAJOR — open
+- class: UX/data-flow lag · location: `synapse/pipeline/app.py:813` (единственные вызовы `_flush_voice_context`: начало СЛЕДУЮЩЕГО `_on_end_of_turn` + `flush_voice_feed` на disconnect), флашер :843-858
+- symptom: в чате звонка реплики пользователя появляются сразу (D1' пишет транскрипт напрямую), а ответы диспетчера — только когда пользователь скажет СЛЕДУЮЩУЮ фразу (диффом контекста), последний ответ — только на disconnect. В live-виде треда выглядит как «его ответы просто войсом, а текста нет» (жалоба Теро 2026-07-14). Данные при этом НЕ теряются — лента на диске полная, задним числом.
+- trigger: любой звонок; открыть тред во время звонка (SPA это позволяет) или посмотреть чат сразу после ответа.
+- expected vs actual: ответ диспетчера в ленте через ≤3с после произнесения (интервал pollFeed) · actual: лаг до бесконечности (пока нет следующей реплики).
+- root cause: флашер событийно не привязан к commit ответа; pipecat `LLMAssistantAggregator.push_aggregation` (llm_response_universal.py:1595-1612) кладёт `{"role":"assistant","content":<str>}` в контекст ровно в момент, когда ответ сказан (агрегатор downstream TTS) — но наш код это событие не слушает.
+- fix sketch: post-commit колбэк в `GuardedAssistantAggregator` (make_guarded_assistant_aggregator): после `push_aggregation()` звать `_flush_voice_context`. Курсорный дифф уже идемпотентен.
+
+### B26 — completion-SPEAK озвучивает «Задача выполнена», даже когда Кора ОТКАЗАЛАСЬ выполнять — MINOR (grounding, родня B13) — open
+- class: grounding/misleading narration · location: completion-SPEAK темплейт из task_text (NO-EXFIL backstop, слайс 4)
+- symptom: 12:50 Кора ответила отказом («Не могу выполнить эту задачу…») и завершила сессию без единого tool_use → task_completed → голос: «Задача выполнена: Создай файл helloworld.txt на рабочем столе». Пользователь слышит успех при фактическом отказе.
+- expected vs actual: терминальная озвучка не должна утверждать успех, который не подтверждён · actual: темплейт «Задача выполнена: <task_text>» на любой task_completed.
+- note: темплейт из task_text — сознательный NO-EXFIL-бэкстоп (текст Коры в SPEAK не идёт); фикс должен не сломать этот инвариант (например, нейтральное «Кора завершила работу над задачей: …»).
+
+### B27 — одна Кора на всю систему: параллельные задачи невозможны — LIMITATION (by design v1) — open
+- class: design limitation · location: хост-синглтон (слайс 0), `TaskStore` §1 «одна активная задача»
+- symptom: Теро: «значит у нас только одна кора есть почему так». Вторая задача при живой первой невозможна; при зависшей — только cancel и заново.
+- note: v1-скоуп срезан сознательно (M1-спека). Пул/очередь Кор — проектировать отдельно (M1.1), затрагивает TaskStore-инвариант, роутинг диспетчера, ленты тредов, gate-стейджи.
+
+### B28 — во время звонка на экране нет текста ответов диспетчера (live-оверлей показывает только статус) — MINOR/UX — open
+- class: UX gap · location: `synapse/pipeline/client/app.js:760-777` (live-overlay: только «Диспетчер слушает…/отвечает» + wave-бары)
+- symptom: «текст не появляется на экране от диспетчера» — в голосовом оверлее нет live-captions; текст ответа виден только в треде (и то с лагом — B25).
+- fix sketch: после B25 (мгновенный флаш) оверлею достаточно поллить ленту войс-треда и показывать последнюю assistant-запись; либо RTVI bot-transcript события из pipecat.
+
+### B29 — диспетчер на мета-вопросы отвечает не по делу («Я всего лишь диспетчер и нахожусь здесь, у вас на линии») — MINOR (prompt quality, родня P10) — open
+- class: prompt/anti-hallucination · location: `synapse/prompt.py` (системный промпт диспетчера)
+- symptom: на «Почему не знаешь?» / «В смысле диспетчер?» — бессодержательные ответы; диспетчер не умеет объяснить, кто он и что происходит (например, почему Кора «не в сети» — см. B23).
+- note: P10 (ревизия анти-галлюцинационного промпта) уже в парковке gate-v2 рана; этот кейс — конкретный репро туда.
+
+### Доказательства (bughunt PROVE 2026-07-14, 2 соннет-тест-райтера, непересекающиеся файлы; фиксов НЕТ — приказ «чинить не будем»)
+Каждый xfail(strict=True) краснеет на СВОЁМ ассерте под `--runxfail` ровно по documented expected-vs-actual; инвариант-компаньоны зелёные сейчас и обязаны пережить будущий фикс. Полная суита: **545 passed + 5 xfailed** (4 новых + доживший B15), additive, без collection-коллизий. Когда баг починят — strict-xfail станет xpass и громко уронит суиту (напоминание снять маркер, паттерн «regression armour» B15).
+- **B23** → `tests/test_bugs_0714_bridge.py::test_B23_completed_task_idle_is_ok_not_unreachable` + `::test_B23_failed_task_idle_is_ok_not_unreachable` (idle terminal-задача → liveness даёт UNREACHABLE вместо OK). R6-инвариант ЗЕЛЁНЫЙ: `::test_B23_running_task_stale_signal_stays_unreachable` (мёртвая Кора mid-task обязана остаться UNREACHABLE — фикс не имеет права её замолчать).
+- **B24** → `tests/test_bugs_0714_bridge.py::test_B24_write_outside_workspace_nonsecret_is_allowed` (Write в несекретный путь вне workspace → deny `outside_workspace`, желаемое allow). Security-инвариант ЗЕЛЁНЫЙ: `::test_B24_write_to_secret_path_stays_denied` (Write в `secrets.yaml` остаётся `secret_path`-deny — симметрия чтению обязана уцелеть).
+- **B25** → `tests/test_bugs_0714_voiceflush.py::test_dispatcher_answer_reaches_feed_at_commit` (драйвит РЕАЛЬНЫЙ `GuardedLLMAssistantAggregator.push_aggregation()` → `_context.add_message`; на момент commit'а лента держит только `['user']`, ответ диспетчера отсутствует). Фикс зацепит post-commit-колбэк на тот же `push_aggregation`, и тест позеленеет.
+- **B26 / B27 / B28 / B29 — `not-test-verifiable`** (тестом не покрыты, обоснование):
+  - B26 (completion-SPEAK «Задача выполнена» при отказе Коры) — «правильная» озвучка не определена (grounding-суждение, родня B13); юнит зафиксировал бы произвольную формулировку. Ручная проверка: задача-отказ → слушать терминальную SPEAK.
+  - B27 (одна Кора) — by-design v1-синглтон, уже пинится `tests/test_host_singleton.py`; «баг»-теста нет, это M1.1-скоуп.
+  - B28 (нет live-captions в голосовом оверлее) — JS-оверлей `app.js`, не юнит-тестируемо осмысленно; проверять глазами в браузере во время звонка.
+  - B29 (мета-ответы диспетчера) — качество промпта, требует LLM-суждения, не детерминированный ассерт; репро для парковки P10.
