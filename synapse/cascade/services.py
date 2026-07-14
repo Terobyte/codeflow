@@ -32,8 +32,11 @@ class TierLabel:
 
 
 def build_tier_services(cfg: SynapseConfig) -> tuple[list, list[TierLabel]]:
-    tier1 = OpenRouterLLMService(api_key=cfg.openrouter_api_key, model=cfg.tier1_model)
-    tier2 = AnthropicLLMService(api_key=cfg.anthropic_api_key or "unset", model=cfg.tier2_model)
+    # B-CORE-17: model= депрекейтнут pipecat 0.0.105 в пользу settings=…Settings(model=…)
+    tier1 = OpenRouterLLMService(api_key=cfg.openrouter_api_key,
+                                 settings=OpenRouterLLMService.Settings(model=cfg.tier1_model))
+    tier2 = AnthropicLLMService(api_key=cfg.anthropic_api_key or "unset",
+                                settings=AnthropicLLMService.Settings(model=cfg.tier2_model))
     services = [tier1, tier2]
 
     # connect=5.0 kept at the SDK default explicitly -- a bare `httpx.Timeout(N)` would also

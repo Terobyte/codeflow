@@ -433,7 +433,11 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
             {"reason": reason},
         )
 
-    stt = DeepgramFluxSTTService(api_key=host.cfg.deepgram_api_key or "", model="flux-general-multi")
+    # B-CORE-17: model= депрекейтнут pipecat 0.0.105 → settings=…Settings(model=…)
+    stt = DeepgramFluxSTTService(
+        api_key=host.cfg.deepgram_api_key or "",
+        settings=DeepgramFluxSTTService.Settings(model="flux-general-multi"),
+    )
 
     @stt.event_handler("on_end_of_turn")
     async def _on_end_of_turn(service, transcript: str) -> None:

@@ -9,14 +9,23 @@ const COLORS = { green: "#2ecc71", yellow: "#f1c40f", red: "#e74c3c" };
 const KIND_ICONS = { task: "▶", text: "💬", thinking: "🧠", tool_use: "🔧",
                      tool_result: "·", result: "🏁", system: "⚙", user: "🗣", assistant: "🤖" };
 
+const FETCH_TIMEOUT_MS = 15000;
 async function getJSON(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(url + " → " + res.status);
-  return res.json();
+  // B-CORE-2: AbortController + таймаут — «молчащий» сервер не оставит промис висеть навсегда.
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+    if (!res.ok) throw new Error(url + " → " + res.status);
+    return await res.json();
+  } finally { clearTimeout(timeout); }
 }
 function postJSON(url, body) {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS); // B-CORE-2
   return fetch(url, { method: "POST", headers: { "content-type": "application/json" },
-                      body: JSON.stringify(body) });
+                      body: JSON.stringify(body), signal: ctrl.signal })
+    .finally(() => clearTimeout(timeout));
 }
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -40,8 +49,25 @@ function route() {
 
 let threads = [];
 let projects = [];
-let feedThread = null; // чей фид сейчас в DOM
-let feedCount = 0;     // сколько записей уже отрендерено (инкрементальный append)
+let feedThread = null;          // чей фид сейчас в DOM
+const renderedKeys = new Set();     // подписи уже отрисованных записей — курсор по КОНТЕНТУ, а не по
+                                // индексу окна: скользящее ?limit=500 больше не «замерзает» после
+                                // 500 записей (B-CORE-3) и поздний параллельный полл не плодит
+                                // дубли (B-CORE-7).
+let feedInFlight = false;       // сериализуем параллельные pollFeed (B-CORE-7)
+let listsLoaded = false;        // первая успешная загрузка списков состоялась (B-CORE-9)
+let lastActiveThread = "";      // дедуп POST /api/active-thread (B-CORE-13)
+const LOAD_ERR = "нет связи с сервером — тяну снова…";
+
+// единый форматтер исхода (B-CORE-14): бейдж и карточка треда больше не расходятся в значках
+const OUTCOME = {
+  failed: { icon: "✖", text: "✖ ошибка", bad: true },
+  cancelled: { icon: "⏹", text: "⏹ отменено", bad: false },
+  completed: { icon: "✓", text: "✓ готово", bad: false },
+};
+function outcomeLabel(outcome) { return OUTCOME[outcome] || null; }
+
+function feedKey(e) { return (e.ts || 0) + "|" + (e.kind || "") + "|" + (e.text || ""); }
 
 // ---------- активный проект: дом рожает треды-ветки в нём ----------
 // Персистится в localStorage; валидируется против загруженного списка — удалённый
@@ -74,7 +100,7 @@ function render() {
     renderBadge(t);
     if (feedThread !== r.id) {
       feedThread = r.id;
-      feedCount = 0;
+      renderedKeys.clear();
       $("feed-list").replaceChildren();
     }
     pollFeed();
@@ -85,10 +111,16 @@ function render() {
     feedThread = null;
   }
   // Голос адресуется открытому треду; дом = авто-тред диспетчера в активном проекте.
-  postJSON("/api/active-thread", {
-    id: r.view === "thread" ? r.id : null,
-    project_id: r.view === "home" ? activeProject : null,
-  }).catch(() => {});
+  // B-CORE-13: не спамим active-thread на каждый ре-рендер — шлём только при смене цели.
+  const activeThreadKey = (r.view === "thread" ? r.id : "") + "|" +
+    (r.view === "home" ? (activeProject || "") : "");
+  if (activeThreadKey !== lastActiveThread) {
+    lastActiveThread = activeThreadKey;
+    postJSON("/api/active-thread", {
+      id: r.view === "thread" ? r.id : null,
+      project_id: r.view === "home" ? activeProject : null,
+    }).catch(() => {});
+  }
   renderChip(r);
   renderSidebar();
   renderHome();
@@ -97,10 +129,11 @@ window.addEventListener("hashchange", render);
 
 function renderBadge(t) {
   const b = $("thread-badge");
-  if (!t || !t.last_outcome) { b.hidden = true; return; }
-  b.textContent = t.last_outcome === "failed" ? "✖ ошибка"
-    : t.last_outcome === "cancelled" ? "⏹ отменено" : "✓ готово";
-  b.className = t.last_outcome === "failed" ? "bad" : "";
+  const o = outcomeLabel(t && t.last_outcome);
+  // running/queued/неизвестный исход больше не рисуются как «✓ готово» — бейдж просто скрыт.
+  if (!o) { b.hidden = true; return; }
+  b.textContent = o.text;
+  b.className = o.bad ? "bad" : "";
   b.hidden = false;
 }
 
@@ -108,8 +141,8 @@ function renderBadge(t) {
 function threadCard(t, cur, showProj) {
   const a = el("a", "thread-card" + (cur.view === "thread" && cur.id === t.id ? " active" : ""));
   a.href = "#/thread/" + encodeURIComponent(t.id);
-  const badge = t.last_outcome === "failed" ? "✖ " : t.last_outcome === "completed" ? "✓ " : "";
-  a.appendChild(el("span", "tc-title", badge + t.title));
+  const o = outcomeLabel(t.last_outcome);
+  a.appendChild(el("span", "tc-title", (o ? o.icon + " " : "") + t.title));
   const proj = showProj ? projects.find((p) => p.id === t.project_id) : null;
   a.appendChild(el("span", "tc-meta", relTime(t.updated_ts) + (proj ? " · " + proj.name : "")));
   return a;
@@ -160,8 +193,7 @@ function renderChip(r) {
 }
 $("proj-chip").addEventListener("click", () => {
   // тап по чипу ведёт к списку проектов — выбор делается тапом по строке проекта
-  $("shell").classList.add("drawer-open");
-  $("backdrop").hidden = false;
+  openDrawer();
 });
 
 function renderHome() {
@@ -181,7 +213,13 @@ async function loadLists() {
     const [tData, pData] = await Promise.all([getJSON("/api/threads"), getJSON("/api/projects")]);
     threads = tData.threads;
     projects = pData.projects;
-  } catch { return; } // сеть упала — оставляем прошлый рендер, не гадаем
+    // B-CORE-9: первая удачная загрузка снимает баннер «нет связи», если он висел.
+    if (!listsLoaded) { listsLoaded = true; if ($("conn-status").textContent === LOAD_ERR) setConn(""); }
+  } catch {
+    // B-CORE-9: молчаливый catch оставлял пустой UI без обратной связи на холодном старте.
+    if (!listsLoaded) setConn(LOAD_ERR);
+    return; // после старта — тихо оставляем прошлый рендер, фоновый ретрайер подхватит
+  }
   validateActiveProject();
   renderChip(route());
   renderSidebar();
@@ -224,16 +262,29 @@ function nearBottom() {
 async function pollFeed() {
   const r = route();
   if (r.view !== "thread") return;
-  let data;
-  try { data = await getJSON(`/api/threads/${encodeURIComponent(r.id)}/feed?limit=500`); }
-  catch { return; }
-  if (route().id !== r.id || feedThread !== r.id) return; // роут сменился, пока ждали
-  const fresh = data.entries.slice(feedCount);
-  if (!fresh.length) return;
-  const stick = feedCount === 0 || nearBottom();
-  fresh.forEach(addEntry);
-  feedCount = data.entries.length;
-  if (stick) $("feed-list").lastElementChild.scrollIntoView({ block: "end" });
+  if (feedInFlight) return; // B-CORE-7: три источника зовут pollFeed — не даём им гоняться
+  feedInFlight = true;
+  try {
+    let data;
+    try { data = await getJSON(`/api/threads/${encodeURIComponent(r.id)}/feed?limit=500`); }
+    catch { return; }
+    if (route().id !== r.id || feedThread !== r.id) return; // роут сменился, пока ждали
+    // B-CORE-3: рендерим только НЕвиденные записи по подписи — окно «последние 500» может
+    // сдвинуться, но каждая запись отрисуется ровно раз; после 500 лента больше не мертва.
+    const first = renderedKeys.size === 0;
+    const stick = first || nearBottom();
+    let added = false;
+    for (const e of data.entries) {
+      const k = feedKey(e);
+      if (renderedKeys.has(k)) continue;
+      renderedKeys.add(k);
+      addEntry(e);
+      added = true;
+    }
+    if (added && stick) $("feed-list").lastElementChild.scrollIntoView({ block: "end" });
+  } finally {
+    feedInFlight = false;
+  }
 }
 
 // ---------- статус Коры: карточка в сайдбаре (цвет готовым с сервера) ----------
@@ -263,14 +314,15 @@ async function sendMessage() {
   if (!text) return;
   const r = route();
   $("msg-send").disabled = true;
-  input.value = "";
+  // B-CORE-1: поле НЕ чистим заранее — иначе отказ сети/ошибка сервера бесследно съедают
+  // набранный текст. Очистим только после подтверждённой отправки POST /message.
   try {
     let id = r.view === "thread" ? r.id : null;
     if (!id) {
       // Дом: первое сообщение создаёт тред-ветку активного проекта (Ж1 + иерархия)
       const tRes = await postJSON("/api/threads",
                                   { title: text.slice(0, 60), project_id: activeProject });
-      if (!tRes.ok) { setConn("не удалось создать тред"); return; }
+      if (!tRes.ok) { setConn("не удалось создать тред"); return; } // текст остаётся в поле
       id = (await tRes.json()).id;
       location.hash = "#/thread/" + encodeURIComponent(id); // render() переключит вью без reload
     }
@@ -279,19 +331,24 @@ async function sendMessage() {
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
       setConn("⛔ " + (d.error || "ошибка " + res.status));
-    } else {
-      setConn("");
+      return; // текст остаётся — можно переотправить, не перепечатывая
     }
+    setConn("");
+    input.value = ""; // успех подтверждён — теперь чистим
     await Promise.all([pollFeed(), loadLists()]);
   } catch {
-    setConn("сеть недоступна");
+    setConn("сеть недоступна"); // текст остаётся в поле
   } finally {
     $("typing").hidden = true;
     $("msg-send").disabled = false;
   }
 }
 $("msg-send").addEventListener("click", sendMessage);
-$("msg-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
+// B-CORE-15: не отправляем во время IME-композиции (китайский/японский/эмодзи-клавиатура iOS —
+// Enter там подтверждает набор, а не сообщение).
+$("msg-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) sendMessage();
+});
 
 // ---------- голос: vendored SDK → session-less POST /api/offer, видимые стейты ----------
 const botAudio = $("bot-audio");
@@ -331,7 +388,12 @@ async function connectVoice() {
           botAudio.srcObject = new MediaStream([track]);
         }
       },
-      onError: (e) => { console.error("voice error:", e); setConn("⛔ ошибка соединения"); },
+      onError: (e) => {
+        // B-CORE-5: не только логируем — гасим кнопку и обнуляем client, иначе UI застревал
+        // («слушаю» + «⛔ ошибка»), а следующий тап шёл в ветку «отключить» мёртвого клиента.
+        console.error("voice error:", e);
+        if (client === me) { client = null; setMicState("error", "соединение прервано"); }
+      },
     },
   });
   client = me;
@@ -372,6 +434,9 @@ let aliveMisses = 0;
 function maybeReload() {
   const last = Number(sessionStorage.getItem("synapse-last-reload") || 0);
   if (Date.now() - last < 10000) return; // анти-луп: не чаще раза в 10с
+  // B-CORE-10: reload пересоздаёт сессию и стирает набранное — сохраняем черновик input,
+  // восстановим на следующем старте.
+  sessionStorage.setItem("synapse-draft", $("msg-input").value);
   sessionStorage.setItem("synapse-last-reload", String(Date.now()));
   location.reload();
 }
@@ -382,7 +447,9 @@ async function probeSession() {
   try { data = await getJSON("./session-alive"); }
   catch { return; } // сеть упала — неизвестность, реконнект ничего не починит
   if (data.active) { aliveMisses = 0; return; }
-  if (++aliveMisses < 2) return; // одиночный false — возможная гонка старта сессии
+  // B-CORE-10: 3 промаха (~15с стабильного «нет сессии») вместо 2 — /session-alive может
+  // кратко лгать, а лишний реконнект дороже задержки.
+  if (++aliveMisses < 3) return;
   aliveMisses = 0;
   // зомби: клиент думает «on», сервер сессию не держит → тихий реконнект на месте
   const c = client;
@@ -404,34 +471,51 @@ async function probeSession() {
 }
 setInterval(probeSession, 5000);
 
-// ---------- drawer (мобайл) ----------
-function closeDrawer() { $("shell").classList.remove("drawer-open"); $("backdrop").hidden = true; }
-$("menu-btn").addEventListener("click", () => {
-  $("shell").classList.add("drawer-open");
-  $("backdrop").hidden = false;
-});
+// ---------- drawer (мобайл) + модалки: Escape + scroll-lock (B-CORE-6) ----------
+function syncScrollLock() {
+  // фон не скроллится, пока открыт drawer или пикер (iOS scroll-chaining за модалкой)
+  const anyModal = !picker.hidden || $("shell").classList.contains("drawer-open");
+  document.body.style.overflow = anyModal ? "hidden" : "";
+}
+function openDrawer() { $("shell").classList.add("drawer-open"); $("backdrop").hidden = false; syncScrollLock(); }
+function closeDrawer() { $("shell").classList.remove("drawer-open"); $("backdrop").hidden = true; syncScrollLock(); }
+$("menu-btn").addEventListener("click", openDrawer);
 $("side-close").addEventListener("click", closeDrawer);
 $("backdrop").addEventListener("click", closeDrawer);
 $("new-thread").addEventListener("click", () => {
   location.hash = "#/";
   closeDrawer();
-  $("msg-input").focus();
+  // B-CORE-16: rAF после закрытия drawer — синхронный .focus() на iOS Safari не поднимает клавиатуру
+  requestAnimationFrame(() => $("msg-input").focus());
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return; // Escape закрывает верхнюю открытую модалку (B-CORE-6)
+  if (!picker.hidden) { closePicker(); return; }
+  if ($("shell").classList.contains("drawer-open")) closeDrawer();
 });
 
 // ---------- пикер папки для «+ проект» (GET /api/browse — сервер листает сам) ----------
 const picker = $("picker");
 const pickerPath = $("picker-path");
 const pickerDirs = $("picker-dirs");
+const pickerError = $("picker-error");
 let pickerCur = null;
+let latestBrowse = 0; // B-CORE-12: игнорируем ответ не от последнего browse (быстрые тапы папок)
+
+function openPicker() { picker.hidden = false; pickerError.textContent = ""; syncScrollLock(); browse(null); }
+function closePicker() { picker.hidden = true; syncScrollLock(); }
 
 async function browse(path) {
+  const my = ++latestBrowse;
   let data;
   try {
     const url = "/api/browse" + (path ? "?path=" + encodeURIComponent(path) : "");
     data = await getJSON(url);
   } catch { return; }
+  if (my !== latestBrowse) return; // устаревший ответ — новый browse уже в пути, не перерисовываем
   pickerCur = data.path;
   pickerPath.textContent = data.path;
+  pickerError.textContent = "";
   pickerDirs.replaceChildren();
   if (data.parent) {
     const up = el("li", "", "‹ назад");
@@ -445,24 +529,27 @@ async function browse(path) {
   });
 }
 
-$("add-project").addEventListener("click", () => {
-  picker.hidden = false;
-  browse(null);
-});
-$("picker-cancel").addEventListener("click", () => { picker.hidden = true; });
+$("add-project").addEventListener("click", openPicker);
+$("picker-cancel").addEventListener("click", closePicker);
 $("picker-choose").addEventListener("click", async () => {
   if (!pickerCur) return;
   const res = await postJSON("/api/projects", { name: "", path: pickerCur }).catch(() => null);
-  if (res && !res.ok) {
+  // B-CORE-4: сеть упала (res === null) — это НЕ успех, пикер не закрываем
+  if (res === null) { pickerError.textContent = "⛔ нет связи"; return; }
+  if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    pickerPath.textContent = "⛔ " + (data.error || "не удалось добавить");
-    return; // пикер остаётся открытым — видно причину, можно выбрать другую папку
+    // B-CORE-11: причину — в отдельный #picker-error, путь в pickerPath не затираем
+    pickerError.textContent = "⛔ " + (data.error || "не удалось добавить");
+    return;
   }
-  picker.hidden = true;
+  closePicker();
   loadLists();
 });
 
 // ---------- init ----------
+// B-CORE-10: восстановить черновик, сохранённый перед вынужденным reload вотчдога
+const draft = sessionStorage.getItem("synapse-draft");
+if (draft) { $("msg-input").value = draft; sessionStorage.removeItem("synapse-draft"); }
 loadLists().then(render);
 pollStatus();
 setInterval(loadLists, 5000);

@@ -9,7 +9,7 @@
 <meta name="theme-color" content="#0b0f14">
 <title>Размышления Коры</title>
 <style>
-  body { margin: 0; background: #0b0f14; color: #d7dde5; font: 14px/1.5 -apple-system, "SF Mono", Menlo, monospace; }
+  body { margin: 0; background: #0b0f14; color: #d7dde5; font: 14px/1.5 -apple-system, system-ui, sans-serif; }
   header {
     position: sticky; top: 0; display: flex; align-items: center; gap: 12px;
     padding: calc(env(safe-area-inset-top, 0px) + 10px) 14px 10px;
@@ -19,15 +19,15 @@
   header h1 { margin: 0; font-size: 15px; font-weight: 600; }
   #feed { padding: 10px 14px calc(env(safe-area-inset-bottom, 0px) + 20px); }
   .row { margin: 0 0 10px; }
-  .meta { display: block; font-size: 11px; color: #6b7683; margin-bottom: 2px; }
+  .meta { display: block; font-size: 12px; color: #8795a5; margin-bottom: 2px; }
   .text { white-space: pre-wrap; word-break: break-word; }
   .kind-task .text { color: #5dade2; font-weight: 600; }
   .kind-thinking .text { color: #9b8ec4; font-style: italic; }
   .kind-tool_use .text { color: #e0b76b; }
-  .kind-tool_result .text { color: #6b7683; }
+  .kind-tool_result .text { color: #8795a5; }
   .kind-result .text { color: #2ecc71; font-weight: 600; }
-  .kind-system .text { color: #6b7683; }
-  #empty { color: #6b7683; padding: 24px 14px; }
+  .kind-system .text { color: #8795a5; }
+  #empty { color: #8795a5; padding: 24px 14px; }
 </style>
 </head>
 <body>
@@ -73,10 +73,13 @@ async function poll() {
   render(data.entries || []);
 }
 
+// B-UI-8: гасим интервал в фоне (PWA на локе не должна часами долбить сеть каждые 2с);
+// на возврате — немедленный полл + рестарт.
+let timer = setInterval(poll, 2000);
 poll();
-setInterval(poll, 2000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) poll();
+  if (document.hidden) { clearInterval(timer); timer = null; }
+  else if (!timer) { poll(); timer = setInterval(poll, 2000); }
 });
 </script>
 </body>
