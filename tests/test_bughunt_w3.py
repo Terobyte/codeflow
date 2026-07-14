@@ -87,8 +87,10 @@ def _make_runner(tmp_path):
 def test_b21_gate_deny_reason_does_not_leak_absolute_path(tmp_path):
     runner, ws = _make_runner(tmp_path)
 
-    # (a) out-of-workspace escape — the classic disclosure oracle.
-    allowed, detail, category = runner._gate_decision("Read", {"file_path": "/etc/passwd"})
+    # (a) out-of-workspace escape — the classic disclosure oracle. Gate v2 (A12'): probe is a
+    # MUTATING Write — reads outside the workspace are now allowed (except secrets), so Write
+    # is the tool that still trips the outside_workspace deny this invariant guards.
+    allowed, detail, category = runner._gate_decision("Write", {"file_path": "/etc/passwd"})
     assert allowed is False
     resolved = str(Path("/etc/passwd").resolve())  # macOS: /private/etc/passwd
     reason = detail or ""

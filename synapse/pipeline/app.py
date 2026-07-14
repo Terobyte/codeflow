@@ -728,10 +728,14 @@ class SynapseSession:
     fresh by `build_session_pipeline()` on every WebRTC connection; wired to the long-lived
     `SynapseHost` by reference."""
 
-    def __init__(self, pipeline: Pipeline, llm_switcher: LLMSwitcher, generation_guard: GenerationGuard) -> None:
+    def __init__(self, pipeline: Pipeline, llm_switcher: LLMSwitcher, generation_guard: GenerationGuard,
+                 flush_voice_feed: Any = None) -> None:
         self.pipeline = pipeline
         self.llm_switcher = llm_switcher
         self.generation_guard = generation_guard
+        # Gate v2 D3': колбэк «дофлашить context-diff в ленту войс-треда» — webrtc_server зовёт
+        # его в on_client_disconnected (последний ответ звонка). None → фича не проведена (стабы).
+        self.flush_voice_feed = flush_voice_feed
 
 
 def build_session_pipeline(host: SynapseHost) -> SynapseSession:
@@ -802,8 +806,56 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
                 {"role": "system", "content": voice_system},
                 *(m for m in context.get_messages() if m.get("role") != "system"),
             ])
+        # Gate v2 D1'/D3': реплики звонка → лента треда (континуитет live→чат). Всё ВНЕ
+        # turn_lock-секции (MINOR lock-скоуп): создание треда и append-ы не держат очередь ходов.
+        if host.threads is not None:
+            # D3' ПЕРЕД записью текущего transcript: диффом ловится ответ ПРЕДЫДУЩЕГО хода.
+            _flush_voice_context()
+            tid = host.voice_thread["id"]
+            if tid is None or host.threads.get(tid) is None:
+                # D1' (alt-MAJOR): EAGER-создание треда на первой голосовой реплике — буферов
+                # нет, транскрипты не теряются никогда. Паттерн _on_task_committed: проект из
+                # voice_project, битый/удалённый тихо деградирует в «без проекта».
+                pid = host.voice_project["id"]
+                th = host.threads.create(
+                    title="новый тред",
+                    project_id=pid if pid and host.projects is not None and host.projects.get(pid) else None,
+                )
+                host.voice_thread["id"] = th.id
+                tid = th.id
+            host.threads.maybe_autotitle(tid, transcript)
+            host.threads.append_feed(tid, {"ts": host.clock.now(), "kind": "user", "text": transcript})
+            if host.text_loop is not None:
+                # D4' (sec-5): тёплая LLM-история треда видит войс-реплику без рестарта.
+                host.text_loop.note_external_turn(tid, "user", transcript)
 
     context = LLMContext(tools=ALL_SCHEMAS)
+
+    # Gate v2 D3': context-diff флашер — сказанные ответы диспетчера идут в ленту войс-треда.
+    # Курсор двигается по ВСЕМ сообщениям context.get_messages(); в ленту из диффа пишутся
+    # ТОЛЬКО assistant со строковым контентом: user-транскрипт пишет D1' напрямую из параметра
+    # (не дублируем), role tool/system отфильтрованы. Aggregator сидит downstream TTS →
+    # контекст = реально СКАЗАННОЕ (интеррапты уже обработаны pipecat). Зовётся из
+    # _on_end_of_turn (ответ предыдущего хода) и on_client_disconnected (последний ответ).
+    # NO-EXFIL не задет: в ленту идут только слова диспетчера, кора-виды в контексте не живут.
+    _voice_cursor = {"n": 0}
+
+    def _flush_voice_context() -> None:
+        msgs = context.get_messages()
+        fresh = msgs[_voice_cursor["n"]:]
+        _voice_cursor["n"] = len(msgs)
+        tid = host.voice_thread["id"]
+        if host.threads is None or tid is None:
+            return
+        for m in fresh:
+            if m.get("role") != "assistant":
+                continue
+            content = m.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            host.threads.append_feed(tid, {"ts": host.clock.now(), "kind": "assistant", "text": content})
+            if host.text_loop is not None:
+                host.text_loop.note_external_turn(tid, "assistant", content)
     # S1: replicate LLMContextAggregatorPair's own __init__ recipe (user first, then the
     # assistant with a back-reference to it) so the assistant half can be the guarded
     # subclass from make_guarded_assistant_aggregator -- LLMContextAggregatorPair itself
@@ -851,7 +903,8 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
         ]
     )
 
-    return SynapseSession(pipeline=pipeline, llm_switcher=llm_switcher, generation_guard=generation_guard)
+    return SynapseSession(pipeline=pipeline, llm_switcher=llm_switcher, generation_guard=generation_guard,
+                          flush_voice_feed=_flush_voice_context)
 
 
 def run() -> None:

@@ -389,10 +389,62 @@ def test_gate_allows_missing_path_for_read_search(tmp_path):
     assert runner._gate_decision("Glob", {})[0] is True  # defaults to cwd ∈ workspace
 
 
-def test_gate_denies_non_file_tools(tmp_path):
+def test_gate_allows_bash_and_denies_web_egress(tmp_path):
+    # Gate v2 A1': Bash → allow (категория allow_egress, detail = command[:200]);
+    # WebFetch/WebSearch остаются deny egress (юзер не заказывал — P13).
     runner, *_ = make_runner(tmp_path)
-    allowed, _detail, category = runner._gate_decision("Bash", {"command": "rm -rf /"})
-    assert allowed is False and category == "egress"
+    allowed, detail, category = runner._gate_decision("Bash", {"command": "ls -la"})
+    assert allowed is True and category == "allow_egress" and detail == "ls -la"
+    for tool, inp in (("WebFetch", {"url": "http://example.com"}), ("WebSearch", {"query": "x"})):
+        allowed, _detail, category = runner._gate_decision(tool, inp)
+        assert allowed is False and category == "egress", f"{tool} must stay denied"
+
+
+def test_gate_denies_unknown_non_file_tools(tmp_path):
+    runner, *_ = make_runner(tmp_path)
+    allowed, _detail, category = runner._gate_decision("Task", {"description": "x"})
+    assert allowed is False and category == "non_file_tool"
+
+
+def test_gate_allows_read_outside_workspace_but_not_secret(tmp_path):
+    # Gate v2 A2': читающие инструменты ходят по всей машине, кроме секретов; мутирующие —
+    # workspace-only, как раньше (A3').
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "notes.txt").write_text("x", encoding="utf-8")
+    allowed, _detail, category = runner._gate_decision("Read", {"file_path": str(outside / "notes.txt")})
+    assert allowed is True and category == "allow"
+    # секрет вне workspace — по-прежнему deny (per-path чек ДО allow)
+    allowed2, _d2, category2 = runner._gate_decision("Read", {"file_path": str(outside / ".env")})
+    assert allowed2 is False and category2 == "secret_path"
+    # мутирующий вне workspace — deny без изменений
+    allowed3, _d3, category3 = runner._gate_decision("Write", {"file_path": str(outside / "notes.txt")})
+    assert allowed3 is False and category3 == "outside_workspace"
+
+
+def test_gate_pathless_read_stays_missing_path_deny(tmp_path):
+    # Gate v2 A2' (MINOR): дефолт-к-cwd умеют только Glob/Grep/LS; Read без пути — deny.
+    runner, *_ = make_runner(tmp_path)
+    allowed, _detail, category = runner._gate_decision("Read", {})
+    assert allowed is False and category == "missing_path"
+
+
+def test_gate_outside_ws_directory_bounded_scan(tmp_path):
+    # Gate v2 A2' (sec-1): каталог ВНЕ workspace сканится ограниченно (depth≤2): видимый
+    # секрет на глубине ≤2 → deny; секрет ГЛУБЖЕ границы → allow (принятый best-effort).
+    runner, *_ = make_runner(tmp_path)
+    shallow = tmp_path / "proj-a"
+    (shallow / "sub").mkdir(parents=True)
+    (shallow / "sub" / "secrets.yaml").write_text("t: s\n", encoding="utf-8")
+    allowed, _d, category = runner._gate_decision("Grep", {"path": str(shallow)})
+    assert allowed is False and category == "secret_path"
+
+    deep = tmp_path / "proj-b"
+    (deep / "a" / "b" / "c").mkdir(parents=True)
+    (deep / "a" / "b" / "c" / "secrets.yaml").write_text("t: s\n", encoding="utf-8")
+    allowed2, _d2, category2 = runner._gate_decision("Grep", {"path": str(deep)})
+    assert allowed2 is True and category2 == "allow"  # глубже depth-границы — не сканим
 
 
 def test_gate_allows_safe_meta_tools(tmp_path):
@@ -460,10 +512,12 @@ async def _decision(runner, tool, inp):
 
 async def test_pretool_hook_returns_explicit_permission_decisions(tmp_path):
     runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
-    # file inside workspace → allow; secret inside workspace → deny; egress → deny; meta → allow.
+    # file inside workspace → allow; secret inside workspace → deny; Bash → allow (gate v2 A1');
+    # web egress → deny; meta → allow.
     assert await _decision(runner, "Write", {"file_path": str(ws / "a.txt")}) == "allow"
     assert await _decision(runner, "Read", {"file_path": str(ws / ".env")}) == "deny"
-    assert await _decision(runner, "Bash", {"command": "ls"}) == "deny"
+    assert await _decision(runner, "Bash", {"command": "ls"}) == "allow"
+    assert await _decision(runner, "WebFetch", {"url": "http://example.com"}) == "deny"
     assert await _decision(runner, "ToolSearch", {"query": "x"}) == "allow"
     assert await _decision(runner, "TodoWrite", {"todos": []}) == "allow"
 
@@ -482,7 +536,7 @@ async def test_gate_journals_explicit_deny_categories(tmp_path):
     sibling = ws.parent / (ws.name + "-evil") / "a.txt"
     cases = [
         (("Read", {"file_path": str(ws / ".env")}), "secret_path"),
-        (("Bash", {"command": "ls"}), "egress"),
+        (("WebSearch", {"query": "x"}), "egress"),  # gate v2 A1': Bash больше не deny-кейс
         (("WebFetch", {"url": "http://example.com"}), "egress"),
         (("Task", {"description": "x"}), "non_file_tool"),
         (("Write", {}), "missing_path"),
@@ -499,6 +553,18 @@ async def test_gate_journals_allow_category(tmp_path):
     await runner._pretool_hook({"tool_name": "Grep", "tool_input": {}}, None, None)  # missing-path read/search → allow
     allow_rows = [r for r in _journal_rows(journal) if r["kind"] == "kora_event" and r["type"] == "gate_allow"]
     assert allow_rows and allow_rows[-1]["payload"]["category"] == "allow"
+
+
+async def test_gate_journals_bash_allow_with_command(tmp_path):
+    # Gate v2 A7'-а: Bash слеп для файлового гейта — gate_allow обязан нести САМУ команду
+    # (аудит-след), обрезанную до 200 символов.
+    runner, store, ledger, journal, ws, speaks = make_runner(tmp_path)
+    long_cmd = "echo " + "x" * 300
+    assert await _decision(runner, "Bash", {"command": long_cmd}) == "allow"
+    allow_rows = [r for r in _journal_rows(journal) if r["kind"] == "kora_event" and r["type"] == "gate_allow"]
+    assert allow_rows and allow_rows[-1]["payload"]["category"] == "allow_egress"
+    assert allow_rows[-1]["payload"]["tool"] == "Bash"
+    assert allow_rows[-1]["payload"]["command"] == long_cmd[:200]
 
 
 def test_is_secret_path_predicate_unit():

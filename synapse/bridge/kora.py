@@ -59,13 +59,32 @@ _READ_SEARCH_TOOLS = frozenset({"Glob", "Grep", "LS"})
 # Read/Glob/Grep/LS — читающие, docs_only их НЕ трогает; _SAFE_META_TOOLS тоже.
 _MUTATING_FILE_TOOLS = frozenset({"Write", "Edit", "NotebookEdit"})
 
-# Non-file tools that reach the network / a shell — named only for the gate's deny CATEGORY
-# (they are already denied by the _PATH_KEY miss; naming does not change the outcome).
+# Non-file tools that reach the network / a shell. Gate v2 (A1'/A9'): Bash теперь ALLOWED —
+# заказ Теро («Bash разрешить; читать везде кроме секретов»), риск Bash-обхода файлового гейта
+# проговорён и принят; его ветка в _gate_decision стоит ВЫШЕ этого сета и возвращает категорию
+# allow_egress. WebFetch/WebSearch ОСТАЮТСЯ deny (юзер не заказывал; меньше exfil-поверхность —
+# sec-3, парк P13). Сет несёт все три имени: он даёт deny-КАТЕГОРИЮ "egress" тем, кто до
+# Bash-ветки не дошёл.
 _EGRESS_TOOLS = frozenset({"Bash", "WebFetch", "WebSearch"})
+
+# Gate v2 (A7', sec-2/alt-A4): дени-only лексический скан Bash-команды на секрет-токены
+# (casefold). Bash слеп для файлового гейта — скан ловит СЛУЧАЙНОЕ чтение секрета
+# (cat ~/.env), не злонамеренный обход (тот принят как остаток). Over-deny приемлем (B22).
+_BASH_SECRET_TOKENS = (
+    ".env", "id_rsa", "id_ed25519", ".ssh", ".aws", ".pem", "credentials", ".netrc",
+    "token.txt", "apikey", "api_key", ".pgpass", ".zsh_history", ".bash_history",
+    ".claude.json", ".credentials",
+)
+
+# Gate v2 (A2', sec-1): скан каталога ВНЕ workspace ограничен глубиной и числом записей —
+# полный os.walk по ~/ был бы unusable (минуты). Cap исчерпан → allow (best-effort: Bash
+# всё равно открыт, скан — защита от случайного, не от злонамеренного).
+_OUTSIDE_SCAN_MAX_DEPTH = 2
+_OUTSIDE_SCAN_MAX_ENTRIES = 2000
 
 # Non-file meta tools Кора legitimately needs (ToolSearch to load tools, TodoWrite to plan) —
 # allowed explicitly BEFORE the egress/non_file fail-closed deny. Everything else non-file stays
-# denied (Bash/WebFetch/WebSearch/Task/Skill/unknown): Кора edits files, no shell/net this slice.
+# denied (WebFetch/WebSearch/Task/Skill/unknown); Bash имеет СВОЮ allow-ветку выше (gate v2 A1').
 _SAFE_META_TOOLS = frozenset({"ToolSearch", "TodoWrite"})
 
 # Slice-4 secret containment (§2.8, BLOCKER-1): a secret INSIDE the workspace is still a
@@ -85,6 +104,11 @@ _SECRET_FILE_NAMES = frozenset(
         # UI v2 S12: запись в шелл-конфиг = persistence; ".config"-сегмент принимает редкие
         # false positives (deny-only, прецедент B22).
         ".zshrc", ".zshenv", ".zprofile", ".bashrc", ".bash_profile", ".profile",
+        # Gate v2 (A8', sec-4): чтение открыто по всей машине → дыры денилиста стали дороже.
+        # Истории шеллов (пароли в argv), ~/.claude.json (ключи), терраформ/generic credentials.
+        # Generic "settings.json" НЕ добавлен — убил бы чтение любого VSCode-проекта.
+        ".zsh_history", ".bash_history", ".claude.json", ".credentials.json",
+        "credentials.tfrc.json",
     }
 )
 _SECRET_FILE_STEMS = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk"})
@@ -141,6 +165,35 @@ def _subtree_has_readable_secret(root: Path) -> bool:
                     return True
     except OSError:
         return True  # cannot scan → fail closed
+    return False
+
+
+def _bounded_subtree_has_secret(root: Path) -> bool:
+    """Gate v2 (A2', sec-1): версия `_subtree_has_readable_secret` для каталогов ВНЕ workspace.
+    Читающие инструменты теперь ходят по всей машине — полный os.walk по ~/Projects занял бы
+    минуты и почти всегда denied бы легитимный Grep. Скан ограничен depth≤2 и cap 2000 записей;
+    секрет найден → deny, cap/depth исчерпан → allow (best-effort: Bash всё равно открыт, скан —
+    защита от СЛУЧАЙНОГО захвата секрета, не от злонамеренного обхода). Та же дисциплина
+    скрытых записей, что у базового скана (ripgrep/glob без `--hidden` их не читают)."""
+    seen = 0
+    # os.walk строит dirpath от root КАК ПЕРЕДАН (не resolve) — глубину меряем от него же.
+    root_depth = len(root.parts)
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            if len(Path(dirpath).parts) - root_depth >= _OUTSIDE_SCAN_MAX_DEPTH:
+                dirnames[:] = []  # глубже не спускаемся — depth-граница
+            else:
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                seen += 1
+                if seen > _OUTSIDE_SCAN_MAX_ENTRIES:
+                    return False  # cap исчерпан → allow (принятый best-effort)
+                if fn.startswith("."):
+                    continue  # hidden file — the tools skip it by default
+                if _is_secret_path(Path(fn)):
+                    return True
+    except OSError:
+        return True  # cannot scan → fail closed (симметрия с базовым сканом)
     return False
 
 
@@ -523,13 +576,15 @@ class KoraRunner:
 
     def _system_prompt(self, workspace: Path, task_text: str) -> str:
         # LOAD-BEARING (§2d CASE 1): with setting_sources=[] Kora does not otherwise know its
-        # cwd and will invent absolute paths that the gate then (correctly) denies. Naming the
-        # workspace + steering to Write/Edit (not shell) is what made the live smoke succeed.
+        # cwd and will invent paths the gate then (correctly) denies — naming the workspace is
+        # what made the live smoke succeed. Gate v2 (A10'): текст соответствует новому гейту —
+        # Bash и чтение по всей машине открыты, запись файловыми инструментами workspace-only.
         return (
             f"Ты — Кора, исполнитель задач Синапса. Твоя рабочая директория: {workspace}. "
-            f"Создавай и изменяй файлы только внутри неё, используя инструменты Write/Edit, "
-            f"а не команды shell. Не обращайся к абсолютным путям за пределами этой директории. "
-            f"Задача пользователя: {task_text}"
+            f"Bash разрешён (рабочая директория — {workspace}); читать файлы можно по всей "
+            f"машине, кроме секретных. Создавать и изменять файлы можно только внутри "
+            f"{workspace} — инструментами Write/Edit. Секреты (.env, ключи, ~/.ssh) закрыты, "
+            f"в том числе через shell. Задача пользователя: {task_text}"
         )
 
     def _build_options(self, task_id: str, text: str) -> Any:
@@ -561,19 +616,49 @@ class KoraRunner:
         )
 
     def _gate_decision(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str | None, str]:
-        """Pure fail-closed containment decision (RISK-M6, slice-4 hardened). Returns
+        """Pure containment decision (RISK-M6; gate v2 A1'-A8'). Returns
         (allowed, detail, category) — an EXPLICIT category, never string-parsed by the caller.
-        A non-file tool is denied (egress/non_file_tool); a mutating file tool with no/blank
-        path is denied (missing_path); a resolved secret path is denied for ALL file tools even
-        inside the workspace (secret_path, checked BEFORE the in-workspace allow); a path is
-        allowed only when its resolved form is inside the workspace via
-        Path.resolve().is_relative_to (NOT startswith — that would leak the sibling /ws-evil),
-        else outside_workspace. Categories: allow/secret_path/outside_workspace/missing_path/
-        egress/non_file_tool/path_error."""
+
+        Политика gate v2 (заказ Теро: «Bash разрешить; чтение — везде кроме секретов; запись
+        файловыми инструментами — только workspace»):
+        - Bash → allow (кроме docs_only-режима и лексического секрет-скана команды);
+        - читающие Read/Glob/Grep/LS с путём → allow ЛЮБОЙ путь, кроме секретного; каталог
+          внутри ws — полный subtree-скан (B16), вне ws — bounded-скан (depth/cap, best-effort);
+        - мутирующие Write/Edit/NotebookEdit → без изменений: workspace-only + docs_only + секреты;
+        - WebFetch/WebSearch и прочие non-file → deny.
+
+        Полный контракт категорий (A9'):
+          allow               — файловый инструмент, путь разрешён (detail = resolved путь);
+          allow_meta          — ToolSearch/TodoWrite (_SAFE_META_TOOLS);
+          allow_egress        — Bash (detail = command[:200], попадает в журнал gate_allow);
+          secret_path         — секретный путь/поддерево с секретом/секрет-токен в Bash-команде
+                                (detail category-only — B21, не светить resolved путь агенту);
+          outside_workspace   — МУТИРУЮЩИЙ инструмент вне workspace;
+          docs_only_violation — мутирующий вне docs-дерева ИЛИ Bash при gate_mode=docs_only (A6');
+          missing_path        — файловый инструмент без пути (включая pathless Read — только
+                                Glob/Grep/LS умеют дефолт-к-cwd);
+          egress              — WebFetch/WebSearch (не-Bash egress);
+          non_file_tool       — неизвестный non-file инструмент (fail-closed);
+          path_error          — resolve() пути упал.
+        Пути сверяются через Path.resolve().is_relative_to (NOT startswith — that would leak
+        the sibling /ws-evil)."""
         key = _PATH_KEY.get(tool_name)
         if key is None:
             if tool_name in _SAFE_META_TOOLS:
                 return True, None, "allow_meta"
+            if tool_name == "Bash":
+                # Gate v2 A6' (БЛОКЕР-фикс): docs_only-ран даёт Коре писать только доки —
+                # открытый Bash обошёл бы это одним `echo > src/main.py`. Deny целиком.
+                if self._current_gate_mode() == "docs_only":
+                    return False, "docs_only_violation", "docs_only_violation"
+                cmd = str((tool_input or {}).get("command") or "")
+                # Gate v2 A7': лексический секрет-скан команды (casefold, deny-only).
+                # Detail category-only (B21) — команду в reason агенту не возвращаем.
+                low = cmd.casefold()
+                if any(tok in low for tok in _BASH_SECRET_TOKENS):
+                    return False, "secret_path", "secret_path"
+                # Gate v2 A1': Bash allow; command[:200] уходит в журнал gate_allow (A7'-а).
+                return True, cmd[:200], "allow_egress"
             cat = "egress" if tool_name in _EGRESS_TOOLS else "non_file_tool"
             return False, f"{cat}: {tool_name}", cat
         raw = (tool_input or {}).get(key)
@@ -630,6 +715,15 @@ class KoraRunner:
                 if not (in_docs or top_md):
                     return False, "docs_only_violation", "docs_only_violation"
             return True, str(resolved), "allow"
+        # Gate v2 A2': читающие инструменты ходят по ВСЕЙ машине (заказ Теро), кроме секретов
+        # (per-path deny выше). Каталог вне ws — bounded-скан вместо полного os.walk
+        # (usability: Grep по ~/Projects не должен ходить весь диск; best-effort принят —
+        # Bash всё равно открыт). Мутирующие остаются workspace-only (A3').
+        if tool_name == "Read" or tool_name in _READ_SEARCH_TOOLS:
+            if (tool_name in _READ_SEARCH_TOOLS and resolved.is_dir()
+                    and _bounded_subtree_has_secret(resolved)):
+                return False, "secret_path", "secret_path"
+            return True, str(resolved), "allow"
         return False, "outside_workspace", "outside_workspace"
 
     async def _pretool_hook(self, input_data: dict[str, Any], tool_use_id: Any, context: Any) -> dict[str, Any]:
@@ -646,12 +740,17 @@ class KoraRunner:
             return await self._handle_question(tinput)
 
         allowed, detail, category = self._gate_decision(name, tinput)
+        payload = {"tool": name, "detail": detail, "category": category}
+        if name == "Bash":
+            # Gate v2 A7'-а: Bash слеп для файлового гейта — журнал обязан нести САМУ команду
+            # (аудит-след), не только факт allow/deny. Обрезка 200 — как detail.
+            payload["command"] = str((tinput or {}).get("command") or "")[:200]
         self._journal.record_kora_event(
             KoraEvent(
                 id=f"kora-gate-{int(self._clock.now() * 1000)}",
                 type="gate_allow" if allowed else "gate_deny",
                 cls=EventClass.NARRATABLE,
-                payload={"tool": name, "detail": detail, "category": category},
+                payload=payload,
                 speak_text=None,
                 ts=self._clock.now(),
             )

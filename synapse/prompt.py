@@ -60,6 +60,15 @@ OWED_RULE_9 = (
     "по-прежнему передавай через request_cancel, а вопрос о статусе — через get_task_status."
 )
 
+# Gate v2 C3' (анти-галлюцинация): диспетчер обещал юзеру несуществующий «компактный режим».
+# НЕ гейтится include_owed_prompt_rules — это не OWED-правило Приложения А, а операционная
+# правда о серверных командах (полная анти-галлюцинационная ревизия промпта — парк P10).
+COMMANDS_NOTE = (
+    "\n\nНе обещай несуществующих режимов или команд. Команды compact и clear обрабатывает "
+    "сервер, и работают они только в текстовом чате — сам ты сжатие или очистку контекста "
+    "не выполняешь и не изображаешь."
+)
+
 # UI-4: these blocks are appended after the non-negotiable dispatcher rules. They are only
 # supplied for the two conversational stages; a running/code/done thread must retain the
 # conservative base prompt rather than being invited to start another staged request.
@@ -115,6 +124,7 @@ def build_system_prompt(
     """PROMPT_V3 (+ OWED additions, gated by cfg.include_owed_prompt_rules) + the
     task-dictionary block (§4/Р-9)."""
     base = _apply_owed_additions(PROMPT_V3) if cfg.include_owed_prompt_rules else PROMPT_V3
+    base = base + COMMANDS_NOTE  # gate v2 C3': всегда, вне owed-гейта
     dictionary_block = ""
     if task_dictionary:
         entries = "\n".join(f"- {k}: {v}" for k, v in task_dictionary.items())

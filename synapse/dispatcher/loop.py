@@ -66,6 +66,19 @@ class DispatcherTurnLoop:
         # UI-5 (S10): колбэк на факт компакта истории треда (лента пишет event «контекст сжат»).
         self._on_compact = on_compact
         self._histories: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+        # Gate v2 C6 (sec-6): пер-тред поколение истории. clear_history инкрементит его; ход,
+        # начатый ДО clear, при коммите видит несовпадение и НЕ воскрешает очищенную историю.
+        self._generations: dict[str, int] = {}
+
+    @staticmethod
+    def _append_coalesced(hist: list[dict[str, Any]], role: str, text: str) -> None:
+        """Gate v2 C2' (MINOR): подряд идущие same-role реплики склеиваются в одно сообщение —
+        войс-путь (D1') пишет user-транскрипты в ленту и без ответной пары, а Anthropic-шейп
+        ждёт чередования ролей. Общая точка для регидрации и note_external_turn."""
+        if hist and hist[-1].get("role") == role and isinstance(hist[-1].get("content"), str):
+            hist[-1]["content"] += "\n" + text
+        else:
+            hist.append({"role": role, "content": text})
 
     def _history_for(self, thread_id: str) -> list[dict[str, Any]]:
         """Пер-тред контекст (спека §4, находка A): история LLM ключуется по треду.
@@ -75,18 +88,51 @@ class DispatcherTurnLoop:
         if hist is None:
             hist = []
             if self._thread_feed_reader is not None:
-                for e in self._thread_feed_reader(thread_id):
+                entries = list(self._thread_feed_reader(thread_id))
+                # Gate v2 C2' (каveat R5): срез по ПОСЛЕДНЕМУ kind=="clear" — иначе очищенная
+                # командой «clear» история воскресала бы из feed при следующем cache-miss
+                # (feed-файл — архив, его clear не трогает).
+                for i in range(len(entries) - 1, -1, -1):
+                    if entries[i].get("kind") == "clear":
+                        entries = entries[i + 1:]
+                        break
+                for e in entries:
                     kind = e.get("kind")
-                    if kind == "user":
-                        hist.append({"role": "user", "content": str(e.get("text", ""))})
-                    elif kind == "assistant":
-                        hist.append({"role": "assistant", "content": str(e.get("text", ""))})
+                    if kind in ("user", "assistant"):
+                        self._append_coalesced(hist, kind, str(e.get("text", "")))
             self._histories[thread_id] = hist
             while len(self._histories) > _MAX_CACHED_THREADS:
                 self._histories.popitem(last=False)
         else:
             self._histories.move_to_end(thread_id)
         return hist
+
+    def note_external_turn(self, thread_id: str, role: str, text: str) -> None:
+        """Gate v2 D4' (sec-5): реплика, прошедшая МИМО ingest_user_turn (войс-путь пишет её в
+        feed напрямую), доливается в ТЁПЛУЮ LLM-историю треда, чтобы кэшированный тред увидел
+        разговор без рестарта. Кэш-мисс — no-op: холодная регидрация подхватит её из feed сама
+        (writer уже положил запись в ленту до вызова)."""
+        hist = self._histories.get(thread_id)
+        if hist is None:
+            return
+        self._append_coalesced(hist, role, text)
+
+    def clear_history(self, thread_id: str) -> None:
+        """Gate v2 C1': команда «clear» — LLM-история треда чистится IN-PLACE (живая ссылка,
+        дисциплина _maybe_compact) + поколение инкрементится (C6). Feed-файл НЕ трогается
+        (лента = архив); clear-маркер в ленту пишет РОУТ (канонический слой записи —
+        webrtc_server, как у user/assistant)."""
+        hist = self._histories.get(thread_id)
+        if hist is not None:
+            hist[:] = []
+        self._generations[thread_id] = self._generations.get(thread_id, 0) + 1
+
+    async def force_compact(self, thread_id: str) -> None:
+        """Gate v2 C1': команда «compact» — немедленный компакт истории треда, минуя порог
+        (threshold_override=1: жмём, если есть что резать). LLM-ХОД диспетчера не зовётся —
+        только внутренний вызов сжатия; событие ленты пишет существующий on_compact."""
+        history = self._history_for(thread_id)
+        await self._maybe_compact(thread_id, history, threshold_override=1)
 
     async def ingest_user_turn(self, transcript: str, thread_id: str = "voice") -> tuple[TurnRecord, str]:
         now = self._clock.now()
@@ -99,6 +145,8 @@ class DispatcherTurnLoop:
 
         had_active_task = self._store.has_active_task()
         history = self._history_for(thread_id)
+        # Gate v2 C6: снимок поколения ДО await'ов — сверяется на коммите (см. ниже).
+        generation = self._generations.get(thread_id, 0)
         # UI-5 (S10): компакт ПЕРЕД ходом — старшая половина жмётся отдельным LLM-вызовом,
         # если история длиннее порога. Мутирует список IN-PLACE (history[:] = ...): ребинд
         # локальной `history` дошёл бы до _complete ЭТОГО хода, но self._histories[thread_id]
@@ -155,9 +203,13 @@ class DispatcherTurnLoop:
         # Commit this turn's user msg + final assistant reply to the SHARED history in one
         # synchronous burst (no await between the two appends → no concurrent turn can interleave
         # and stack a second user with no assistant between).
-        history.append({"role": "user", "content": transcript})
-        if text:
-            history.append({"role": "assistant", "content": text})
+        # Gate v2 C6 (B20-стиль: правда на момент коммита, не до-await снимок): «clear»,
+        # прилетевший во время нашего await, инкрементит поколение — поздний коммит этой
+        # (user, assistant)-пары молча воскресил бы только что очищенную историю. Скип, не ошибка.
+        if self._generations.get(thread_id, 0) == generation:
+            history.append({"role": "user", "content": transcript})
+            if text:
+                history.append({"role": "assistant", "content": text})
         return record, text
 
     async def _complete(
@@ -195,8 +247,13 @@ class DispatcherTurnLoop:
 
     # --- UI-5 (S10): компакт длинной истории -------------------------------------------
 
-    async def _maybe_compact(self, thread_id: str, history: list[dict[str, Any]]) -> None:
+    async def _maybe_compact(
+        self, thread_id: str, history: list[dict[str, Any]], threshold_override: int | None = None
+    ) -> None:
         """Сжать старшую половину истории, если она длиннее порога, ПЕРЕД ходом.
+
+        Gate v2 C1' (MINOR): `threshold_override` — явный параметр для force_compact (команда
+        «compact» жмёт немедленно, порог=1); None → конфиг-порог dispatcher_compact_after.
 
         Мутирует `history` IN-PLACE (history[:] = ...), а не ребиндит локальную ссылку:
         `_history_for` отдаёт ЖИВУЮ ссылку на `self._histories[thread_id]`, поэтому только
@@ -208,7 +265,7 @@ class DispatcherTurnLoop:
         история здесь содержит только user/assistant (регидрация + этот метод), роль user —
         корректный срез-маркер; tool-хвостов в `history` нет (они удаляются на откате хода).
         """
-        threshold = self._cfg.dispatcher_compact_after
+        threshold = threshold_override if threshold_override is not None else self._cfg.dispatcher_compact_after
         if threshold <= 0 or len(history) <= threshold:
             return
         cut = len(history) // 2

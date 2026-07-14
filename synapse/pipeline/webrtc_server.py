@@ -63,6 +63,12 @@ _MAX_PENDING_SESSIONS = 128
 # from the prebuilt bundle's own dist/ directory, which we read from but never write to.
 _STATIC_DIR = Path(__file__).parent / "static"
 
+# Gate v2 C1': серверные чат-команды — exact-match ВСЕГО сообщения (strip+casefold). Bare-слова
+# приняты сениором (юзер уже печатает «compact» без слэша); риск легитимной реплики «clear»
+# принят. Обрабатываются ДО ingest_user_turn: LLM-ход не зовётся, user-запись в ленту не
+# пишется (команда — не реплика диалога).
+_CHAT_COMMANDS = frozenset({"compact", "/compact", "clear", "/clear"})
+
 
 def _status_color(liveness: Liveness, task_status: TaskStatus | None, awaiting: bool) -> str:
     """Светофор Коры — kora status UI (tero run 2026-07-12). red > yellow > green;
@@ -168,6 +174,15 @@ def build_web_app(host: SynapseHost) -> FastAPI:
 
             @transport.event_handler("on_client_disconnected")
             async def _on_client_disconnected(_transport, _client):
+                # Gate v2 D3': последний ответ диспетчера в звонке никаким _on_end_of_turn уже
+                # не ловится (юзер повесил трубку) — флашим context-diff в ленту треда здесь.
+                # Display-путь: сбой флаша не должен валить teardown соединения.
+                flush = getattr(session, "flush_voice_feed", None)
+                if flush is not None:
+                    try:
+                        flush()
+                    except Exception:  # noqa: BLE001
+                        pass
                 # M1: browser close/refresh pushes no EndFrame -> cancel so Flux/Fish/LLM sockets for
                 # THIS connection's transport tear down instead of leaking until the process exits.
                 # host state (store/speak_ledger/confirm_flow/breaker/cost_cap) is untouched.
@@ -374,7 +389,15 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     # (torn down or preempted), so this reflects real server state instead of a guess.
     @app.get("/client/session-alive")
     async def session_alive():
-        return JSONResponse({"active": current["task"] is not None})
+        # Gate v2 B1'/A12': GET-эндпоинт под voice_thread НЕ создаём — session-alive уже
+        # поллится вотчдогом; «Завершить — в чат» читает id треда звонка отсюда. Ключ
+        # voice_thread добавляется ТОЛЬКО когда host реально его несёт: голые host-стабы
+        # route-тестов (object()) сохраняют прежний payload {"active": ...}.
+        payload: dict = {"active": current["task"] is not None}
+        vt = getattr(host, "voice_thread", None)
+        if isinstance(vt, dict):
+            payload["voice_thread"] = vt.get("id")
+        return JSONResponse(payload)
 
     # kora status UI (tero run 2026-07-12): все четыре роута ниже — как session-alive,
     # ДО app.mount (Starlette матчит в порядке регистрации, роут выигрывает у StaticFiles).
@@ -531,6 +554,25 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         text = str(data.get("text") or "").strip()
         if not text:
             return JSONResponse({"error": "empty text"}, status_code=400)
+        # Gate v2 C1': команды compact/clear — серверные, обрабатываются ДО ingest_user_turn.
+        cmd = text.casefold()
+        if cmd in _CHAT_COMMANDS:
+            if cmd.lstrip("/") == "compact":
+                # Событие ленты «контекст сжат» пишет существующий on_compact (внутри force_compact).
+                await host.text_loop.force_compact(thread_id)
+                return JSONResponse({"ok": True, "command": "compact"})
+            # clear: под host.turn_lock — сериализуемся с ОТКРЫТИЕМ ходов (голос/HTTP);
+            # хвост уже начатого хода добивает generation-механизм в loop (C6, B20-стиль).
+            async with host.turn_lock:
+                host.text_loop.clear_history(thread_id)
+            # Clear-маркер пишет РОУТ (канонический слой записи лент — как user/assistant).
+            # id-штамп: две команды clear в один clock-tick иначе схлопнулись бы в клиентском
+            # feedKey (ts|kind|text коллизия — MINOR принят).
+            host.threads.append_feed(thread_id, {
+                "ts": host.clock.now(), "kind": "clear", "text": "история очищена",
+                "id": f"clear-{uuid.uuid4().hex[:12]}",
+            })
+            return JSONResponse({"ok": True, "command": "clear"})
         # NB (B08): turn_lock is intentionally NOT held across ingest_user_turn — B-PIPE-5 requires
         # releasing it before the LLM call so one slow client can't block others. The journal-level
         # begin_turn backstop (journal.py) is what protects an in-flight turn's record from a

@@ -220,9 +220,12 @@ function render() {
   }
   // Голос адресуется открытому треду; дом = авто-тред диспетчера в активном проекте.
   // B-CORE-13: не спамим active-thread на каждый ре-рендер — шлём только при смене цели.
+  // gate v2 B2' (MINOR render()): пока голос подключён (client!=null), привязку звонка НЕ
+  // меняем — навигация домой/по тредам мид-колл не должна разрывать/уводить звонок.
+  // lastActiveThread не трогаем: после hang-up первый render дошлёт актуальную привязку.
   const activeThreadKey = (r.view === "thread" ? r.id : "") + "|" +
     (r.view === "home" ? (activeProject || "") : "");
-  if (activeThreadKey !== lastActiveThread) {
+  if (activeThreadKey !== lastActiveThread && !client) {
     lastActiveThread = activeThreadKey;
     postJSON("/api/active-thread", {
       id: r.view === "thread" ? r.id : null,
@@ -456,7 +459,9 @@ function addEntry(e) {
     li.textContent = "▶ " + (e.text || "");
   } else if (e.kind === "gate_card") {
     renderGateCard(li, e);
-  } else if (e.kind === "event") {
+  } else if (e.kind === "event" || e.kind === "clear") {
+    // gate v2 C4': kind "clear" — event-стиль строка («история очищена»); запись несёт
+    // id-штамп с сервера, так что feedKey не схлопывает повторные clear.
     li.textContent = "• " + (e.text || "");
   } else {
     li.textContent = (KIND_ICONS[e.kind] || "·") + " " + (e.text || "");
@@ -828,6 +833,17 @@ async function disconnectVoice() {
   client = null;
   setMicState("idle");
   await c.disconnect().catch(() => {});
+  // gate v2 B2': «Завершить — В ЧАТ» ведёт в чат звонка. Тред создаёт сервер (клиент его id
+  // не знал) — читаем из session-alive (B1': отдельный GET не плодим). Лента звонка уже на
+  // диске (D1'/D3'), навигация открывает полную историю. Сеть упала → остаёмся на месте.
+  try {
+    const data = await getJSON("./session-alive");
+    const tid = data && data.voice_thread;
+    if (tid && route().id !== tid) {
+      location.hash = "#/thread/" + encodeURIComponent(tid); // render() переключит вью
+    }
+    await Promise.all([loadLists(), pollFeed()]);
+  } catch { /* нет связи — навигация в тред не критична */ }
 }
 
 $("mic-btn").addEventListener("click", async () => {
