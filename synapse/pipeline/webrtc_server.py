@@ -619,8 +619,11 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         if th is None:
             return JSONResponse({"error": "no such thread"}, status_code=404)
         # per-thread busy: синглтон говорит ЧТО бежит, thread_for_task — В КАКОМ треде.
+        # B49: «занят» = канонический has_active_task (RUNNING ∪ PENDING_CONFIRMATION), не
+        # только RUNNING — иначе тред архивируется, пока задача ждёт подтверждения, и «да»
+        # юзера запускает Кору в уже-убранный тред.
         task = host.store.task
-        if task is not None and task.status == TaskStatus.RUNNING:
+        if task is not None and host.store.has_active_task():
             live = host.threads.thread_for_task(task.id)
             if live is not None and live.id == thread_id:
                 return JSONResponse({"error": "busy"}, status_code=409)

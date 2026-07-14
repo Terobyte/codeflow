@@ -137,8 +137,6 @@ async def test_B46_unrelated_direct_dispatch_completion_must_not_unstale_the_pla
 # =============================================================================================
 
 
-@pytest.mark.xfail(reason="B48: gate_action launches send_to_kora on an archived thread; "
-                          "archived is never checked in any write path", strict=True)
 async def test_B48_archived_thread_must_refuse_send_to_kora(tmp_path):
     host = _gate_host(tmp_path)
     t = host.threads.create("x")
@@ -166,9 +164,6 @@ async def test_B48_archived_thread_must_refuse_send_to_kora(tmp_path):
 # =============================================================================================
 
 
-@pytest.mark.xfail(reason="B49: the archive route's busy-check only excludes RUNNING, "
-                          "not PENDING_CONFIRMATION, unlike the canonical has_active_task()",
-                   strict=True)
 def test_B49_archive_must_refuse_while_task_pending_confirmation(tmp_path):
     pytest.importorskip("aiortc")
     pytest.importorskip("cv2")

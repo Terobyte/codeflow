@@ -335,6 +335,10 @@ class SynapseHost:
             return {"error": "unknown_thread"}
         lock = self._gate_locks.setdefault(thread_id, asyncio.Lock())
         async with lock:
+            # B48: архивный тред — read-only. Ни один гейт-экшен (запуск Коры, revise) не
+            # должен оживлять «убранный» тред; чтение под локом — конкурентный архив виден.
+            if th.archived:
+                return {"error": "archived"}
             # валидация модели — только когда она передана (revise её не несёт)
             if model is not None and model not in _KORA_MODELS:
                 return {"error": "invalid_model"}
@@ -570,6 +574,8 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             )
             if thread_id is None:
                 voice_thread["id"] = th.id
+        if th.archived:
+            return {"outcome": "thread_archived"}  # B48: свод не коммитится в убранный тред
         if th.stage != "collect":
             return {"outcome": "illegal_stage"}
         try:
@@ -641,6 +647,8 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
 
     def _on_task_committed(task_id: str, text: str) -> None:
         th = threads.get(voice_thread["id"]) if voice_thread["id"] else None
+        if th is not None and th.archived:
+            th = None  # B48: стейл-привязка на архивный тред деградирует в свежий тред
         if th is None:
             # Авто-тред рождается В активном проекте дома (иерархия «проекты → треды»);
             # несуществующий/удалённый проект тихо деградирует в «без проекта».
@@ -691,6 +699,8 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     def _http_task_committed(task_id: str, text: str) -> None:
         tid = current_http_thread["id"]
         th = threads.get(tid) if tid else None
+        if th is not None and th.archived:
+            th = None  # B48: зеркало войс-пути — задача не аппендится в убранный тред
         if th is None:
             th = threads.create(title=text)
         threads.append_task(th.id, task_id)
