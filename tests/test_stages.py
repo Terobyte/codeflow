@@ -172,3 +172,156 @@ def test_stage_transitions_table_is_complete():
     assert _STAGE_TRANSITIONS["spec_plan"] == frozenset({"code", "collect"})
     assert _STAGE_TRANSITIONS["code"] == frozenset({"done", "collect"})
     assert _STAGE_TRANSITIONS["done"] == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Task 2: гейт-режим docs_only в KoraRunner
+# ---------------------------------------------------------------------------
+
+from synapse.bridge.kora import KoraRunner
+from synapse.bridge.runspec import RunSpec
+from synapse.bridge.state import SpeakLedger, TaskStatus, TaskStore
+from synapse.config import SynapseConfig
+from synapse.journal import TurnJournal
+
+
+class _Fc:  # мини FakeClock, чтобы не тащить зависимость по порядку импортов
+    def __init__(self, t=0.0): self.t = t
+    def now(self): return self.t
+
+
+def _gate_runner(tmp_path, captured, gate_mode):
+    """Стаб-раннер как в test_runspec.py: FakeClient зовёт _gate_decision во время рана,
+    когда снапшот gate_mode уже стоит. captures — список (tool, input) → решение."""
+    cfg = SynapseConfig(kora_workspace_dir=str(tmp_path / "ws"))
+    clock = _Fc()
+    store = TaskStore(clock)
+    journal = TurnJournal(str(tmp_path / "j"), clock)
+
+    class FakeClient:
+        def __init__(self, opts): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+        async def query(self, text): pass
+        async def receive_response(self):
+            r = captured["runner"]
+            for (tool, inp) in captured["probes"]:
+                captured["results"].append(r._gate_decision(tool, inp))
+            if False:
+                yield None
+
+    runner = KoraRunner(cfg, store, SpeakLedger(), clock, journal, None,
+                        client_factory=lambda opts: FakeClient(opts))
+    captured["runner"] = runner
+    return runner, store
+
+
+async def _run_gate(tmp_path, gate_mode, probes):
+    """Прогоняет ран с gate_mode и возвращает список решений по probes (во время рана,
+    когда снапшот gate_mode уже стоит — паттерн test_runspec.py)."""
+    captured = {"probes": probes, "results": []}
+    runner, store = _gate_runner(tmp_path, captured, gate_mode)
+    store.start_task("t1", "з", TaskStatus.RUNNING, 0.0)
+    await runner._run("t1", "з", RunSpec(thread_id="th1", gate_mode=gate_mode))
+    return captured["results"]
+
+
+def _mk(tmp_path, *parts):
+    p = tmp_path / "ws"
+    for seg in parts:
+        p = p / seg
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("x", encoding="utf-8")
+    return p
+
+
+async def test_docs_only_allows_write_into_docs_subtree(tmp_path):
+    _mk(tmp_path, "docs", "plans", "x.md")
+    f = tmp_path / "ws" / "docs" / "plans" / "x.md"
+    [res] = await _run_gate(tmp_path, "docs_only", [("Write", {"file_path": str(f)})])
+    allowed, _, cat = res
+    assert allowed and cat == "allow"
+
+
+async def test_docs_only_denies_write_into_src(tmp_path):
+    _mk(tmp_path, "src", "main.py")
+    f = tmp_path / "ws" / "src" / "main.py"
+    [res] = await _run_gate(tmp_path, "docs_only", [("Write", {"file_path": str(f)})])
+    allowed, _, cat = res
+    assert not allowed and cat == "docs_only_violation"
+
+
+async def test_docs_only_allows_top_level_md_edit(tmp_path):
+    _mk(tmp_path, "plan.md")
+    f = tmp_path / "ws" / "plan.md"
+    [res] = await _run_gate(tmp_path, "docs_only", [("Edit", {"file_path": str(f)})])
+    allowed, _, cat = res
+    assert allowed and cat == "allow"
+
+
+async def test_docs_only_denies_top_level_non_md(tmp_path):
+    _mk(tmp_path, "config.toml")
+    f = tmp_path / "ws" / "config.toml"
+    [res] = await _run_gate(tmp_path, "docs_only", [("Write", {"file_path": str(f)})])
+    allowed, _, cat = res
+    assert not allowed and cat == "docs_only_violation"
+
+
+async def test_docs_only_allows_read_and_grep_anywhere(tmp_path):
+    _mk(tmp_path, "src", "deep.py")
+    f = tmp_path / "ws" / "src" / "deep.py"
+    res = await _run_gate(tmp_path, "docs_only", [
+        ("Read", {"file_path": str(f)}),
+        ("Grep", {"path": str(tmp_path / "ws" / "src")}),
+    ])
+    assert all(allowed and cat == "allow" for allowed, _, cat in res)
+
+
+async def test_docs_only_secret_still_denied_before_docs_check(tmp_path):
+    """Порядок проверок: секрет ловится ДО docs_only, даже внутри docs/ (docs/.env)."""
+    _mk(tmp_path, "docs", ".env")
+    f = tmp_path / "ws" / "docs" / ".env"
+    [res] = await _run_gate(tmp_path, "docs_only", [("Write", {"file_path": str(f)})])
+    allowed, _, cat = res
+    assert not allowed and cat == "secret_path"
+
+
+async def test_full_gate_mode_byte_identical_to_pre_docs_only(tmp_path):
+    """gate_mode=full — мутирующая Write в src/ разрешена (поведение прежнее)."""
+    _mk(tmp_path, "src", "main.py")
+    f = tmp_path / "ws" / "src" / "main.py"
+    [res] = await _run_gate(tmp_path, "full", [("Write", {"file_path": str(f)})])
+    allowed, _, cat = res
+    assert allowed and cat == "allow"
+
+
+def test_no_run_snapshot_defaults_to_full_gate_mode(tmp_path):
+    """Вне рана (снапшот пуст) _current_gate_mode() → 'full' — fail-open корректен."""
+    captured = {"probes": [], "results": []}
+    runner, _ = _gate_runner(tmp_path, captured, "full")
+    assert runner._current_gate_mode() == "full"
+
+
+async def test_snapshot_gate_mode_cleared_after_run(tmp_path):
+    """Снапшот gate_mode чистится в finally identity-guard, как _run_root/_run_model."""
+    captured = {"probes": [], "results": []}
+    runner, store = _gate_runner(tmp_path, captured, "docs_only")
+    store.start_task("t9", "з", TaskStatus.RUNNING, 0.0)
+    await runner._run("t9", "з", RunSpec(thread_id="th9", gate_mode="docs_only"))
+    assert runner._run_gate_mode is None
+    assert runner._current_gate_mode() == "full"  # вне рана → full
+
+
+async def test_parked_answer_not_delivered_after_run_ends(tmp_path):
+    """Факт 12 (межзапускный reset): SPEC_PLAN-запуск паркует AskUserQuestion, ран завершается,
+    provide_answer в НОВЫЙ (ещё не стартовавший) ран не доставляется — awaiting чист. На UI-пути
+    supersede не делается (409 на занятом), поэтому чистота держится на finally-очистке
+    _handle_question. Здесь проверяем observable: после конца рана provide_answer → False
+    (вопрос не кому доставлять), awaiting флаг погашен."""
+    captured = {"probes": [], "results": []}
+    runner, store = _gate_runner(tmp_path, captured, "docs_only")
+    store.start_task("tA", "з", TaskStatus.RUNNING, 0.0)
+    await runner._run("tA", "з", RunSpec(thread_id="thA", gate_mode="docs_only"))
+    # ран закончился, снапшот чист — ответ некому доставлять
+    assert runner.provide_answer("да") is False
+    assert store.awaiting_answer is False

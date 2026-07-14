@@ -55,6 +55,10 @@ _PATH_KEY = {
 # workspace); a mutating tool with no path is fail-closed (Deny) — never let it default out.
 _READ_SEARCH_TOOLS = frozenset({"Glob", "Grep", "LS"})
 
+# UI-4 (docs_only): мутирующие файловые инструменты, сужаемые до docs-дерева и top-level md.
+# Read/Glob/Grep/LS — читающие, docs_only их НЕ трогает; _SAFE_META_TOOLS тоже.
+_MUTATING_FILE_TOOLS = frozenset({"Write", "Edit", "NotebookEdit"})
+
 # Non-file tools that reach the network / a shell — named only for the gate's deny CATEGORY
 # (they are already denied by the _PATH_KEY miss; naming does not change the outcome).
 _EGRESS_TOOLS = frozenset({"Bash", "WebFetch", "WebSearch"})
@@ -345,6 +349,10 @@ class KoraRunner:
         self._run_owner: str | None = None
         self._run_root: Path | None = None
         self._run_model: str | None = None
+        # UI-4 (docs_only): четвёртый слот снапшота тем же паттерном. None = «рана нет»
+        # (честный сентинел, как _run_root); НЕ ставить дефолт "full" в слот, иначе
+        # is-not-None всегда истинно и зеркало ломается. ПЕРВЫЙ читатель spec.gate_mode.
+        self._run_gate_mode: str | None = None
 
     # --- launch / cancel (host-facing) -----------------------------------------------------
 
@@ -392,6 +400,7 @@ class KoraRunner:
         root = Path(spec.project_root) if spec.project_root else self._workspace()
         self._run_owner, self._run_root = task_id, root
         self._run_model = spec.model or self._cfg.kora_model
+        self._run_gate_mode = spec.gate_mode or "full"
         try:
             await asyncio.wait_for(self._stream(task_id, text), self._cfg.kora_deadline_s)
         except Exception as exc:  # noqa: BLE001 — includes TimeoutError; CancelledError is a
@@ -403,6 +412,7 @@ class KoraRunner:
                 self._run_owner = None
                 self._run_root = None
                 self._run_model = None
+                self._run_gate_mode = None
             self._terminalize_if_running(task_id)
             # UI-2 (находка G): исход запуска → тред. Источник — терминальный статус стора
             # ПОСЛЕ terminalize; чужой task в сторе (суперсид) → исход не наш, молчим.
@@ -464,6 +474,11 @@ class KoraRunner:
         """Один корень на все три головы (спека §3): во время рана — снапшот RunSpec;
         вне рана (юнит-вызов options/гейта без _run) — конфиг-дефолт."""
         return self._run_root if self._run_root is not None else self._workspace()
+
+    def _current_gate_mode(self) -> str:
+        """Зеркало _current_root: во время рана — снапшот gate_mode; вне рана — 'full'
+        (fail-open корректен для docs_only — это сужение, а не замена)."""
+        return self._run_gate_mode if self._run_gate_mode is not None else "full"
 
     def _system_prompt(self, workspace: Path, task_text: str) -> str:
         # LOAD-BEARING (§2d CASE 1): with setting_sources=[] Kora does not otherwise know its
@@ -542,6 +557,15 @@ class KoraRunner:
         if _is_secret_path(resolved):
             return False, "secret_path", "secret_path"
         if resolved.is_relative_to(ws_resolved):
+            # UI-4 (docs_only): сужение ПОСЛЕ секрет-чека и in-workspace. Мутирующий инструмент
+            # разрешён только в поддереве <ws>/docs/ ИЛИ в top-level .md файле корня; всё остальное
+            # — deny (Р3 whitelist docs-путей). Читающие инструменты не трогаются. Категория-only
+            # в detail — прецедент B21 (не светить resolved-путь агенту).
+            if self._current_gate_mode() == "docs_only" and tool_name in _MUTATING_FILE_TOOLS:
+                in_docs = resolved.is_relative_to(ws_resolved / "docs")
+                top_md = resolved.parent == ws_resolved and resolved.suffix == ".md"
+                if not (in_docs or top_md):
+                    return False, "docs_only_violation", "docs_only_violation"
             return True, str(resolved), "allow"
         return False, "outside_workspace", "outside_workspace"
 
