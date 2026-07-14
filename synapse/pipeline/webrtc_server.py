@@ -469,7 +469,10 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         return JSONResponse(proj)
 
     @app.get("/api/threads")
-    async def api_threads_list():
+    async def api_threads_list(archived: str | None = None):
+        # UI-5 (S31): по умолчанию архив скрыт; ?archived=1 отдаёт только архив.
+        if archived and archived != "0":
+            return JSONResponse({"threads": [_thread_dict(t) for t in host.threads.list(include_archived=True) if t.archived]})
         return JSONResponse({"threads": [_thread_dict(t) for t in host.threads.list()]})
 
     @app.get("/api/threads/{thread_id}")
@@ -539,6 +542,36 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             return JSONResponse({"error": "empty title"}, status_code=400)
         host.threads.rename(thread_id, title[:80])
         return JSONResponse(_thread_dict(host.threads.get(thread_id)))
+
+    @app.post("/api/threads/{thread_id}/archive")
+    async def api_thread_archive(thread_id: str, request: Request):
+        """Архив треда (UI-5, S31). 409 только если жив ИМЕННО этот тред — детект per-thread,
+        не глобальный busy: архив ДРУГОГО треда пока первый исполняется разрешён."""
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        th = host.threads.get(thread_id)
+        if th is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        # per-thread busy: синглтон говорит ЧТО бежит, thread_for_task — В КАКОМ треде.
+        task = host.store.task
+        if task is not None and task.status == TaskStatus.RUNNING:
+            live = host.threads.thread_for_task(task.id)
+            if live is not None and live.id == thread_id:
+                return JSONResponse({"error": "busy"}, status_code=409)
+        host.threads.set_archived(thread_id, True)
+        return JSONResponse(_thread_dict(host.threads.get(thread_id)))
+
+    @app.delete("/api/projects/{project_id}")
+    async def api_projects_delete(project_id: str, request: Request):
+        """Удаление проекта (UI-5, S31): проект удаляется, его треды НЕ удаляются —
+        project_id → None + event «проект удалён» в их ленты. Возвращает свежий список."""
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        removed = await host.projects.remove(project_id)
+        if not removed:
+            return JSONResponse({"error": "no such project"}, status_code=404)
+        host.threads.unbind_project(project_id)
+        return JSONResponse({"projects": host.projects.list()})
 
     @app.post("/api/threads/{thread_id}/gate")
     async def api_thread_gate(thread_id: str, request: Request):

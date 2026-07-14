@@ -35,6 +35,14 @@ function patchJSON(url, body) {
                       body: JSON.stringify(body), signal: ctrl.signal })
     .finally(() => clearTimeout(timeout));
 }
+// UI-5 (S31): DELETE для удаления проекта.
+function deleteJSON(url) {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  return fetch(url, { method: "DELETE", headers: { "content-type": "application/json" },
+                      signal: ctrl.signal })
+    .finally(() => clearTimeout(timeout));
+}
 function el(tag, cls, text) {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -178,6 +186,8 @@ function renderStageChip(t) {
 
 // ---------- сайдбар: дерево проект → его треды-ветки ----------
 function threadCard(t, cur, showProj) {
+  // UI-5 (S31): карточка = контейнер (ссылка + кнопка «архив»), не голая <a>.
+  const wrap = el("div", "tc-wrap");
   const a = el("a", "thread-card" + (cur.view === "thread" && cur.id === t.id ? " active" : ""));
   a.href = "#/thread/" + encodeURIComponent(t.id);
   const o = outcomeLabel(t.last_outcome);
@@ -185,7 +195,34 @@ function threadCard(t, cur, showProj) {
   if (STAGES[t.stage]) a.appendChild(el("span", "tc-stage", STAGES[t.stage]));
   const proj = showProj ? projects.find((p) => p.id === t.project_id) : null;
   a.appendChild(el("span", "tc-meta", relTime(t.updated_ts) + (proj ? " · " + proj.name : "")));
-  return a;
+  wrap.appendChild(a);
+  const ar = el("button", "tc-archive");
+  ar.type = "button";
+  ar.textContent = "архив";
+  ar.title = "Архивировать тред";
+  ar.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); archiveThread(t); });
+  wrap.appendChild(ar);
+  return wrap;
+}
+
+async function archiveThread(t) {
+  if (!window.confirm("Архивировать тред «" + t.title + "»?")) return;
+  try {
+    const res = await postJSON(`/api/threads/${encodeURIComponent(t.id)}/archive`, {});
+    if (res.ok) await loadLists();
+    else setConn("не архивировать");
+  } catch { setConn("сеть недоступна"); }
+}
+
+async function deleteProject(p) {
+  if (!window.confirm("Удалить проект «" + p.name + "»? Треды останутся, но потеряют привязку.")) return;
+  try {
+    const res = await deleteJSON(`/api/projects/${encodeURIComponent(p.id)}`);
+    if (res.ok) {
+      if (activeProject === p.id) setActiveProject(null);
+      await loadLists();
+    } else setConn("не удалить проект");
+  } catch { setConn("сеть недоступна"); }
 }
 
 function renderSidebar() {
@@ -201,6 +238,13 @@ function renderSidebar() {
     row.appendChild(el("span", "pr-name", "📁 " + p.name));
     row.addEventListener("click", () => setActiveProject(p.id));
     li.appendChild(row);
+    // UI-5 (S31): удалить проект — confirm() перед опасным действием; треды не гибнут.
+    const del = el("button", "pr-delete");
+    del.type = "button";
+    del.textContent = "×";
+    del.title = "Удалить проект (треды останутся)";
+    del.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); deleteProject(p); });
+    li.appendChild(del);
     const branch = el("ul", "branch");
     threads.filter((t) => t.project_id === p.id).forEach((t) => {
       const bi = el("li");

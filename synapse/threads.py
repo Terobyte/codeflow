@@ -101,8 +101,11 @@ class ThreadStore:
     def get(self, thread_id: str) -> Thread | None:
         return self._threads.get(thread_id)
 
-    def list(self) -> list[Thread]:
-        return sorted(self._threads.values(), key=lambda t: t.updated_ts, reverse=True)
+    def list(self, include_archived: bool = False) -> list[Thread]:
+        items = self._threads.values() if include_archived else (
+            t for t in self._threads.values() if not t.archived
+        )
+        return sorted(items, key=lambda t: t.updated_ts, reverse=True)
 
     def append_task(self, thread_id: str, task_id: str) -> None:
         t = self._threads.get(thread_id)
@@ -201,6 +204,34 @@ class ThreadStore:
         t.updated_ts = self._clock.now()
         self._persist(t)
         return True
+
+    # --- архив треда (UI-5, S31) -------------------------------------------------------
+
+    def set_archived(self, thread_id: str, archived: bool) -> bool:
+        """Архивация/разархивация треда. Архивированный тред исключается из обычного list()
+        и GET /api/threads, виден с ?archived=1. Лента и метаданные сохраняются."""
+        t = self._threads.get(thread_id)
+        if t is None:
+            return False
+        t.archived = archived
+        t.updated_ts = self._clock.now()
+        self._persist(t)
+        return True
+
+    def unbind_project(self, project_id: str) -> int:
+        """Снять привязку к удалённому проекту со всех его тредов (UI-5, S31): треды НЕ
+        удаляются, лишь project_id → None + event «проект удалён» в их ленты. Возвращает
+        число затронутых тредов."""
+        count = 0
+        now = self._clock.now()
+        for t in self._threads.values():
+            if t.project_id == project_id:
+                t.project_id = None
+                t.updated_ts = now
+                self._persist(t)
+                self.append_feed(t.id, {"ts": now, "kind": "event", "text": "проект удалён"})
+                count += 1
+        return count
 
     # --- лента (S3) -----------------------------------------------------------------------
 

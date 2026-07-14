@@ -81,3 +81,14 @@ class ProjectStore:
             self._projects.append(proj)
             self._persist()
             return proj
+
+    async def remove(self, project_id: str) -> bool:
+        """Удалить проект по id (UI-5, S31). Атомарный rewrite под тем же lock, что add.
+        Возвращает True если проект был и удалён, False если не найден."""
+        async with self._lock:
+            before = len(self._projects)
+            self._projects = [p for p in self._projects if p["id"] != project_id]
+            if len(self._projects) == before:
+                return False
+            self._persist()
+            return True

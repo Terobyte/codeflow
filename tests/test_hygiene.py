@@ -613,3 +613,258 @@ def test_rename_ui_handlers_present_and_xss_safe():
     assert '$("view-title").addEventListener' in app
 
 
+# --- Task 11: архив тредов + удаление проекта (S31) ------------------------------------
+# Заимствуем _endpoint/FakeRequest, определённые выше (Task 10 секция).
+
+
+def _api_host_archive(tmp_path):
+    """Хост с ThreadStore + ProjectStore + store для per-thread busy-чека."""
+    clock = FakeClock()
+    threads = ThreadStore(clock, tmp_path / "threads")
+    from synapse.projects import ProjectStore
+    return SimpleNamespace(
+        clock=clock, threads=threads, store=TaskStore(clock),
+        projects=ProjectStore(tmp_path / "projects.json"),
+        turn_lock=asyncio.Lock(),
+    )
+
+
+# --- store: set_archived / list(include_archived) --------------------------------------
+
+
+def test_set_archived_excludes_from_default_list(tmp_path):
+    clock = FakeClock()
+    threads = ThreadStore(clock, tmp_path / "threads")
+    a = threads.create("живой")
+    b = threads.create("на архив")
+    threads.set_archived(b.id, True)
+    visible = [t.id for t in threads.list()]
+    assert a.id in visible and b.id not in visible
+
+
+def test_list_include_archived_returns_all(tmp_path):
+    clock = FakeClock()
+    threads = ThreadStore(clock, tmp_path / "threads")
+    a = threads.create("живой")
+    b = threads.create("на архив")
+    threads.set_archived(b.id, True)
+    all_ids = {t.id for t in threads.list(include_archived=True)}
+    assert all_ids == {a.id, b.id}
+
+
+def test_set_archived_unknown_thread_returns_false(tmp_path):
+    clock = FakeClock()
+    threads = ThreadStore(clock, tmp_path / "threads")
+    assert not threads.set_archived("ghost", True)
+
+
+def test_set_archived_preserves_feed_and_metadata(tmp_path):
+    clock = FakeClock()
+    threads = ThreadStore(clock, tmp_path / "threads")
+    th = threads.create("тред")
+    threads.append_feed(th.id, {"kind": "user", "text": "реплика"})
+    threads.set_archived(th.id, True)
+    # рестарт: новый стор читает тот же каталог — лента и archived сохранены
+    store2 = ThreadStore(FakeClock(), tmp_path / "threads")
+    assert store2.get(th.id).archived is True
+    feed = store2.read_feed(th.id)
+    assert any(e.get("kind") == "user" for e in feed)
+
+
+# --- unbind_project -------------------------------------------------------------------
+
+
+async def test_unbind_project_clears_project_id_and_writes_event(tmp_path):
+    clock = FakeClock()
+    threads = ThreadStore(clock, tmp_path / "threads")
+    from synapse.projects import ProjectStore
+    projects = ProjectStore(tmp_path / "projects.json")
+    (tmp_path / "proj").mkdir()
+    proj = await projects.add("п", str(tmp_path / "proj"))
+    th = threads.create("в проекте")
+    threads.bind_project(th.id, proj["id"])
+    orphan = threads.create("без проекта")
+    count = threads.unbind_project(proj["id"])
+    assert count == 1
+    assert threads.get(th.id).project_id is None  # тред НЕ удалён
+    assert threads.get(orphan.id) is not None  # чужой тред не тронут
+    # event «проект удалён» добавлен в ленту затронутого треда
+    feed = threads.read_feed(th.id)
+    assert any(e.get("kind") == "event" and "проект удалён" in e.get("text", "") for e in feed)
+
+
+# --- ProjectStore.remove --------------------------------------------------------------
+
+
+async def test_project_remove_deletes_and_returns_true(tmp_path):
+    from synapse.projects import ProjectStore
+    store = ProjectStore(tmp_path / "projects.json")
+    (tmp_path / "p").mkdir()
+    proj = await store.add("п", str(tmp_path / "p"))
+    assert await store.remove(proj["id"]) is True
+    assert store.get(proj["id"]) is None
+
+
+async def test_project_remove_unknown_returns_false(tmp_path):
+    from synapse.projects import ProjectStore
+    store = ProjectStore(tmp_path / "projects.json")
+    assert await store.remove("ghost") is False
+
+
+async def test_project_remove_survives_restart(tmp_path):
+    from synapse.projects import ProjectStore
+    store1 = ProjectStore(tmp_path / "projects.json")
+    (tmp_path / "keep").mkdir(); (tmp_path / "gone").mkdir()
+    keep = await store1.add("keep", str(tmp_path / "keep"))
+    gone = await store1.add("gone", str(tmp_path / "gone"))
+    await store1.remove(gone["id"])
+    store2 = ProjectStore(tmp_path / "projects.json")
+    assert store2.get(keep["id"]) is not None
+    assert store2.get(gone["id"]) is None
+
+
+# --- POST /api/threads/{id}/archive ---------------------------------------------------
+
+
+async def test_archive_route_csrf_rejects_non_json(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    th = host.threads.create("тред")
+    ep = _endpoint(app, "api_thread_archive")
+    resp = await ep(th.id, FakeRequest({}, json_ct=False))
+    assert resp.status_code == 403
+
+
+async def test_archive_route_unknown_thread_404(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    ep = _endpoint(app, "api_thread_archive")
+    resp = await ep("ghost", FakeRequest({}))
+    assert resp.status_code == 404
+
+
+async def test_archive_route_success_sets_archived(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    th = host.threads.create("тред")
+    ep = _endpoint(app, "api_thread_archive")
+    resp = await ep(th.id, FakeRequest({}))
+    assert resp.status_code == 200
+    import json as _json
+    assert _json.loads(resp.body)["archived"] is True
+
+
+async def test_archive_route_409_only_for_live_thread(tmp_path):
+    """per-thread busy: архив ИМЕННО живого треда → 409; архив ДРУГОГО пока первый
+    исполняется → OK. Голый глобальный busy-чек ложно-409-нул бы второй."""
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    from synapse.bridge.state import TaskStatus
+    live = host.threads.create("живой тред с задачей")
+    other = host.threads.create("другой тред")
+    host.threads.append_task(live.id, "t1")
+    host.store.start_task("t1", "з", TaskStatus.RUNNING, 0.0)
+    ep = _endpoint(app, "api_thread_archive")
+    # архив живого треда → 409
+    assert (await ep(live.id, FakeRequest({}))).status_code == 409
+    assert host.threads.get(live.id).archived is False  # стадия/архив не сдвинуты
+    # архив ДРУГОГО треда пока первый исполняется → OK
+    resp = await ep(other.id, FakeRequest({}))
+    assert resp.status_code == 200
+    assert host.threads.get(other.id).archived is True
+
+
+# --- GET /api/threads hides archived, ?archived=1 shows them --------------------------
+
+
+async def test_threads_list_route_hides_archived(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    a = host.threads.create("живой")
+    b = host.threads.create("архив")
+    host.threads.set_archived(b.id, True)
+    ep = _endpoint(app, "api_threads_list")
+    import json as _json
+    visible = [t["id"] for t in _json.loads((await ep()).body)["threads"]]
+    assert a.id in visible and b.id not in visible
+
+
+async def test_threads_list_route_archived_param(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    a = host.threads.create("живой")
+    b = host.threads.create("архив")
+    host.threads.set_archived(b.id, True)
+    ep = _endpoint(app, "api_threads_list")
+    import json as _json
+    # ?archived=1 → только архив
+    archived = _json.loads((await ep(archived="1")).body)["threads"]
+    assert [t["id"] for t in archived] == [b.id]
+
+
+# --- DELETE /api/projects/{id} --------------------------------------------------------
+
+
+async def test_delete_project_route_csrf(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    ep = _endpoint(app, "api_projects_delete")
+    resp = await ep("x", FakeRequest({}, json_ct=False))
+    assert resp.status_code == 403
+
+
+async def test_delete_project_route_unknown_404(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    ep = _endpoint(app, "api_projects_delete")
+    resp = await ep("ghost", FakeRequest({}))
+    assert resp.status_code == 404
+
+
+async def test_delete_project_route_success_unbinds_threads(tmp_path):
+    webrtc_server = _webrtc_or_skip()
+    host = _api_host_archive(tmp_path)
+    app = webrtc_server.build_web_app(host=host)
+    (tmp_path / "p").mkdir()
+    proj = await host.projects.add("п", str(tmp_path / "p"))
+    th = host.threads.create("в проекте")
+    host.threads.bind_project(th.id, proj["id"])
+    ep = _endpoint(app, "api_projects_delete")
+    resp = await ep(proj["id"], FakeRequest({}))
+    assert resp.status_code == 200
+    import json as _json
+    # проект удалён из возвращённого списка
+    assert all(p["id"] != proj["id"] for p in _json.loads(resp.body)["projects"])
+    # тред жив, но потерял привязку
+    assert host.threads.get(th.id) is not None
+    assert host.threads.get(th.id).project_id is None
+    # event в ленте
+    feed = host.threads.read_feed(th.id)
+    assert any(e.get("kind") == "event" and "проект удалён" in e.get("text", "") for e in feed)
+
+
+# --- UI lexical: archive/delete handlers ----------------------------------------------
+
+
+def test_archive_delete_ui_handlers_present_and_xss_safe():
+    """app.js: кнопка «архив» в карточке треда, «×» у проекта, confirm(), deleteJSON;
+    без innerHTML; карточка остаётся ссылкой (#/thread/...) для SPA-роутера."""
+    app_path = Path(__file__).resolve().parent.parent / "synapse" / "pipeline" / "client" / "app.js"
+    app = app_path.read_text(encoding="utf-8")
+    for token in ("archiveThread", "deleteProject", "deleteJSON",
+                  "tc-archive", "pr-delete", "/archive", "/api/projects/",
+                  "window.confirm"):
+        assert token in app, f"archive/delete UI missing {token!r}"
+    assert "innerHTML" not in app
+    # archived-фильтрация идёт через сервер (loadLists), но UI не рендерит archived-треды
+
+
+
