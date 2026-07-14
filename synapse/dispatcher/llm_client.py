@@ -30,7 +30,24 @@ def _schema_to_tool(schema: Any) -> dict[str, Any]:
 def _to_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
     out: list[dict[str, Any]] = []
+    # Buffer for a run of consecutive tool messages so their tool_result blocks
+    # coalesce into ONE user message (canonical Anthropic parallel-tool-use shape).
+    tool_results: list[dict[str, Any]] = []
+
+    def _flush_tool_results() -> None:
+        if tool_results:
+            out.append({"role": "user", "content": list(tool_results)})
+            tool_results.clear()
+
     for m in messages:
+        if m["role"] == "tool":
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": m.get("tool_call_id", ""),
+                "content": m["content"],
+            })
+            continue
+        _flush_tool_results()
         if m["role"] == "user":
             out.append({"role": "user", "content": m["content"]})
         elif m["role"] == "assistant":
@@ -41,15 +58,7 @@ def _to_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str, list[di
                 blocks.append({"type": "tool_use", "id": c["id"], "name": c["name"],
                                "input": c["arguments"]})
             out.append({"role": "assistant", "content": blocks or m.get("content", "")})
-        elif m["role"] == "tool":
-            out.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": m.get("tool_call_id", ""),
-                    "content": m["content"],
-                }],
-            })
+    _flush_tool_results()
     return system, out
 
 

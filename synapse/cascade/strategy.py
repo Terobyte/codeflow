@@ -48,6 +48,11 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
         self._cost_cap = cost_cap
         self._generation_guard = generation_guard
         self._clock = clock
+        # B21: the generation _advance last recorded a paid attempt for. The success-side
+        # switcher counter (app._CostCountingLLMSwitcher) reads this to avoid double-counting a
+        # tier0 that failover RETURNED to (which _advance already counted) — its `idx==0` gate
+        # wrongly assumed tier0 is only ever the initial, never-pre-counted tier.
+        self._advanced_in_generation: int | None = None
         self._register_event_handler("on_retry")
         self._register_event_handler("on_tail_tier")
         self._register_event_handler("on_all_failed")
@@ -56,6 +61,14 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
         if self._active_service is None:
             return None
         return self._services.index(self._active_service)
+
+    def advanced_this_generation(self) -> bool:
+        """B21: True iff _advance already counted a paid failover attempt for the CURRENT
+        generation. `current_generation` is stable across a turn's tier retries (it advances
+        only on a new LLMContextFrame, not a tier switch), so this cleanly distinguishes an
+        initial tier0 (the switcher SHOULD count) from a failover-reached tier0 (already
+        counted here → the switcher must NOT count it again)."""
+        return self._advanced_in_generation == self._generation_guard.current_generation
 
     async def handle_error(self, error: ErrorFrame) -> FrameProcessor | None:
         now = self._clock.now()
@@ -91,6 +104,10 @@ class SynapseFailoverStrategy(ServiceSwitcherStrategyFailover):
             if not allowed:
                 await self._fail_all("cost_cap")
                 return None
+            # B21: mark that THIS generation's paid attempt is already counted here, so the
+            # success-side switcher counter skips it (prevents the failover-back-to-tier0
+            # double-count). Set for any paid tier — the switcher only recounts at idx==0.
+            self._advanced_in_generation = self._generation_guard.current_generation
 
         result = await self._set_active_if_available(self._services[next_idx])
         if result is None:

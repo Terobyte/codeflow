@@ -17,6 +17,7 @@ import contextvars
 import functools
 import itertools
 import logging
+import os
 from collections import deque
 from typing import Any
 
@@ -181,15 +182,22 @@ class SynapseHost:
         if self._output_task is task:
             self._output_task = None
 
-    async def push_speak_frame(self, text: str) -> None:
+    async def push_speak_frame(self, text: str) -> bool:
         """Inject Kora's SPEAK straight into the running output task, out-of-band (no input
         frame needed). Re-checks liveness: the task may have finished between `speak()`
         scheduling this and it running. `queue_frame` on a finished task is a SILENT DROP
         (worker.py: an unbounded put never raises/blocks, the drain task is gone), so the
-        `has_finished()` guard is what actually prevents a lost-in-the-void SPEAK."""
+        `has_finished()` guard is what actually prevents a lost-in-the-void SPEAK.
+
+        Returns True iff the frame was actually queued. B17: the finished/unbound guard
+        returns normally WITHOUT raising, so the raise-only revert (B01) never fired for this
+        clean-return silent drop — the ledger stayed spoken=True and the Р-15г watchdog was
+        disarmed. Signalling non-delivery lets `_on_speak_frame_done` revert here too."""
         t = self._output_task
         if t is not None and not t.has_finished():
             await t.queue_frame(TTSSpeakFrame(text=text, append_to_context=False))
+            return True
+        return False
 
     def speak(self, text: str) -> None:
         """SPEAK entry point (called by on_speak). Registers the ledger ALWAYS and synchronously
@@ -226,6 +234,14 @@ class SynapseHost:
         if exc is not None:
             # NOT delivered → revert the optimistic mark so the Р-15г watchdog alerts.
             logger.warning("push_speak_frame injection failed; SPEAK dropped: %r", exc)
+            self.speak_ledger.revert_speak(marked)
+            return
+        if fut.result() is False:
+            # B17: the output task finished/was unbound in the scheduling window, so
+            # push_speak_frame returned a clean False — a SILENT drop, no audio, and NO arbiter
+            # fallback was taken (speak() saw the task live). Revert exactly as the cancel/raise
+            # paths do so the dropped critical re-arms the Р-15г watchdog instead of vanishing.
+            logger.warning("push_speak_frame silently dropped SPEAK (output task finished); reverting")
             self.speak_ledger.revert_speak(marked)
 
     async def monitor_forever(self) -> None:
@@ -340,7 +356,12 @@ class SynapseHost:
                     return {"error": "confirm_required"}
                 # план-файл должен существовать И последняя SPEC_PLAN — completed (иначе stale_plan:
                 # устаревший файл от провалившейся попытки не должен пускать CODE)
-                root = self._resolve_root_for(th)
+                # B18: root может быть None (projectless тред + kora_workspace_dir не задан) — это
+                # ЛЕГАЛЬНЫЙ сигнал «дефолт-воркспейс» (RunSpec его так и трактует). Раньше `Path(None)`
+                # тут кидал TypeError МИМО ValueError-гарда ниже → неперехваченный 500 / краш хода.
+                # Резолвим план-путь против того же дефолт-воркспейса, что и рантайм Коры
+                # (зеркало kora.py:485 `kora_workspace_dir or ~/synapse-kora-workspace`).
+                root = self._resolve_root_for(th) or os.path.expanduser("~/synapse-kora-workspace")
                 plan_path = Path(root) / "docs" / "plans" / f"{thread_id}.md"
                 if not plan_path.exists():
                     return {"error": "no_plan_file"}
@@ -406,7 +427,11 @@ class _CostCountingLLMSwitcher(LLMSwitcher):
     async def push_frame(self, frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
             idx = self.strategy.active_tier_index()
-            if idx == 0 and self._labels[idx].paid:
+            # B21: only count the INITIAL tier0 attempt here. If failover RETURNED to tier0
+            # this generation, strategy._advance already counted it — recounting double-charges
+            # the cap and trips it prematurely. `advanced_this_generation()` is the guard.
+            if (idx == 0 and self._labels[idx].paid
+                    and not self.strategy.advanced_this_generation()):
                 self._cost_cap.record_paid_attempt(self._clock.now())
         await super().push_frame(frame, direction)
 

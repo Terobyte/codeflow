@@ -25,7 +25,11 @@ class ProjectValidationError(ValueError):
     pass
 
 
-def validate_project_path(raw: str) -> Path:
+def validate_project_path(raw: str, *, require_exists: bool = True) -> Path:
+    """Валидация корня проекта. `require_exists=False` (путь загрузки, B19) снимает ТОЛЬКО
+    проверку существования директории — секрет/системный/домашний денилист остаётся жёстким.
+    Проект на временно отмонтированном диске обязан пережить рестарт, а вот секрет-корень —
+    нет: безопасность — инвариант СТОРА, а не только write-пути (см. `_load`)."""
     p = Path(raw).expanduser()
     if not p.is_absolute():
         raise ProjectValidationError("нужен абсолютный путь")
@@ -42,7 +46,7 @@ def validate_project_path(raw: str) -> Path:
     for sub in _FORBIDDEN_HOME_SUBDIRS:
         if rp.is_relative_to(home / sub):
             raise ProjectValidationError("секретные директории запрещены")
-    if not rp.is_dir():
+    if require_exists and not rp.is_dir():
         raise ProjectValidationError("директория не существует")
     return rp
 
@@ -62,11 +66,22 @@ class ProjectStore:
         except (json.JSONDecodeError, OSError):
             return
         if isinstance(data, list):
-            self._projects = [
-                {"id": str(d["id"]), "name": str(d.get("name") or ""), "path": str(d.get("path") or "")}
-                for d in data
-                if isinstance(d, dict) and d.get("id")
-            ]
+            loaded: list[dict] = []
+            for d in data:
+                if not (isinstance(d, dict) and d.get("id")):
+                    continue
+                raw_path = str(d.get("path") or "")
+                try:
+                    # B19: re-validate on load with the SAME security denylist add() uses, so a
+                    # project persisted before the B05 denylist shipped — or a hand-edited
+                    # projects.json — cannot re-admit a secret-rooted workspace (B03/B16 surface).
+                    # require_exists=False: a transiently-missing dir survives; only the denylist
+                    # is enforced. Validation is a store invariant, not just a write-path check.
+                    validate_project_path(raw_path, require_exists=False)
+                except ProjectValidationError:
+                    continue
+                loaded.append({"id": str(d["id"]), "name": str(d.get("name") or ""), "path": raw_path})
+            self._projects = loaded
 
     def _persist(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

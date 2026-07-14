@@ -220,7 +220,6 @@ class DispatcherTurnLoop:
             # после cut нет user-сообщения — хвост одна группа, резать нечего чисто
             return
         older = history[:cut]
-        tail = history[cut:]
         # NO-EXFIL: в историю компакта попадают ТОЛЬКО user/assistant (по построению здесь
         # другого и нет); кора-виды/лента сюда не входят. tools=[] — компакт без инструментов.
         compact_messages = [
@@ -235,10 +234,16 @@ class DispatcherTurnLoop:
         except Exception:  # noqa: BLE001 — сбой компакта не должен валить ход диспетчера
             return
         summary = (summary or "").strip() or "[история сжата]"
-        history[:] = [
-            {"role": "user", "content": f"[КОМПАКТ] {summary}"},
-            *tail,
-        ]
+        # B20: сплайсим по ТЕКУЩЕМУ списку, НЕ по до-await снимку `tail`. Другой ход этого же
+        # треда во время нашего `await self._llm.complete` дописывает свою (user,assistant)-пару
+        # в КОНЕЦ общего списка (turn_lock отпущен до ingest — B-PIPE-5); ребинд из устаревшего
+        # `tail` молча их терял (B20). Старшая половина, которую мы сжали, append-иммутабельна
+        # (ходы дописывают только хвост, голову не трогают) — если она всё ещё голова списка,
+        # заменяем РОВНО её и сохраняем всё, что теперь идёт следом (исходный хвост + чужие
+        # коммиты). Если параллельный ход уже сам пересобрал/сжал список (голова не совпала) —
+        # no-op, а не затирание его результата.
+        if history[:len(older)] == older:
+            history[:len(older)] = [{"role": "user", "content": f"[КОМПАКТ] {summary}"}]
         if self._on_compact is not None:
             try:
                 self._on_compact(thread_id)

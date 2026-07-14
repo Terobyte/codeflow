@@ -118,6 +118,32 @@ def _is_secret_path(p: Path) -> bool:
     return False
 
 
+def _subtree_has_readable_secret(root: Path) -> bool:
+    """B16: `Grep`/`Glob`/`LS` take a DIRECTORY and recurse INSIDE the tool — the per-path
+    `_is_secret_path` gate never sees the files they read, so a content `Grep` at the (legit,
+    non-secret) workspace root exfiltrates `workspace/secrets.yaml` bytes that the same gate
+    denies to a per-file `Read`. Close that asymmetry: scan `root` for a secret file the tool
+    WOULD reach and deny the whole call if one exists.
+
+    Mirrors the tools' default traversal by SKIPPING hidden entries (dotfiles/dotdirs) — which
+    (a) is what ripgrep/glob do without `--hidden`, and (b) avoids flagging every repo's own
+    `.git`/`.env`/`.ssh` (a `_is_secret_path` scan that honoured dir-segments would deny a
+    search in ANY git checkout). Fail-closed and best-effort: it does NOT parse `.gitignore`, so
+    it can OVER-deny a gitignored secret (safe direction) and cannot see a secret reachable only
+    via an explicit `--hidden` (residual — parked for M1.1, see docs/bugs.md B16)."""
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue  # hidden file — the tools skip it by default
+                if _is_secret_path(Path(fn)):
+                    return True
+    except OSError:
+        return True  # cannot scan → fail closed
+    return False
+
+
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 
@@ -564,6 +590,10 @@ class KoraRunner:
                     return False, "path resolution failed", "path_error"
                 if _is_secret_path(ws_resolved):
                     return False, "secret_path", "secret_path"
+                # B16: no-path Grep/Glob/LS default to the workspace root and recurse into it —
+                # deny if a readable secret file lives anywhere in that subtree.
+                if _subtree_has_readable_secret(ws_resolved):
+                    return False, "secret_path", "secret_path"
                 return True, None, "allow"
             return False, f"missing_path: {tool_name}", "missing_path"
         workspace = self._current_root()
@@ -583,6 +613,13 @@ class KoraRunner:
         if _is_secret_path(resolved):
             return False, "secret_path", "secret_path"
         if resolved.is_relative_to(ws_resolved):
+            # B16: a directory-recursion read tool pointed at a DIR inside the workspace reads
+            # every file under it — deny if that subtree holds a readable secret the per-path
+            # check can't see. Only for read/search tools on a directory (a mutating tool's path
+            # is a file, already covered by _is_secret_path above).
+            if (tool_name in _READ_SEARCH_TOOLS and resolved.is_dir()
+                    and _subtree_has_readable_secret(resolved)):
+                return False, "secret_path", "secret_path"
             # UI-4 (docs_only): сужение ПОСЛЕ секрет-чека и in-workspace. Мутирующий инструмент
             # разрешён только в поддереве <ws>/docs/ ИЛИ в top-level .md файле корня; всё остальное
             # — deny (Р3 whitelist docs-путей). Читающие инструменты не трогаются. Категория-only
