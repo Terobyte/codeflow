@@ -13,7 +13,7 @@ from collections import OrderedDict
 from typing import Any, Callable, Protocol
 
 from synapse.bridge.confirm import ConfirmFlow
-from synapse.bridge.state import TaskStore
+from synapse.bridge.state import TaskStore, should_hide_task
 from synapse.clock import Clock
 from synapse.config import SynapseConfig
 from synapse.dispatcher.tools import ALL_SCHEMAS, ToolCall, ToolHandlers
@@ -81,6 +81,7 @@ class DispatcherTurnLoop:
         thread_feed_reader: Callable[[str], list[dict]] | None = None,
         stage_block_for: Callable[[str], str] | None = None,
         on_compact: Callable[[str], None] | None = None,
+        owner_thread_for: Callable[[str], str | None] | None = None,
     ) -> None:
         self._llm = llm
         self._handlers = handlers
@@ -95,6 +96,9 @@ class DispatcherTurnLoop:
         self._stage_block_for = stage_block_for
         # UI-5 (S10): колбэк на факт компакта истории треда (лента пишет event «контекст сжат»).
         self._on_compact = on_compact
+        # Резолвер «id треда-владельца задачи» — скоуп терминальной задачи к её треду в
+        # [СОСТОЯНИЕ] (иначе завершённая задача течёт во все треды, see should_hide_task).
+        self._owner_thread_for = owner_thread_for
         self._histories: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
         # Gate v2 C6 (sec-6): пер-тред поколение истории. clear_history инкрементит его; ход,
         # начатый ДО clear, при коммите видит несовпадение и НЕ воскрешает очищенную историю.
@@ -227,7 +231,7 @@ class DispatcherTurnLoop:
     async def _complete(
         self, history: list[dict[str, Any]], thread_id: str
     ) -> tuple[str, list[ToolCall]]:
-        state_block = self._render_state(self._clock.now())
+        state_block = self._render_state(self._clock.now(), thread_id)
         stage_block = self._stage_block_for(thread_id) if self._stage_block_for is not None else ""
         system_prompt = build_system_prompt(self._cfg, self._task_dictionary, stage_block=stage_block)
         messages: list[dict[str, Any]] = [
@@ -254,8 +258,16 @@ class DispatcherTurnLoop:
         )
         return result
 
-    def _render_state(self, now: float) -> str:
-        return self._store.render_state(now, self._cfg.stale_after_s, self._cfg.unreachable_after_s)
+    def _render_state(self, now: float, thread_id: str | None = None) -> str:
+        # Терминальную задачу чужого треда прячем из [СОСТОЯНИЕ] (глобальный синглтон иначе
+        # течёт: диспетчер в новом треде повторял «задача выполнена» о задаче другого треда).
+        hide = False
+        task = self._store.task
+        if task is not None and self._owner_thread_for is not None:
+            hide = should_hide_task(task, thread_id, self._owner_thread_for(task.id))
+        return self._store.render_state(
+            now, self._cfg.stale_after_s, self._cfg.unreachable_after_s, hide_task=hide
+        )
 
     # --- UI-5 (S10): компакт длинной истории -------------------------------------------
 

@@ -721,6 +721,9 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             thread_feed_reader=threads.read_feed,
             stage_block_for=_stage_block_for,
             on_compact=_on_compact,
+            owner_thread_for=lambda task_id: (
+                th.id if (th := threads.thread_for_task(task_id)) else None
+            ),
         )
 
     # breaker needs only the tier COUNT, not the service instances themselves -- those are

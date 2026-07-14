@@ -134,6 +134,22 @@ def _task_from_dict(d: dict[str, Any]) -> TaskState:
     )
 
 
+def should_hide_task(
+    task: TaskState | None, asking_thread_id: str | None, owner_thread_id: str | None
+) -> bool:
+    """Терминальная (COMPLETED/FAILED) задача привязана к своему треду-владельцу и НЕ должна
+    всплывать как «текущий статус» в чужом треде. Стор — глобальный синглтон (один Кора, одна
+    задача в state.json), но завершённая задача не должна течь в несвязанный разговор: без этого
+    диспетчер в КАЖДОМ треде повторял «задача выполнена, Кора смотрела проект X час назад».
+    Активная задача (RUNNING/PENDING_CONFIRMATION) остаётся глобальной — Кора реально занята, и
+    has_active_task всё равно блокирует параллельный submit. Осиротевшая терминальная задача
+    (owner=None — стейл-остаток из state.json, чей тред не резолвится) прячется ото ВСЕХ: None !=
+    любой thread_id → hide; в родном треде owner совпадает с asking → показываем результат."""
+    if task is None or task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+        return False
+    return owner_thread_id != asking_thread_id
+
+
 class TaskStore:
     """Holds the single active task (§1: "одна активная задача"), Kora liveness, and
     [СОСТОЯНИЕ] rendering. `journal_dir=None` (used by the console demo) disables
@@ -293,9 +309,12 @@ class TaskStore:
             return Liveness.STALE
         return Liveness.OK
 
-    def render_state(self, now: float, stale_after_s: float, unreachable_after_s: float) -> str:
+    def render_state(self, now: float, stale_after_s: float, unreachable_after_s: float,
+                     *, hide_task: bool = False) -> str:
         live = self.liveness(now, stale_after_s, unreachable_after_s)
-        if self._task is None:
+        # hide_task: терминальная задача чужого треда (should_hide_task) — рендерим как «нет
+        # задачи», чтобы завершённая задача не текла в несвязанный разговор диспетчера.
+        if self._task is None or hide_task:
             return f"[СОСТОЯНИЕ]\nАктивной задачи нет.\nСвязь с Корой: {live.value}."
         t = self._task
         lines = [
@@ -318,10 +337,12 @@ class TaskStore:
             lines.append(f"  - {_render_event(ev)}")
         return "\n".join(lines)
 
-    def snapshot(self, now: float, stale_after_s: float, unreachable_after_s: float) -> dict[str, Any]:
-        """Same redaction as render_state — used by the get_task_status() tool result."""
+    def snapshot(self, now: float, stale_after_s: float, unreachable_after_s: float,
+                 *, hide_task: bool = False) -> dict[str, Any]:
+        """Same redaction as render_state — used by the get_task_status() tool result.
+        hide_task: терминальная задача чужого треда прячется (see should_hide_task)."""
         live = self.liveness(now, stale_after_s, unreachable_after_s)
-        if self._task is None:
+        if self._task is None or hide_task:
             return {"task": None, "liveness": live.value}
         t = self._task
         return {

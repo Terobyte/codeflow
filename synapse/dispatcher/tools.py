@@ -26,7 +26,7 @@ from synapse.bridge.confirm import (
     ConfirmResult,
     SubmitResult,
 )
-from synapse.bridge.state import TaskStore
+from synapse.bridge.state import TaskStore, should_hide_task
 from synapse.clock import Clock
 from synapse.config import SynapseConfig
 from synapse.journal import TurnJournal
@@ -261,7 +261,16 @@ class ToolHandlers:
 
     async def get_task_status(self) -> dict[str, Any]:
         cfg = self.bridge.cfg
-        result = self.bridge.store.snapshot(self.bridge.clock.now(), cfg.stale_after_s, cfg.unreachable_after_s)
+        # Скоуп терминальной задачи к её треду — зеркало loop._render_state: завершённая задача
+        # чужого треда не должна отвечать «выполнено» на статус-вопрос из несвязанного треда.
+        hide = False
+        task = self.bridge.store.task
+        if task is not None and self.bridge.threads is not None and self.bridge.thread_id_for is not None:
+            owner = self.bridge.threads.thread_for_task(task.id)
+            hide = should_hide_task(task, self.bridge.thread_id_for(), owner.id if owner else None)
+        result = self.bridge.store.snapshot(
+            self.bridge.clock.now(), cfg.stale_after_s, cfg.unreachable_after_s, hide_task=hide
+        )
         self._journal.record_tool_call("get_task_status", {}, result)
         return result
 
