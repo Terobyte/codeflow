@@ -234,10 +234,6 @@ def test_B43_invariant_active_thread_rebinds_when_no_voice_session_live(tmp_path
 # =============================================================================================
 
 
-@pytest.mark.xfail(
-    reason="B44: reconnect builds a fresh empty LLM context, never seeded from thread history",
-    strict=True,
-)
 async def test_B44_reconnect_seeds_context_from_thread_history(tmp_path):
     pytest.importorskip("pipecat.services.deepgram.flux.stt")
     from synapse.config import SynapseConfig

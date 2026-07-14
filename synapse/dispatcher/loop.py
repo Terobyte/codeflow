@@ -37,6 +37,36 @@ _MAX_TOOL_PASSES = 5
 _MAX_CACHED_THREADS = 64
 
 
+def _append_coalesced(hist: list[dict[str, Any]], role: str, text: str) -> None:
+    """Gate v2 C2' (MINOR): подряд идущие same-role реплики склеиваются в одно сообщение —
+    войс-путь (D1') пишет user-транскрипты в ленту и без ответной пары, а Anthropic-шейп
+    ждёт чередования ролей. Общая точка для регидрации и note_external_turn."""
+    if hist and hist[-1].get("role") == role and isinstance(hist[-1].get("content"), str):
+        hist[-1]["content"] += "\n" + text
+    else:
+        hist.append({"role": role, "content": text})
+
+
+def history_from_feed(entries: list[dict]) -> list[dict[str, Any]]:
+    """ЕДИНАЯ точка «лента треда → LLM-история»: HTTP-путь (`_history_for`, холодный
+    кэш-мисс) и войс-путь (B44: build_session_pipeline сидит свежий контекст реконнекта из
+    той же ленты) обязаны регидрироваться одинаково, иначе каналы расходятся в памяти.
+    В историю идут ТОЛЬКО реплики (kind user/assistant) — кора-виды display-only и в
+    LLM-контекст не попадают НИКОГДА (NO-EXFIL); срез по ПОСЛЕДНЕМУ kind=="clear" (каveat
+    R5: очищенная командой «clear» история не должна воскресать из feed-архива)."""
+    entries = list(entries)
+    for i in range(len(entries) - 1, -1, -1):
+        if entries[i].get("kind") == "clear":
+            entries = entries[i + 1:]
+            break
+    hist: list[dict[str, Any]] = []
+    for e in entries:
+        kind = e.get("kind")
+        if kind in ("user", "assistant"):
+            _append_coalesced(hist, kind, str(e.get("text", "")))
+    return hist
+
+
 class DispatcherTurnLoop:
     def __init__(
         self,
@@ -70,36 +100,18 @@ class DispatcherTurnLoop:
         # начатый ДО clear, при коммите видит несовпадение и НЕ воскрешает очищенную историю.
         self._generations: dict[str, int] = {}
 
-    @staticmethod
-    def _append_coalesced(hist: list[dict[str, Any]], role: str, text: str) -> None:
-        """Gate v2 C2' (MINOR): подряд идущие same-role реплики склеиваются в одно сообщение —
-        войс-путь (D1') пишет user-транскрипты в ленту и без ответной пары, а Anthropic-шейп
-        ждёт чередования ролей. Общая точка для регидрации и note_external_turn."""
-        if hist and hist[-1].get("role") == role and isinstance(hist[-1].get("content"), str):
-            hist[-1]["content"] += "\n" + text
-        else:
-            hist.append({"role": role, "content": text})
+    # Делегат на модульную функцию — общая точка с регидрацией (B44 вынес логику наверх).
+    _append_coalesced = staticmethod(_append_coalesced)
 
     def _history_for(self, thread_id: str) -> list[dict[str, Any]]:
         """Пер-тред контекст (спека §4, находка A): история LLM ключуется по треду.
-        Холодный тред регидрируется из персиста РЕПЛИК (kind user/assistant) — кора-шаги
-        display-only и в LLM-контекст не попадают НИКОГДА (NO-EXFIL)."""
+        Холодный тред регидрируется из персиста через history_from_feed (единая точка
+        «feed → history» с войс-каналом, B44)."""
         hist = self._histories.get(thread_id)
         if hist is None:
             hist = []
             if self._thread_feed_reader is not None:
-                entries = list(self._thread_feed_reader(thread_id))
-                # Gate v2 C2' (каveat R5): срез по ПОСЛЕДНЕМУ kind=="clear" — иначе очищенная
-                # командой «clear» история воскресала бы из feed при следующем cache-miss
-                # (feed-файл — архив, его clear не трогает).
-                for i in range(len(entries) - 1, -1, -1):
-                    if entries[i].get("kind") == "clear":
-                        entries = entries[i + 1:]
-                        break
-                for e in entries:
-                    kind = e.get("kind")
-                    if kind in ("user", "assistant"):
-                        self._append_coalesced(hist, kind, str(e.get("text", "")))
+                hist = history_from_feed(list(self._thread_feed_reader(thread_id)))
             self._histories[thread_id] = hist
             while len(self._histories) > _MAX_CACHED_THREADS:
                 self._histories.popitem(last=False)

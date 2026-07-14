@@ -831,6 +831,17 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
 
     context = LLMContext(tools=ALL_SCHEMAS)
 
+    # B44: (ре)коннект В УЖЕ РАЗГОВОРЕННЫЙ тред обязан продолжать разговор, а не начинать с
+    # амнезии — лента на экране показывает историю, значит и диспетчер обязан её помнить.
+    # Сидим свежий per-connection контекст из ленты треда той же функцией, что HTTP-путь
+    # (dispatcher/loop.py::history_from_feed): один резолвер «feed → history» на оба канала,
+    # NO-EXFIL соблюдён по построению (в history идут только kind user/assistant).
+    _seed_tid = host.voice_thread["id"]
+    if host.threads is not None and _seed_tid is not None and host.threads.get(_seed_tid) is not None:
+        from synapse.dispatcher.loop import history_from_feed
+        for _m in history_from_feed(host.threads.read_feed(_seed_tid)):
+            context.add_message(_m)
+
     # Gate v2 D3': context-diff флашер — сказанные ответы диспетчера идут в ленту войс-треда.
     # Курсор двигается по ВСЕМ сообщениям context.get_messages(); в ленту из диффа пишутся
     # ТОЛЬКО assistant со строковым контентом: user-транскрипт пишет D1' напрямую из параметра
@@ -840,7 +851,9 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     # B25 — из guarded-агрегатора СРАЗУ по коммиту ответа (on_commit), чтобы ответ появлялся в
     # ленте в тот же момент, а не ходом позже. Курсор делает все три вызова идемпотентными.
     # NO-EXFIL не задет: в ленту идут только слова диспетчера, кора-виды в контексте не живут.
-    _voice_cursor = {"n": 0}
+    # Старт курсора = длина УЖЕ засеянного контекста (B44): регидрированные из ленты ответы
+    # уже В ленте — флашить их обратно значило бы задублировать каждую реплику на реконнекте.
+    _voice_cursor = {"n": len(context.get_messages())}
 
     def _flush_voice_context() -> None:
         msgs = context.get_messages()
