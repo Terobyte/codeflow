@@ -5,9 +5,27 @@
 import { PipecatClient, SmallWebRTCTransport } from "./vendor/pipecat.mjs";
 
 const $ = (id) => document.getElementById(id);
-const COLORS = { green: "#2ecc71", yellow: "#f1c40f", red: "#e74c3c" };
+// PF7: Organic-рампа вместо traffic-light цветов; механизм inline-точки (setKora) не трогаем.
+const COLORS = { green: "#7a8a5e", yellow: "#f6a06b", red: "#b2622d" };
 const KIND_ICONS = { task: "▶", text: "💬", thinking: "🧠", tool_use: "🔧",
                      tool_result: "·", result: "🏁", system: "⚙", user: "🗣", assistant: "🤖" };
+
+// R6 guardrail: никакой сырой HTML-вставки — динамические иконки идут через SVG-узлы,
+// собранные createElementNS-ом, текст — только textContent.
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs = {}) {
+  const n = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+function iconSvg(paths, size = 12) {
+  const svg = svgEl("svg", { viewBox: "0 0 24 24", width: size, height: size,
+    fill: "currentColor", stroke: "none" });
+  paths.forEach((d) => svg.appendChild(svgEl("path", { d })));
+  return svg;
+}
+const ICON_PLAY = ["M8 5v14l11-7z"];
+const ICON_PAUSE = ["M7 5h4v14H7z", "M13 5h4v14h-4z"];
 
 const FETCH_TIMEOUT_MS = 15000;
 async function getJSON(url) {
@@ -117,12 +135,43 @@ function validateActiveProject() {
   activeProject = stored && projects.some((p) => p.id === stored) ? stored : null;
 }
 
+// ---------- тумблер «Диспетчер · реалтайм» (плейсхолдер P1: чисто клиентский гейт входа
+// в live, сервер не знает) ----------
+let dispOn = localStorage.getItem("synapse-disp-on") !== "false"; // default true
+
+function applyDispToggleUI() {
+  $("disp-toggle").setAttribute("aria-checked", String(dispOn));
+  // R2: НИКОГДА не ставим disabled — визуальный dim не блокирует hang-up, когда client!=null.
+  $("mic-btn").classList.toggle("disp-off", !dispOn);
+  $("mic-btn").title = dispOn ? "микрофон" : "Диспетчер выключен — только Кора, доступен чат";
+}
+$("disp-toggle").addEventListener("click", () => {
+  dispOn = !dispOn;
+  localStorage.setItem("synapse-disp-on", String(dispOn));
+  applyDispToggleUI();
+});
+
+// ---------- вкладки Чат / Дифф в топбаре треда (плейсхолдер P2: реальный git diff не подключён) ----------
+let tab = "chat";
+function setTab(next) {
+  tab = next;
+  $("tab-chat").setAttribute("aria-selected", String(tab === "chat"));
+  $("tab-diff").setAttribute("aria-selected", String(tab === "diff"));
+  const inThread = route().view === "thread";
+  $("view-thread").hidden = !(inThread && tab === "chat");
+  $("view-diff").hidden = !(inThread && tab === "diff");
+}
+$("tab-chat").addEventListener("click", () => setTab("chat"));
+$("tab-diff").addEventListener("click", () => setTab("diff"));
+
 function render() {
   const r = route();
   closeDrawer();
   $("view-home").hidden = r.view !== "home";
-  $("view-thread").hidden = r.view !== "thread";
+  $("view-thread").hidden = !(r.view === "thread" && tab === "chat");
+  $("view-diff").hidden = !(r.view === "thread" && tab === "diff");
   $("view-activity").hidden = r.view !== "activity";
+  $("thread-tabs").hidden = r.view !== "thread";
   if (r.view === "thread") {
     const t = threads.find((x) => x.id === r.id);
     $("view-title").textContent = t ? t.title : "тред";
@@ -133,6 +182,7 @@ function render() {
       feedThread = r.id;
       renderedKeys.clear();
       $("feed-list").replaceChildren();
+      setTab("chat"); // новый тред всегда открывается на вкладке «Чат»
     }
     pollFeed();
   } else if (r.view === "activity") {
@@ -320,15 +370,46 @@ async function loadLists() {
 }
 
 // ---------- лента треда ----------
+// PF3/P3-плейсхолдер: визуальный toggle озвучки, без реального аудио (парк P3).
+function playButton(role) {
+  const btn = el("button", "play-btn");
+  btn.type = "button";
+  btn.title = "TTS · голос " + (role === "disp" ? "диспетчера" : "Коры");
+  btn.appendChild(iconSvg(ICON_PLAY));
+  btn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const playing = btn.classList.toggle("playing");
+    btn.replaceChildren(iconSvg(playing ? ICON_PAUSE : ICON_PLAY));
+  });
+  return btn;
+}
+
+// 3.1: assistant (Диспетчер) и text (Кора) — разные роли в чате; user остаётся как был.
 function addEntry(e) {
   const li = el("li", "feed-" + (e.kind || "misc"));
   if (e.kind === "user" || e.kind === "assistant" || e.kind === "text") {
-    li.classList.add("msg", e.kind === "user" ? "msg-user" : "msg-bot");
-    li.textContent = e.text || "";
-  } else if (e.kind === "thinking" || e.kind === "tool_use" || e.kind === "tool_result") {
+    const role = e.kind === "user" ? "user" : e.kind === "assistant" ? "disp" : "kora";
+    li.classList.add("msg", role === "user" ? "msg-user" : role === "disp" ? "msg-disp" : "msg-kora");
+    const bubble = el("div", "msg-bubble");
+    if (role !== "user") {
+      bubble.appendChild(el("span", "msg-avatar", role === "disp" ? "Д" : "К"));
+    }
+    const body = el("div", "msg-body");
+    body.appendChild(el("p", "msg-text", e.text || ""));
+    if (role !== "user") body.appendChild(playButton(role));
+    bubble.appendChild(body);
+    li.appendChild(bubble);
+  } else if (e.kind === "thinking") {
+    // PF8: thinking остаётся светлым collapsible, отдельно от тёмной tool-карточки.
     const det = document.createElement("details");
-    det.appendChild(el("summary", "", e.kind === "thinking" ? "🧠 размышления"
-      : e.kind === "tool_use" ? "🔧 инструмент" : "· результат инструмента"));
+    det.className = "think-card";
+    det.appendChild(el("summary", "", "🧠 размышления"));
+    if (e.text) det.appendChild(el("pre", "", e.text));
+    li.appendChild(det);
+  } else if (e.kind === "tool_use" || e.kind === "tool_result") {
+    const det = document.createElement("details");
+    det.className = "tool-card";
+    det.appendChild(el("summary", "", e.kind === "tool_use" ? "🔧 инструмент" : "· результат инструмента"));
     if (e.text) det.appendChild(el("pre", "", e.text));
     li.appendChild(det);
   } else if (e.kind === "result") {
@@ -624,12 +705,33 @@ $("view-title").addEventListener("click", renameCurrentThread);
 const botAudio = $("bot-audio");
 let client = null;
 let connecting = false;
+// R1: overlay-видимость — производная от setMicState, не отдельный источник правды.
+// Клик мика лишь СТАВИТ liveRequested; сама видимость решается в syncLiveOverlay().
+let liveRequested = false;
+let liveMuteFn = null; // R5: живёт внутри connectVoice-замыкания, guard client===me
+
+function setLiveStatus(text, speaking) {
+  $("live-status").textContent = text;
+  $("live-overlay").classList.toggle("speaking", !!speaking);
+}
+
+// PF5+R4: overlay встроен в модальный стек — его открытость учитывается в syncScrollLock().
+function syncLiveOverlay(state) {
+  const show = state === "on" && liveRequested;
+  $("live-overlay").hidden = !show;
+  $("shell").classList.toggle("live-open", show);
+  if (show) setLiveStatus("Диспетчер слушает…", false);
+  syncScrollLock();
+}
 
 function setMicState(state, msg) {
   $("mic-btn").dataset.state = state;
   if (state === "error") setConn("⛔ " + msg);
   else setConn(state === "connecting" ? "подключаю голос…"
     : state === "on" ? "🎙 говори — я слушаю" : "");
+  // R1: idle/error всегда закрывают live — обрыв звонка больше не морозит «слушает…».
+  if (state === "idle" || state === "error") liveRequested = false;
+  syncLiveOverlay(state);
 }
 
 function withTimeout(promise, ms) {
@@ -658,6 +760,9 @@ async function connectVoice() {
           botAudio.srcObject = new MediaStream([track]);
         }
       },
+      // Live-overlay: «Диспетчер отвечает» + wave-бары, пока бот говорит.
+      onBotStartedSpeaking: () => { if (client === me) setLiveStatus("Диспетчер отвечает", true); },
+      onBotStoppedSpeaking: () => { if (client === me) setLiveStatus("Диспетчер слушает…", false); },
       onError: (e) => {
         // B-CORE-5: не только логируем — гасим кнопку и обнуляем client, иначе UI застревал
         // («слушаю» + «⛔ ошибка»), а следующий тап шёл в ветку «отключить» мёртвого клиента.
@@ -666,19 +771,35 @@ async function connectVoice() {
       },
     },
   });
+  // R5: mute-функция создаётся ВНУТРИ этого замыкания и гоняется только со СВОЕЙ сессией —
+  // module-level `client` мог уехать не туда после тихого авто-реконнекта вотчдога.
+  liveMuteFn = (on) => {
+    if (client !== me) return;
+    try {
+      const result = typeof me.enableMic === "function" ? me.enableMic(on) : null;
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    } catch { /* vendored SDK без enableMic — визуальный toggle остаётся, парк P7 */ }
+  };
   client = me;
   await withTimeout(me.connect(), 20000);
 }
 
+// Общий hang-up путь: клик по мику (когда уже подключены), «Завершить — в чат», Escape.
+async function disconnectVoice() {
+  if (!client) return;
+  const c = client;
+  client = null;
+  setMicState("idle");
+  await c.disconnect().catch(() => {});
+}
+
 $("mic-btn").addEventListener("click", async () => {
   if (connecting) return;
-  if (client) {
-    const c = client;
-    client = null;
-    setMicState("idle");
-    await c.disconnect().catch(() => {});
-    return;
-  }
+  // R2: dispOn=false блокирует только СТАРТ звонка; disabled-атрибут не ставится никогда,
+  // поэтому кнопка остаётся единственным hang-up, пока client!=null.
+  if (!client && !dispOn) return;
+  if (client) { await disconnectVoice(); return; }
+  liveRequested = true;
   connecting = true;
   setMicState("connecting");
   try {
@@ -692,6 +813,16 @@ $("mic-btn").addEventListener("click", async () => {
     connecting = false;
   }
 });
+
+let liveMuted = false;
+$("live-mute").addEventListener("click", () => {
+  liveMuted = !liveMuted;
+  if (liveMuteFn) liveMuteFn(!liveMuted);
+  $("live-mute").textContent = liveMuted ? "Включить микрофон" : "Заглушить";
+  $("live-mute").setAttribute("aria-pressed", String(liveMuted));
+  $("live-mute").classList.toggle("muted", liveMuted);
+});
+$("live-end").addEventListener("click", disconnectVoice);
 
 // ---------- вотчдог (§2.7, наследник reconnect.js): правда сервера, не wall-clock ----------
 // iOS замораживает таймеры страницы при локе — elapsed-time эвристика ложно видит «разрыв»
@@ -745,8 +876,10 @@ setInterval(probeSession, 5000);
 
 // ---------- drawer (мобайл) + модалки: Escape + scroll-lock (B-CORE-6) ----------
 function syncScrollLock() {
-  // фон не скроллится, пока открыт drawer или пикер (iOS scroll-chaining за модалкой)
-  const anyModal = !picker.hidden || $("shell").classList.contains("drawer-open");
+  // фон не скроллится, пока открыт drawer, пикер или live-overlay (PF5+R4: тот же модальный
+  // стек, iOS scroll-chaining за модалкой)
+  const anyModal = !picker.hidden || $("shell").classList.contains("drawer-open") ||
+    !$("live-overlay").hidden;
   document.body.style.overflow = anyModal ? "hidden" : "";
 }
 // B-UX-10: сайдбар — off-canvas на мобайле, но ВСЕГДА виден на десктопе (>768px). inert/aria-hidden
@@ -779,6 +912,8 @@ $("new-thread").addEventListener("click", () => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return; // Escape закрывает верхнюю открытую модалку (B-CORE-6)
+  // PF5+R4: live-overlay — верх модального стека; Escape = «Завершить — в чат».
+  if (!$("live-overlay").hidden) { disconnectVoice(); return; }
   if (!picker.hidden) { closePicker(); return; }
   if ($("shell").classList.contains("drawer-open")) closeDrawer();
 });
@@ -858,6 +993,8 @@ $("picker-choose").addEventListener("click", async () => {
 const draft = sessionStorage.getItem("synapse-draft");
 if (draft) { $("msg-input").value = draft; sessionStorage.removeItem("synapse-draft"); }
 resizeMessageInput();
+applyDispToggleUI();
+setTab("chat");
 loadLists().then(render);
 pollStatus();
 setInterval(loadLists, 5000);

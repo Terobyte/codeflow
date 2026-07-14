@@ -1,122 +1,221 @@
-/* Синапс UI v3 — тёмная тема, mobile-first, Codex-паттерн: сайдбар + лента + композер */
+/* Синапс UI v4 — Organic design system (CodeFlow canon): светлая тема, glass-панели,
+   терракота/олива, Caprasimo/Figtree. Каркас (сайдбар+лента+композер) сохранён из v3,
+   только перекрашен и дополнен live-режимом/вкладками/тумблером. */
 :root {
-  color-scheme: dark;
-  --bg: #0b0f14;
-  --surface: #121a24;
-  --surface-2: #1a2634;
-  --border: #1e2a38;
-  --text: #dbe4ee;
-  --dim: #8fa3b8;
-  --dimmer: #7388a0; /* B-UI-1: ≥4.5:1 на фоне (было #5c7089 — 3.78:1, ниже WCAG AA) */
-  --accent: #7fb3e8;
-  --green: #2ecc71;
-  --red: #e74c3c;
+  color-scheme: light;
+  --font-display: "Caprasimo", Georgia, "Times New Roman", serif;
+  --font-body: "Figtree", -apple-system, "SF Pro Text", system-ui, sans-serif;
+
+  --bg: #f5ead8;
+  --surface: rgba(249, 244, 237, .5);
+  --surface-solid: #f9f4ed;
+  --surface-2: rgba(249, 244, 237, .75);
+  --border: rgba(32, 30, 29, .12);
+  --text: #201e1d;
+  --dim: #5c554e;
+  --dimmer: #4a443f; /* ≥4.5:1 на #f5ead8 (B-UI-1 carried forward) */
+
+  /* терракота */
+  --terra-100: #f7e3d5;
+  --terra-200: #f0c7ab;
+  --terra-300: #e6a97e;
+  --terra-400: #d98f5c;
+  --terra-500: #c67139;
+  --terra-600: #a85a2a;
+  --terra-700: #8a4720;
+  --terra-800: #6b3618;
+  --terra-900: #4d2712;
+
+  /* олива */
+  --olive-100: #eef0e4;
+  --olive-200: #dbe0c8;
+  --olive-300: #c2caa5;
+  --olive-400: #a3ac82;
+  --olive-500: #7a8a5e;
+  --olive-600: #636f4a;
+  --olive-700: #4c5539;
+  --olive-800: #373d29;
+  --olive-900: #23271a;
+
+  /* нейтраль */
+  --neutral-100: #f0e9dc;
+  --neutral-200: #e2d8c6;
+  --neutral-300: #c9bda8;
+  --neutral-400: #a89c88;
+  --neutral-500: #867b6a;
+  --neutral-600: #655c4e;
+  --neutral-700: #473f34;
+
+  --green: #7a8a5e;
+  --yellow: #f6a06b;
+  --red: #b2622d;
+
+  --radius-sm: 8px;
+  --radius-md: 16px;
+  --radius-lg: 28px;
+  --radius-pill: 999px;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
   margin: 0; background: var(--bg); color: var(--text);
-  font: 16px/1.45 -apple-system, "SF Pro Text", system-ui, sans-serif;
+  font: 16px/1.45 var(--font-body);
   overscroll-behavior: none;
+  position: relative;
 }
-h1 { font-size: 18px; margin: 0; font-weight: 650; }
+h1 { font-family: var(--font-display); font-size: 20px; margin: 0; font-weight: 400; letter-spacing: .01em; }
+h1 .flow { color: var(--terra-500); }
 h2 {
   font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
   color: var(--dimmer); margin: 14px 4px 6px; font-weight: 600;
 }
 ul, ol { list-style: none; margin: 0; padding: 0; }
-a { color: var(--accent); text-decoration: none; }
+a { color: var(--terra-600); text-decoration: none; }
 button { font: inherit; cursor: pointer; }
 
-/* B-UI-3: видимое кольцо фокуса (клавиатура/VoiceOver/Switch Control) + мгновенная тач-отдача
-   (на iPhone нет :hover — без :active тап по карточке молчит до перерисовки) */
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* B-UI-3: видимое кольцо фокуса (клавиатура/VoiceOver/Switch Control) + мгновенная тач-отдача */
+:focus-visible { outline: 2px solid var(--terra-500); outline-offset: 2px; }
 button:active, a:active, .thread-card:active, .project-row:active,
 #picker-dirs li:active, #kora-card:active { opacity: .7; }
 
-/* B-UI-4: уважаем «Уменьшить движение» — мигание/пульс триггерят мигрень и гоняют compositor */
+/* ---------- анимации (canon: pulseDot, fadeUp, wave, drift/drift2, blink, ring, breathe) ------- */
+@keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes wave { 0%, 100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
+@keyframes drift { 0%, 100% { transform: translate(0, 0); } 50% { transform: translate(24px, -18px); } }
+@keyframes drift2 { 0%, 100% { transform: translate(0, 0); } 50% { transform: translate(-30px, 20px); } }
+@keyframes blink { 0%, 60%, 100% { opacity: .2; } 30% { opacity: 1; } }
+@keyframes ring { 0% { box-shadow: 0 0 0 0 rgba(122, 138, 94, .35); } 100% { box-shadow: 0 0 0 24px rgba(122, 138, 94, 0); } }
+@keyframes breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+
+/* B-UI-4 + R7: «Уменьшить движение» гасит ВСЕ анимации редизайна, не только старые */
 @media (prefers-reduced-motion: reduce) {
-  .dots span, #mic-btn[data-state="connecting"] { animation: none; }
+  .dots span, #mic-btn[data-state="connecting"],
+  .stage-code, .tc-stage.stage-code,
+  .msg, .bg-blob, #live-orb, #live-wave span,
+  #kora-card-dot { animation: none; }
   #sidebar { transition: none; }
 }
 
+/* ---------- фоновые blob'ы (декор, aria-hidden) ---------- */
+.bg-blob {
+  position: fixed; z-index: -1; border-radius: 50%; filter: blur(60px); pointer-events: none;
+  opacity: .35;
+}
+.bg-blob-1 { top: -10%; left: -8%; width: 46vmax; height: 46vmax; background: radial-gradient(circle, var(--terra-200), transparent 70%); animation: drift 26s ease-in-out infinite; }
+.bg-blob-2 { bottom: -14%; right: -10%; width: 50vmax; height: 50vmax; background: radial-gradient(circle, var(--olive-200), transparent 70%); animation: drift2 32s ease-in-out infinite; }
+.bg-blob-3 { top: 40%; left: 60%; width: 30vmax; height: 30vmax; background: radial-gradient(circle, var(--terra-100), transparent 70%); animation: drift 40s ease-in-out infinite; }
+
 /* ---------- каркас ---------- */
-#shell { display: flex; height: 100dvh; }
+#shell { display: flex; height: 100dvh; position: relative; }
 #main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
 /* ---------- сайдбар ---------- */
 #sidebar {
   width: 280px; flex-shrink: 0; display: flex; flex-direction: column;
-  background: #0d131b; border-right: 1px solid var(--border);
+  background: var(--surface); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
+  border-right: 1px solid var(--border);
   padding: calc(env(safe-area-inset-top) + 10px) 12px 0;
 }
-#side-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 4px 10px; }
+#side-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 4px 4px; }
 #side-close {
   display: none; background: none; border: none; color: var(--dim);
   font-size: 18px; padding: 8px 10px;
 }
-#new-thread {
-  width: 100%; padding: 11px 12px; border-radius: 12px; border: 1px solid var(--border);
-  background: var(--surface); color: var(--text); text-align: left; font-size: 15px;
+.logo-wave { width: 64px; height: 8px; color: var(--terra-400); margin: 0 0 8px 4px; }
+
+/* тумблер диспетчера (плейсхолдер, клиентский стейт) */
+#disp-toggle-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 6px 4px 10px; font-size: 13px; color: var(--dimmer);
 }
-#new-thread:hover { background: var(--surface-2); }
+#disp-toggle {
+  width: 38px; height: 22px; border-radius: var(--radius-pill); border: 1px solid var(--border);
+  background: var(--neutral-200); position: relative; flex-shrink: 0; padding: 0;
+}
+#disp-toggle::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: var(--surface-solid); transition: transform .18s ease;
+}
+#disp-toggle[aria-checked="true"] { background: var(--olive-500); border-color: var(--olive-600); }
+#disp-toggle[aria-checked="true"]::after { transform: translateX(16px); }
+
+#new-thread {
+  width: 100%; padding: 11px 12px; border-radius: var(--radius-md); border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text); text-align: left; font-size: 15px;
+}
+#new-thread:hover { background: var(--surface-solid); }
 #side-scroll { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 8px; }
 /* дерево: строка проекта, под ней его треды-ветки с общим стволом слева */
 .project-row {
   display: flex; width: 100%; align-items: center; text-align: left; font: inherit;
-  color: var(--dim); font-size: 14px; padding: 8px 6px; border-radius: 8px;
+  color: var(--dim); font-size: 14px; padding: 8px 6px; border-radius: var(--radius-sm);
   border: 1px solid transparent; background: none;
 }
-.project-row:hover { background: var(--surface); }
-.project-row.active { color: var(--text); border-color: var(--accent); background: var(--surface); }
+.project-row:hover { background: var(--surface-2); }
+.project-row.active { color: var(--text); border-color: var(--terra-400); background: var(--surface-2); }
 .pr-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .branch { margin-left: 13px; padding-left: 6px; border-left: 1px solid var(--border); }
 .branch .thread-card { padding: 8px 10px; }
 #add-project {
   width: 100%; margin-top: 4px; font-size: 14px; background: none;
-  border: 1px dashed var(--border); border-radius: 10px; color: var(--accent); padding: 9px;
+  border: 1px dashed var(--border); border-radius: var(--radius-sm); color: var(--terra-600); padding: 9px;
 }
-#add-project:hover { border-color: var(--accent); }
+#add-project:hover { border-color: var(--terra-500); }
 
 /* треды-карточки */
 .thread-card {
   display: flex; flex-direction: column; gap: 3px; padding: 10px 12px;
-  border-radius: 10px; color: var(--text); margin-bottom: 2px;
+  border-radius: var(--radius-sm); color: var(--text); margin-bottom: 2px;
 }
-.thread-card:hover { background: var(--surface); }
-.thread-card.active { background: var(--surface-2); }
+.thread-card:hover { background: var(--surface-2); }
+.thread-card.active { background: var(--surface-solid); border: 1px solid var(--border); }
 .tc-wrap { display: flex; align-items: center; gap: 4px; }
 .tc-wrap .thread-card { flex: 1; min-width: 0; margin-bottom: 0; }
-.tc-archive { /* UI-5 (S31): маленькая кнопка «архив» в строке треда */
+.tc-archive {
   font-size: 12px; color: var(--dimmer); background: transparent; border: 1px solid var(--border);
-  border-radius: 8px; padding: 4px 8px; flex-shrink: 0;
+  border-radius: var(--radius-sm); padding: 4px 8px; flex-shrink: 0;
 }
-.tc-archive:active { background: var(--surface); }
-.pr-delete { /* UI-5 (S31): «×» удалить проект */
+.tc-archive:active { background: var(--surface-2); }
+.pr-delete {
   font-size: 16px; line-height: 1; color: var(--dimmer); background: transparent;
   border: none; border-radius: 6px; padding: 2px 8px; flex-shrink: 0;
 }
-.pr-delete:active { color: var(--text); background: var(--surface); }
+.pr-delete:active { color: var(--text); background: var(--surface-2); }
 .tc-title {
   font-size: 14.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.tc-meta { font-size: 13px; color: var(--dimmer); } /* B-UI-12: 12→13px читаемость на мобиле */
+.tc-meta { font-size: 13px; color: var(--dimmer); }
 .tc-stage, #stage-chip {
-  width: fit-content; color: var(--accent); border: 1px solid var(--border); background: var(--surface);
-  border-radius: 999px; font-size: 11px; font-weight: 650; letter-spacing: .04em; padding: 1px 7px;
+  width: fit-content; color: var(--terra-600); border: 1px solid var(--border); background: var(--surface-2);
+  border-radius: var(--radius-pill); font-size: 11px; font-weight: 650; letter-spacing: .04em; padding: 1px 7px;
+}
+/* PF6: канон running/review/done/queued смаплен на реальные стадии */
+.stage-code, .tc-stage.stage-code {
+  background: var(--terra-100); color: var(--terra-700); border-color: var(--terra-300);
+  animation: pulseDot 1.6s infinite;
+}
+.stage-propose, .tc-stage.stage-propose {
+  background: var(--olive-100); color: var(--olive-700); border-color: var(--olive-300);
+}
+.stage-done, .tc-stage.stage-done, #stage-chip.stage-done {
+  background: var(--neutral-200); color: var(--neutral-700); border-color: var(--neutral-300);
+}
+.stage-collect, .tc-stage.stage-collect, .stage-spec_plan, .tc-stage.stage-spec_plan {
+  background: var(--neutral-100); color: var(--dimmer);
 }
 
-/* статус-карточка Коры (вместо кружочка — Ж4) */
+/* статус-карточка Коры */
 #kora-card {
   display: flex; align-items: center; gap: 10px; padding: 12px 10px;
   margin: 0 -12px; border-top: 1px solid var(--border); color: var(--text);
   padding-left: 16px; padding-bottom: calc(env(safe-area-inset-bottom) + 12px);
 }
-#kora-card:hover, #kora-card:focus-visible { background: var(--surface); }
-/* B-UI-14: шеврон-аффорданс — видно, что карточка ведёт на «Размышления Коры» */
+#kora-card:hover, #kora-card:focus-visible { background: var(--surface-2); }
 #kora-card-chevron { margin-left: auto; color: var(--dim); font-size: 20px; flex-shrink: 0; }
 #kora-card-dot {
   width: 10px; height: 10px; border-radius: 50%; background: #888; flex-shrink: 0;
+  animation: breathe 2.4s ease-in-out infinite;
 }
 #kora-card-text { display: flex; flex-direction: column; min-width: 0; }
 #kora-card-title { font-size: 14px; font-weight: 600; }
@@ -130,6 +229,7 @@ button:active, a:active, .thread-card:active, .project-row:active,
   display: flex; align-items: center; gap: 10px;
   padding: calc(env(safe-area-inset-top) + 8px) 16px 8px;
   border-bottom: 1px solid var(--border); min-height: 52px;
+  background: var(--surface); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
 }
 #menu-btn {
   display: none; background: none; border: none; color: var(--text);
@@ -138,62 +238,91 @@ button:active, a:active, .thread-card:active, .project-row:active,
 #view-title {
   font-size: 16px; font-weight: 600; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
-  cursor: pointer; user-select: none; /* UI-5: тап = rename */
+  cursor: pointer; user-select: none;
 }
-.rename-input { /* UI-5: inline-редактор rename, наследует размер заголовка */
+.rename-input {
   font-size: 16px; font-weight: 600; flex: 1; min-width: 0;
-  border: 1px solid var(--accent); border-radius: 6px; padding: 2px 6px;
-  background: var(--surface); color: var(--text);
+  border: 1px solid var(--terra-500); border-radius: 6px; padding: 2px 6px;
+  background: var(--surface-solid); color: var(--text);
 }
 #thread-badge {
   font-size: 13px; color: var(--green); border: 1px solid var(--border);
-  border-radius: 999px; padding: 2px 10px; flex-shrink: 0;
+  border-radius: var(--radius-pill); padding: 2px 10px; flex-shrink: 0;
 }
 #thread-badge.bad { color: var(--red); }
 #stage-chip { flex-shrink: 0; }
-#stage-chip.stage-done { color: var(--green); }
+
+/* вкладки Чат / Дифф */
+#thread-tabs { display: flex; gap: 4px; margin-left: auto; flex-shrink: 0; }
+#thread-tabs button {
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--dim);
+  border-radius: var(--radius-pill); padding: 5px 12px; font-size: 13px;
+}
+#thread-tabs button[aria-selected="true"] {
+  background: var(--terra-500); color: var(--surface-solid); border-color: var(--terra-600);
+}
 
 /* ---------- вью ---------- */
 .view { flex: 1; overflow-y: auto; min-height: 0; padding: 16px; }
+.diff-empty { max-width: 560px; margin: 18vh auto 0; text-align: center; color: var(--dimmer); }
 
 /* дом */
-/* B-UI-13: clamp вместо 10vh — в landscape iPhone hero больше не съедает «Недавние» */
 #hero { margin: clamp(24px, 6vh, 80px) auto 24px; text-align: center; max-width: 480px; }
-#hero-title { font-size: 26px; font-weight: 650; margin: 0 0 8px; }
+#hero-title { font-family: var(--font-display); font-weight: 400; font-size: 28px; margin: 0 0 8px; }
 #hero-sub { color: var(--dim); margin: 0; font-size: 15px; }
 #home-recent { max-width: 560px; margin: 0 auto; }
 #recent-h { max-width: 560px; margin-left: auto; margin-right: auto; }
 
 /* лента треда */
-#feed-list { display: flex; flex-direction: column; gap: 8px; max-width: 760px; margin: 0 auto; }
+#feed-list { display: flex; flex-direction: column; gap: 10px; max-width: 760px; margin: 0 auto; }
 #feed-list:empty::before {
   content: "пока пусто — напиши или скажи, что сделать";
   color: var(--dimmer); text-align: center; padding: 18vh 0; display: block;
 }
-.msg {
-  max-width: 85%; padding: 10px 14px; border-radius: 16px; white-space: pre-wrap;
-  overflow-wrap: break-word;
+.msg { max-width: 85%; animation: fadeUp .25s ease both; }
+.msg-bubble { display: flex; align-items: flex-start; gap: 8px; }
+.msg-avatar {
+  flex-shrink: 0; width: 26px; height: 26px; border-radius: 50%; display: flex;
+  align-items: center; justify-content: center; font-size: 12px; font-weight: 700;
+  color: var(--surface-solid);
 }
-.msg-user { align-self: flex-end; background: #1c3a5e; border-bottom-right-radius: 6px; }
-.msg-bot { align-self: flex-start; background: var(--surface); border-bottom-left-radius: 6px; }
+.msg-body {
+  padding: 10px 14px; border-radius: var(--radius-md); white-space: pre-wrap; overflow-wrap: break-word;
+  display: flex; align-items: flex-end; gap: 8px;
+}
+.msg-text { margin: 0; flex: 1; }
+.msg-user { align-self: flex-end; }
+.msg-user .msg-body { background: rgba(255, 225, 208, .75); border-bottom-right-radius: 6px; }
+.msg-disp { align-self: flex-start; }
+.msg-disp .msg-avatar { background: var(--olive-500); }
+.msg-disp .msg-body { background: var(--surface-2); border-bottom-left-radius: 6px; }
+.msg-kora { align-self: flex-start; }
+.msg-kora .msg-avatar { background: var(--terra-500); }
+.msg-kora .msg-body { background: var(--surface-2); border-bottom-left-radius: 6px; }
+.play-btn {
+  flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--border);
+  background: var(--surface-solid); color: var(--dim); display: flex; align-items: center; justify-content: center;
+  padding: 0;
+}
+.play-btn.playing { color: var(--terra-600); border-color: var(--terra-400); }
+.play-btn svg { width: 12px; height: 12px; }
+
 .feed-task {
-  align-self: stretch; background: var(--surface); border-left: 3px solid var(--accent);
-  border-radius: 8px; padding: 10px 12px; font-size: 14.5px; white-space: pre-wrap;
+  align-self: stretch; background: var(--surface-2); border-left: 3px solid var(--terra-500);
+  border-radius: var(--radius-sm); padding: 10px 12px; font-size: 14.5px; white-space: pre-wrap;
 }
 .feed-system { text-align: center; color: var(--dimmer); font-size: 13px; padding: 2px 0; }
-/* B-UX-3: gate_card (запуск) и event — приглушённые служебные строки, не сообщения-пузыри */
 .feed-gate_card, .feed-event {
   color: var(--dim); font-size: 13px; padding: 4px 0; max-width: 760px; margin: 0 auto;
 }
-.feed-gate_card { color: var(--dim); }
 .gate-card {
   align-self: stretch; max-width: 760px; margin: 0 auto; padding: 12px;
-  border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-2);
 }
 .gate-title { margin: 0 0 8px; color: var(--text); font-weight: 650; }
 .gate-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .gate-action, .gate-model {
-  border: 1px solid var(--border); border-radius: 9px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 9px; background: var(--surface-solid); color: var(--text);
   padding: 7px 10px; font-size: 13px;
 }
 .gate-action:hover:not(:disabled), .gate-model:hover { background: var(--surface-2); }
@@ -201,27 +330,34 @@ button:active, a:active, .thread-card:active, .project-row:active,
 .gate-note { min-height: 1.4em; margin: 8px 0 0; color: var(--dim); font-size: 13px; }
 
 #activity-list { display: flex; flex-direction: column; gap: 8px; max-width: 760px; margin: 0 auto; }
-.activity-entry { padding: 10px 12px; border-radius: 9px; background: var(--surface); color: var(--dim); white-space: pre-wrap; overflow-wrap: break-word; }
+.activity-entry { padding: 10px 12px; border-radius: 9px; background: var(--surface-2); color: var(--dim); white-space: pre-wrap; overflow-wrap: break-word; }
 .feed-result {
   text-align: center; color: var(--green); font-size: 13.5px;
-  border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px;
 }
 .feed-result.bad { color: var(--red); }
-.feed-thinking details, .feed-tool_use details, .feed-tool_result details {
-  background: var(--surface); border-radius: 10px; padding: 8px 12px;
+
+/* PF8: thinking — светлый collapsible; tool_use/tool_result — тёмная tool-карточка */
+.think-card {
+  background: var(--surface-2); border-radius: var(--radius-sm); padding: 8px 12px;
 }
-.feed-thinking summary, .feed-tool_use summary, .feed-tool_result summary {
-  cursor: pointer; color: var(--dim); font-size: 13.5px; user-select: none;
-}
-.feed-thinking pre, .feed-tool_use pre, .feed-tool_result pre {
+.think-card summary { cursor: pointer; color: var(--dim); font-size: 13.5px; user-select: none; }
+.think-card pre {
   margin: 8px 0 0; font: 12.5px/1.5 ui-monospace, "SF Mono", monospace;
   white-space: pre-wrap; overflow-wrap: break-word; color: var(--dim);
+}
+.tool-card {
+  background: rgba(46, 43, 37, .85); color: #e7ded0; border-radius: var(--radius-sm); padding: 8px 12px;
+}
+.tool-card summary { cursor: pointer; font-size: 13.5px; user-select: none; }
+.tool-card pre {
+  margin: 8px 0 0; font: 12.5px/1.5 ui-monospace, "SF Mono", monospace;
+  white-space: pre-wrap; overflow-wrap: break-word; color: #d3c7b3;
 }
 #typing { color: var(--dimmer); font-size: 14px; max-width: 760px; margin: 8px auto 0; }
 .dots span { animation: blink 1.2s infinite; }
 .dots span:nth-child(2) { animation-delay: .2s; }
 .dots span:nth-child(3) { animation-delay: .4s; }
-@keyframes blink { 0%, 60%, 100% { opacity: .2; } 30% { opacity: 1; } }
 
 /* ---------- строка состояния + композер ---------- */
 #conn-status {
@@ -229,70 +365,104 @@ button:active, a:active, .thread-card:active, .project-row:active,
 }
 #composer {
   display: flex; gap: 8px; padding: 10px 14px calc(env(safe-area-inset-bottom) + 10px);
-  border-top: 1px solid var(--border); background: var(--bg);
+  border-top: 1px solid var(--border);
+  background: var(--surface); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
 }
-/* чип активного проекта: показывает, в какую ветку дом родит тред */
 #proj-chip {
   align-self: center; max-width: 34%; min-height: 32px; padding: 5px 12px;
-  border-radius: 16px; border: 1px solid var(--border); background: var(--surface);
+  border-radius: var(--radius-pill); border: 1px solid var(--border); background: var(--surface-2);
   color: var(--dimmer); font-size: 12.5px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-#proj-chip.has-proj { color: var(--accent); border-color: var(--accent); }
+#proj-chip.has-proj { color: var(--terra-600); border-color: var(--terra-400); }
 #msg-input {
-  flex: 1; font: inherit; padding: 12px 16px; border-radius: 22px;
-  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  flex: 1; font: inherit; padding: 12px 16px; border-radius: var(--radius-lg);
+  border: 1px solid var(--border); background: var(--surface-solid); color: var(--text);
   min-height: 44px; max-height: 148px; resize: none; overflow-y: hidden; line-height: 1.35;
 }
-/* B-UI-3: outline снят, но фокус виден — акцентная рамка + кольцо-тень (не «слепой» инпут) */
-#msg-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(127, 179, 232, .25); }
+#msg-input:focus { outline: none; border-color: var(--terra-500); box-shadow: 0 0 0 2px rgba(198, 113, 57, .2); }
 #msg-send, #mic-btn {
   font-size: 18px; min-width: 46px; min-height: 44px; border-radius: 50%;
-  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); background: var(--surface-solid); color: var(--text);
 }
 #msg-send:hover, #mic-btn:hover { background: var(--surface-2); }
 #msg-send:disabled { opacity: .5; }
+#mic-btn { color: var(--terra-600); }
+#mic-btn.disp-off { opacity: .45; }
 
-/* стейты мика: idle / connecting (пульс) / on / error — видно, что происходит (Ж2) */
-#mic-btn[data-state="connecting"] { animation: pulse 1s infinite; border-color: var(--accent); }
-#mic-btn[data-state="on"] { background: #1f6f3f; border-color: var(--green); }
+/* стейты мика: idle / connecting (пульс) / on / error */
+#mic-btn[data-state="idle"] { border-color: var(--border); }
+#mic-btn[data-state="connecting"] { animation: pulseDot 1s infinite; border-color: var(--terra-400); }
+#mic-btn[data-state="on"] { background: var(--olive-500); border-color: var(--olive-600); color: var(--surface-solid); }
 #mic-btn[data-state="error"] { border-color: var(--red); }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+
+/* ---------- live-режим: орб, wave-бары, статус, mute/end ---------- */
+#live-overlay {
+  position: fixed; inset: 0; z-index: 15; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 18px;
+  background: rgba(245, 234, 216, .92); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+}
+#live-overlay[hidden] { display: none; }
+#live-orb {
+  width: 148px; height: 148px; border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, var(--olive-300), var(--olive-600) 75%);
+  animation: breathe 2.8s ease-in-out infinite;
+}
+#shell.live-open #live-orb { animation: breathe 2.8s ease-in-out infinite, ring 1.8s ease-out infinite; }
+#live-status { font-size: 17px; font-weight: 600; color: var(--text); margin: 0; }
+#live-wave { display: flex; align-items: center; gap: 4px; height: 28px; opacity: .35; }
+#live-wave span {
+  width: 4px; height: 100%; border-radius: var(--radius-pill); background: var(--terra-500);
+  animation: wave 1s ease-in-out infinite;
+}
+#live-wave span:nth-child(2) { animation-delay: .1s; }
+#live-wave span:nth-child(3) { animation-delay: .2s; }
+#live-wave span:nth-child(4) { animation-delay: .3s; }
+#live-wave span:nth-child(5) { animation-delay: .4s; }
+#live-overlay.speaking #live-wave { opacity: 1; }
+#live-controls { display: flex; gap: 12px; }
+#live-mute, #live-end {
+  border-radius: var(--radius-pill); border: 1px solid var(--border); background: var(--surface-solid);
+  color: var(--text); padding: 10px 18px; font-size: 14px;
+}
+#live-mute.muted { background: var(--terra-100); border-color: var(--terra-400); color: var(--terra-700); }
+#live-end { background: var(--terra-500); color: var(--surface-solid); border-color: var(--terra-600); }
 
 /* ---------- drawer на мобиле ---------- */
-#backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .5); z-index: 9; }
+#backdrop { position: fixed; inset: 0; background: rgba(32, 30, 29, .45); z-index: 9; }
 @media (max-width: 768px) {
   #sidebar {
     position: fixed; z-index: 10; top: 0; bottom: 0; left: 0;
     transform: translateX(-102%); transition: transform .22s ease;
-    width: min(300px, 84vw); box-shadow: 4px 0 24px rgba(0, 0, 0, .5);
+    width: min(300px, 84vw); box-shadow: 4px 0 24px rgba(32, 30, 29, .35);
   }
   #shell.drawer-open #sidebar { transform: translateX(0); }
   #menu-btn { display: block; }
   #side-close { display: block; }
   .msg { max-width: 92%; }
+  #thread-tabs { margin-left: 0; }
 }
 
 /* ---------- пикер папки («+ проект») ---------- */
 #picker {
-  position: fixed; inset: 0; background: rgba(0, 0, 0, .6); z-index: 20;
+  position: fixed; inset: 0; background: rgba(32, 30, 29, .5); z-index: 20;
   display: flex; align-items: center; justify-content: center;
 }
 #picker[hidden] { display: none; }
 #picker-panel {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  background: var(--surface-solid); border: 1px solid var(--border); border-radius: var(--radius-md);
   width: min(480px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
   gap: 8px; padding: 14px;
 }
 #picker-path { color: var(--dim); font-size: 13px; margin: 0; word-break: break-all; }
 #picker-error { color: var(--red); font-size: 13px; margin: 0; }
-#picker-error:empty { display: none; } /* B-CORE-11: ошибка отдельно от пути, скрыта когда пусто */
+#picker-error:empty { display: none; }
 #picker-dirs { flex: 1; overflow-y: auto; }
-#picker-dirs li { cursor: pointer; padding: 10px 6px; border-radius: 8px; }
+#picker-dirs li { cursor: pointer; padding: 10px 6px; border-radius: var(--radius-sm); }
 #picker-dirs li:hover { background: var(--surface-2); }
 #picker-actions { display: flex; gap: 8px; }
 #picker-actions button {
-  flex: 1; font-size: 15px; padding: 11px; border-radius: 10px;
-  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  flex: 1; font-size: 15px; padding: 11px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--surface-solid); color: var(--text);
 }
 #picker-actions button:hover { background: var(--surface-2); }
