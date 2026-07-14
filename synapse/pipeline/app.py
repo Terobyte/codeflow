@@ -13,6 +13,8 @@ runs live voice, including test_pipeline_smoke).
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import itertools
 import logging
 from collections import deque
 from typing import Any
@@ -44,6 +46,38 @@ from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook,
 from synapse.threads import ThreadStore
 
 logger = logging.getLogger(__name__)
+
+# UI-4 (S34): серверный модельный allowlist для гейт-запусков. kora_model из конфига — дефолт,
+# он в allowlist не обязан входить исторически; валидируем только то, что пришло из UI/инструмента.
+_KORA_MODELS = frozenset({"claude-opus-4-8", "claude-sonnet-5", "claude-fable-5"})
+
+
+class TaskLocalThreadDict(dict):
+    """Task-local thread dictionary to prevent race conditions on concurrent HTTP turns (B-PIPE-5 residual/R1 dedup)."""
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._var = contextvars.ContextVar("current_http_thread_id", default=None)
+
+    def __getitem__(self, key: Any) -> Any:
+        if key == "id":
+            return self._var.get()
+        return super().__getitem__(key)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key == "id":
+            self._var.set(value)
+        else:
+            super().__setitem__(key, value)
+
+    def __contains__(self, key: Any) -> bool:
+        if key == "id":
+            return True
+        return super().__contains__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key == "id":
+            return self._var.get()
+        return super().get(key, default)
 
 
 class SynapseHost:
@@ -114,8 +148,23 @@ class SynapseHost:
         self.turn_lock = turn_lock or asyncio.Lock()
         self.current_http_thread = current_http_thread if current_http_thread is not None else {"id": None}
         # M1 slice 2 (the one NON-long-lived field, see class docstring): the currently live
+
+    @property
+    def current_http_thread(self) -> dict:
+        return self._current_http_thread
+
+    @current_http_thread.setter
+    def current_http_thread(self, value: dict | None) -> None:
+        if isinstance(value, TaskLocalThreadDict):
+            self._current_http_thread = value
+        else:
+            self._current_http_thread = TaskLocalThreadDict()
+            if isinstance(value, dict) and "id" in value:
+                self._current_http_thread["id"] = value["id"]
         # per-connection PipelineTask, or None when no client is connected.
         self._output_task: Any = None
+        # UI-4: per-thread гейт-локи — single-flight двух конкурентных гейт-вызовов на один тред.
+        self._gate_locks: dict[str, asyncio.Lock] = {}
 
     def bind_output(self, task: Any) -> None:
         """Point the SPEAK injector at this connection's live output task. SYNCHRONOUS and
@@ -199,6 +248,115 @@ class SynapseHost:
             except Exception:
                 logger.exception("monitor_forever iteration failed; continuing")
 
+    # --- UI-4: стадийный гейт -----------------------------------------------------------
+
+    def _resolve_root_for(self, th) -> str:
+        """Корень запуска Коры для треда: папка проекта, либо дефолт-воркспейс конфига.
+        Зеркало build_host._resolve_project_root — без него gate_action не знает, где план-файл."""
+        if th.project_id and self.projects is not None:
+            proj = self.projects.get(th.project_id)
+            if proj:
+                return proj["path"]
+        return self.cfg.kora_workspace_dir
+
+    def _run_finished(self, thread_id: str, outcome: str) -> None:
+        """НОВАЯ обёртка на месте on_run_finished=threads.set_outcome: пишет исход И, если ран
+        был на стадии code и завершился completed, переводит тред в done. set_outcome про стадии
+        не знает (факт 10) — переход code→done живёт здесь."""
+        if self.threads is None:
+            return
+        self.threads.set_outcome(thread_id, outcome)
+        th = self.threads.get(thread_id)
+        if th is not None and th.stage == "code" and outcome == "completed":
+            try:
+                self.threads.set_stage(thread_id, "done")
+            except ValueError:
+                pass  # гонка: стадия уже сменилась — молчаливый no-op
+
+    async def gate_action(self, thread_id: str, action: str,
+                          model: str | None = None, confirm: bool = False,
+                          fast: bool = False) -> dict:
+        """Единая хост-функция гейта (UI-4): её зовёт и POST /api/threads/{id}/gate, и голосовой
+        инструмент диспетчера gate_action. СТРОГИЙ порядок: тред → per-thread lock → валидация
+        модели → busy-чек ДО set_stage → ветвление. Возвращает dict с ok/error."""
+        th = self.threads.get(thread_id) if self.threads is not None else None
+        if th is None:
+            return {"error": "unknown_thread"}
+        lock = self._gate_locks.setdefault(thread_id, asyncio.Lock())
+        async with lock:
+            # валидация модели — только когда она передана (revise её не несёт)
+            if model is not None and model not in _KORA_MODELS:
+                return {"error": "invalid_model"}
+            # busy-чек ДО set_stage: запуск-действия не должны двигать стадию на занятом синглтоне
+            is_run = action in ("send_to_kora", "write_code")
+            if is_run and self.kora_runner is not None and self.store.has_active_task():
+                return {"error": "busy"}
+            if action == "revise":
+                try:
+                    self.threads.set_stage(thread_id, "collect")
+                except ValueError:
+                    return {"error": "illegal_stage"}
+                self.threads.append_feed(thread_id,
+                                         {"ts": self.clock.now(), "kind": "event", "text": "правки → сбор"})
+                return {"ok": True, "stage": "collect"}
+            if action == "send_to_kora":
+                if not confirm:
+                    return {"error": "confirm_required"}
+                request_text = th.request_text
+                if not request_text:
+                    return {"error": "no_request"}
+                if fast:
+                    target_stage, gate_mode, text = "code", "full", request_text
+                else:
+                    target_stage = "spec_plan"
+                    gate_mode = "docs_only"
+                    text = (f"Подготовь спеку и план по запросу ниже. План запиши в файл "
+                            f"docs/plans/{thread_id}.md (создай директории). Запрос: {request_text}")
+                self._launch_run(th, target_stage, gate_mode, text, model)
+                return {"ok": True, "stage": target_stage}
+            if action == "write_code":
+                if not confirm:
+                    return {"error": "confirm_required"}
+                # план-файл должен существовать И последняя SPEC_PLAN — completed (иначе stale_plan:
+                # устаревший файл от провалившейся попытки не должен пускать CODE)
+                root = self._resolve_root_for(th)
+                plan_path = Path(root) / "docs" / "plans" / f"{thread_id}.md"
+                if not plan_path.exists():
+                    return {"error": "no_plan_file"}
+                if th.last_outcome != "completed":
+                    return {"error": "stale_plan"}
+                text = (f"Реализуй по плану docs/plans/{thread_id}.md. "
+                        f"Исходный запрос: {th.request_text}")
+                self._launch_run(th, "code", "full", text, model)
+                return {"ok": True, "stage": "code"}
+            return {"error": "unknown_action"}
+
+    def _launch_run(self, th, stage: str, gate_mode: str, text: str, model: str | None) -> None:
+        """Общий хвост запуска стадийного рана: set_stage → task_id → store.start_task →
+        append_task → set_last_model → kora_runner.start → gate_card в ленту."""
+        from synapse.bridge.state import TaskStatus
+        # task_id тем же форматом, что confirm._new_task_id (факт 7: приватный через границу —
+        # дублируем 2 строки генерации, не тащим leading-underscore символ).
+        import time as _time
+        task_id = f"task-{int(self.clock.now() * 1000)}-{next(_GATE_TASK_SEQ)}"
+        self.threads.set_stage(th.id, stage)
+        self.store.start_task(task_id, text, TaskStatus.RUNNING, self.clock.now())
+        self.threads.append_task(th.id, task_id)
+        if model is not None:
+            self.threads.set_last_model(th.id, model)
+        root = self._resolve_root_for(th)
+        self.kora_runner.start(
+            task_id, text,
+            RunSpec(thread_id=th.id, project_root=root, gate_mode=gate_mode, model=model),
+        )
+        self.threads.append_feed(th.id, {
+            "ts": self.clock.now(), "kind": "gate_card",
+            "stage": stage, "action": "run_started", "model": model,
+        })
+
+
+_GATE_TASK_SEQ = itertools.count(1)
+
 
 def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     """Hard-fails via cfg.validate_voice_keys() before touching the network if a required
@@ -253,9 +411,18 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         if th is not None:
             threads.append_feed(th.id, entry)
 
+    def _on_run_finished(thread_id: str, outcome: str) -> None:
+        # UI-4: обёртка над threads.set_outcome — переводит code→done при completed. Holder-паттерн:
+        # kora_runner строится ДО host, но on_run_finished зовётся в runtime (после сборки host).
+        host = _h["host"]
+        if host is not None:
+            host._run_finished(thread_id, outcome)
+        else:
+            threads.set_outcome(thread_id, outcome)
+
     kora_runner = (
         KoraRunner(cfg, store, speak_ledger, clock, journal, on_speak,
-                   log_sink=_kora_log_sink, on_run_finished=threads.set_outcome)
+                   log_sink=_kora_log_sink, on_run_finished=_on_run_finished)
         if cfg.kora_enabled
         else None
     )
@@ -265,7 +432,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     from synapse.projects import ProjectStore
     projects = ProjectStore(Path(cfg.journal_dir) / "projects.json")
     turn_lock = asyncio.Lock()
-    current_http_thread: dict = {"id": None}
+    current_http_thread = TaskLocalThreadDict()
 
     def _awaiting_thread_id() -> str | None:
         task = store.task

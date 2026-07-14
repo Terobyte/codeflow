@@ -325,3 +325,202 @@ async def test_parked_answer_not_delivered_after_run_ends(tmp_path):
     # ран закончился, снапшот чист — ответ некому доставлять
     assert runner.provide_answer("да") is False
     assert store.awaiting_answer is False
+
+
+# ---------------------------------------------------------------------------
+# Task 3: gate_action в build_host + запуск стадий
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+
+class _FakeRunner:
+    """Стаб KoraRunner: записывает start(...) в список, без SDK/сети."""
+    def __init__(self):
+        self.starts = []  # [(task_id, text, RunSpec), ...]
+    def start(self, task_id, text, spec):
+        self.starts.append((task_id, text, spec))
+
+
+def _gate_host(tmp_path):
+    """Собирает РЕАЛЬНЫЙ host через build_host (fake-ключи, kora по умолчанию выключен →
+    kora_runner=None), затем подменяет kora_runner стабом — gate_action будет его звать."""
+    from synapse.config import SynapseConfig
+    from synapse.pipeline.app import build_host
+    cfg = SynapseConfig(
+        google_api_key="fake", openrouter_api_key="fake", anthropic_api_key="fake",
+        deepgram_api_key="fake", fish_audio_api_key="fake", fish_reference_id="fake",
+        journal_dir=str(tmp_path), kora_workspace_dir=str(tmp_path / "ws"),
+    )
+    host = build_host(cfg)
+    host.kora_runner = _FakeRunner()
+    return host
+
+
+def _propose_thread(host):
+    """Тред в стадии propose со сводом — готов к send_to_kora."""
+    t = host.threads.create("x")
+    host.threads.set_stage(t.id, "propose")
+    host.threads.set_request(t.id, "сделай штуку")
+    return t
+
+
+async def test_send_to_kora_from_propose_starts_spec_plan_run(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    res = await host.gate_action(t.id, "send_to_kora", confirm=True)
+    assert res.get("ok") is True
+    assert host.threads.get(t.id).stage == "spec_plan"
+    task_id, text, spec = host.kora_runner.starts[-1]
+    assert spec.gate_mode == "docs_only"
+    assert "сделай штуку" in text
+    assert "docs/plans/" in text  # текст диктует путь план-файла
+    assert spec.thread_id == t.id
+    assert host.store.has_active_task() and host.store.task.id == task_id
+
+
+async def test_send_to_kora_fast_path_needs_confirm(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    # быстрая карточка без confirm → отказ
+    res = await host.gate_action(t.id, "send_to_kora", confirm=False, fast=True)
+    assert res.get("error") == "confirm_required"
+    assert host.threads.get(t.id).stage == "propose"  # стадия не сдвинулась
+
+
+async def test_send_to_kora_fast_path_with_confirm_starts_code_run(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    res = await host.gate_action(t.id, "send_to_kora", confirm=True, fast=True)
+    assert res.get("ok") is True
+    assert host.threads.get(t.id).stage == "code"
+    _, text, spec = host.kora_runner.starts[-1]
+    assert spec.gate_mode == "full"          # быстрый путь — полный гейт
+    assert text == "сделай штуку"            # текст = сам request_text
+
+
+async def test_write_code_without_plan_file_errors(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    host.threads.set_stage(t.id, "spec_plan")
+    res = await host.gate_action(t.id, "write_code", confirm=True, model="claude-sonnet-5")
+    assert res.get("error") == "no_plan_file"
+    assert host.threads.get(t.id).stage == "spec_plan"  # не сдвинулась
+
+
+async def test_write_code_stale_plan_when_last_outcome_not_completed(tmp_path):
+    """План-файл есть, но прошлая SPEC_PLAN провалилась → stale_plan, стадия не сдвинулась."""
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    host.threads.set_stage(t.id, "spec_plan")
+    host.threads.set_outcome(t.id, "failed")
+    # создать план-файл в дефолт-воркспейсе (тред без проекта → root = cfg.kora_workspace_dir)
+    root = Path(host.cfg.kora_workspace_dir)
+    (root / "docs" / "plans").mkdir(parents=True, exist_ok=True)
+    (root / "docs" / "plans" / f"{t.id}.md").write_text("план", encoding="utf-8")
+    res = await host.gate_action(t.id, "write_code", confirm=True, model="claude-sonnet-5")
+    assert res.get("error") == "stale_plan"
+    assert host.threads.get(t.id).stage == "spec_plan"
+
+
+async def test_write_code_with_plan_and_completed_outcome_starts_code_run(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    host.threads.set_stage(t.id, "spec_plan")
+    host.threads.set_outcome(t.id, "completed")
+    root = Path(host.cfg.kora_workspace_dir)
+    (root / "docs" / "plans").mkdir(parents=True, exist_ok=True)
+    (root / "docs" / "plans" / f"{t.id}.md").write_text("план", encoding="utf-8")
+    res = await host.gate_action(t.id, "write_code", confirm=True, model="claude-sonnet-5")
+    assert res.get("ok") is True
+    assert host.threads.get(t.id).stage == "code"
+    _, text, spec = host.kora_runner.starts[-1]
+    assert spec.gate_mode == "full"
+    assert spec.model == "claude-sonnet-5"
+    assert host.threads.get(t.id).last_model == "claude-sonnet-5"
+
+
+async def test_write_code_requires_confirm(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    host.threads.set_stage(t.id, "spec_plan")
+    host.threads.set_outcome(t.id, "completed")
+    root = Path(host.cfg.kora_workspace_dir)
+    (root / "docs" / "plans").mkdir(parents=True, exist_ok=True)
+    (root / "docs" / "plans" / f"{t.id}.md").write_text("план", encoding="utf-8")
+    res = await host.gate_action(t.id, "write_code", confirm=False, model="claude-sonnet-5")
+    assert res.get("error") == "confirm_required"
+
+
+async def test_write_code_invalid_model_errors(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    host.threads.set_stage(t.id, "spec_plan")
+    host.threads.set_outcome(t.id, "completed")
+    root = Path(host.cfg.kora_workspace_dir)
+    (root / "docs" / "plans").mkdir(parents=True, exist_ok=True)
+    (root / "docs" / "plans" / f"{t.id}.md").write_text("план", encoding="utf-8")
+    res = await host.gate_action(t.id, "write_code", confirm=True, model="gpt-4o")
+    assert res.get("error") == "invalid_model"
+
+
+async def test_gate_busy_singleton_keeps_stage(tmp_path):
+    """Занятый синглтон → busy, стадия НЕ сдвинулась (S6: порядок busy-чек ДО set_stage)."""
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    host.store.start_task("other-running", "чужая", TaskStatus.RUNNING, 0.0)
+    res = await host.gate_action(t.id, "send_to_kora", confirm=True)
+    assert res.get("error") == "busy"
+    assert host.threads.get(t.id).stage == "propose"  # не сдвинулась
+    assert host.kora_runner.starts == []              # и запуск не ушёл
+
+
+async def test_revise_returns_to_collect_without_run(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    host.threads.set_stage(t.id, "spec_plan")  # revise доступен из spec_plan
+    res = await host.gate_action(t.id, "revise")
+    assert res.get("ok") is True
+    assert host.threads.get(t.id).stage == "collect"
+    assert host.kora_runner.starts == []  # revise не запускает
+
+
+async def test_gate_single_flight_concurrent_calls(tmp_path):
+    """Двойной конкурентный вызов на один тред — второй ждёт lock и получает busy."""
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    # первый вызов занимает синглтон (внутри gate_action стартует задачу); запустим две
+    # gate_action конкурентно — одна выиграет, вторая увидит has_active_task.
+    import asyncio as _aio
+    r1, r2 = await _aio.gather(
+        host.gate_action(t.id, "send_to_kora", confirm=True),
+        host.gate_action(t.id, "send_to_kora", confirm=True),
+    )
+    results = [r1, r2]
+    oks = [r for r in results if r.get("ok")]
+    busies = [r for r in results if r.get("error") == "busy"]
+    assert len(oks) == 1 and len(busies) == 1
+
+
+async def test_run_finished_code_completed_transitions_to_done(tmp_path):
+    """Новая обёртка on_run_finished: code+completed → done (голый set_outcome так не умеет)."""
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)
+    host.threads.set_stage(t.id, "code")
+    host._run_finished(t.id, "completed")
+    assert host.threads.get(t.id).stage == "done"
+    assert host.threads.get(t.id).last_outcome == "completed"
+
+
+async def test_run_finished_other_stage_does_not_touch_stage(tmp_path):
+    host = _gate_host(tmp_path)
+    t = _propose_thread(host)  # stage = propose
+    host._run_finished(t.id, "completed")
+    assert host.threads.get(t.id).stage == "propose"  # только code→done
+    assert host.threads.get(t.id).last_outcome == "completed"
+
+
+async def test_gate_unknown_thread_errors(tmp_path):
+    host = _gate_host(tmp_path)
+    res = await host.gate_action("ghost", "revise")
+    assert res.get("error") == "unknown_thread"
