@@ -684,6 +684,16 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         tid = data.get("id")
         if tid is not None and host.threads.get(str(tid)) is None:
             return JSONResponse({"error": "no such thread"}, status_code=404)
+        # B43: пока звонок ЖИВ (включая окно тихого реконнекта — бинд переживает клиентский
+        # `client=null`), навигация по тредам НЕ переклеивает привязку голоса: иначе история
+        # одного разговора расщепляется по двум тредам. 200, не 4xx: запрос легитимен, клиент
+        # получает фактическую привязку и реконсилируется. Строгий `is True` — MagicMock-стабы
+        # route-тестов не должны фабриковать «живой звонок» (паттерн session_alive isinstance).
+        live_fn = getattr(host, "voice_session_live", None)
+        if callable(live_fn) and live_fn() is True and str(tid or "") != (host.voice_thread["id"] or ""):
+            return JSONResponse({
+                "ok": False, "reason": "voice_live", "voice_thread": host.voice_thread["id"],
+            })
         host.voice_thread["id"] = str(tid) if tid else None
         # UI v3 иерархия: активный проект дома — голосовой авто-тред родится в нём.
         # Неизвестный проект тихо сбрасывается в None (тот же паттерн, что voice_thread).

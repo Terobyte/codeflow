@@ -182,6 +182,15 @@ class SynapseHost:
         if self._output_task is task:
             self._output_task = None
 
+    def voice_session_live(self) -> bool:
+        """B43: «идёт ли живой звонок» — та же правда, которой пользуются push_speak_frame/
+        speak (бинд M1-слайса-2 + has_finished()), инкапсулированная для роутов: никто вне
+        хоста не должен щупать _output_task напрямую. Возвращает НАСТОЯЩИЙ bool — роут
+        active-thread гейтится строгим `is True`, чтобы stub-хосты тестов (MagicMock)
+        никогда не считались «живым звонком»."""
+        t = self._output_task
+        return bool(t is not None and not t.has_finished())
+
     async def push_speak_frame(self, text: str) -> bool:
         """Inject Kora's SPEAK straight into the running output task, out-of-band (no input
         frame needed). Re-checks liveness: the task may have finished between `speak()`

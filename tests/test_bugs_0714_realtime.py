@@ -181,9 +181,6 @@ class _FakeLiveOutputTask:
         return False
 
 
-@pytest.mark.xfail(
-    reason="B43: active-thread rebinds voice_thread even while a voice call is live", strict=True
-)
 def test_B43_active_thread_must_not_rebind_while_voice_session_live(tmp_path):
     from starlette.testclient import TestClient
 
