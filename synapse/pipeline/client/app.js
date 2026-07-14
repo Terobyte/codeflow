@@ -856,7 +856,11 @@ async function connectVoice() {
         // B-CORE-5: не только логируем — гасим кнопку и обнуляем client, иначе UI застревал
         // («слушаю» + «⛔ ошибка»), а следующий тап шёл в ветку «отключить» мёртвого клиента.
         console.error("voice error:", e);
-        if (client === me) { client = null; setMicState("error", "соединение прервано"); }
+        if (client === me) {
+          client = null;
+          setMicState("error", "соединение прервано");
+          abandonVoice(me);
+        }
       },
     },
   });
@@ -871,6 +875,16 @@ async function connectVoice() {
   };
   client = me;
   await withTimeout(me.connect(), 20000);
+}
+
+// Privacy-инвариант: любой путь, роняющий client по ошибке (onError / провал реконнекта),
+// ОБЯЗАН погасить транспорт — иначе pipecat держит peer-connection + локальный мик-трек
+// живыми, а handle/кнопки/вотчдог уже мертвы (zombie-мик, лечится только reload).
+// c.disconnect()→stop()→mediaManager.disconnect() отпускает getUserMedia; закрытие pc
+// сам трек НЕ глушит.
+function abandonVoice(c) {
+  try { const r = c && c.disconnect(); if (r && r.catch) r.catch(() => {}); }
+  catch { /* уже мёртв */ }
 }
 
 // Общий hang-up путь: клик по мику (когда уже подключены), «Завершить — в чат», Escape.
@@ -965,7 +979,8 @@ async function probeSession() {
     await connectVoice();
   } catch (err) {
     console.error("auto-reconnect failed:", err);
-    client = null;
+    const dead = client; client = null;
+    abandonVoice(dead);  // реконнект мог поднять мик — не осиротить его
     setMicState("error", "связь потеряна — тапни микрофон");
     maybeReload();
   } finally {
