@@ -25,6 +25,11 @@ class SynapseConfig:
     # is pipecat's own FishAudioTTSService default.
     fish_tts_model: str = "s2.1-pro-free"
 
+    # Play-озвучка ленты: санитайз текста Коры перед TTS — direct Gemini, НЕ OpenRouter
+    # (отдельная квота от tier1-каскада; benchmarks/gemini-vs-openrouter-20260715). Таймаут
+    # переиспользует request_timeout_s.
+    speakify_model: str = "gemini-3.5-flash"
+
     request_timeout_s: float = 10.0
 
     # Circuit breaker windows (Р-14).

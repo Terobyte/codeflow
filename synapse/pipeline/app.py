@@ -46,6 +46,7 @@ from synapse.dispatcher.tools import ALL_SCHEMAS, KoraBridge, ToolHandlers, regi
 from synapse.journal import AlertKind, TurnJournal
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
 from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook, make_guarded_assistant_aggregator
+from synapse.pipeline.tts_cache import TTSCache, TTSCacheObserver
 from synapse.prompt import STAGE_RULES_COLLECT, STAGE_RULES_PROPOSE
 from synapse.threads import ThreadStore
 
@@ -305,6 +306,11 @@ class SynapseHost:
             if proj:
                 return proj["path"]
         return self.cfg.kora_workspace_dir
+
+    def resolve_thread_root(self, th) -> str:
+        """Публичная поверхность корня треда для роутов (/api/threads/{id}/diff). Делегат к
+        _resolve_root_for — роут не лезет через приватную границу хоста (pattern-fidelity)."""
+        return self._resolve_root_for(th)
 
     def _run_finished(self, thread_id: str, outcome: str, gate_mode: str | None = None) -> None:
         """Обёртка on_run_finished. `gate_mode` — вид завершившегося рана (несёт RunSpec):
@@ -842,6 +848,13 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         cfg=cfg, store=store, clock=clock, thread_id=tid,
         stage_block_for=_stage_block_for, owner_thread_for=_owner_thread_for,
     )
+    # Play-озвучка ленты (tero 2026-07-14): кэш реалтайм-аудио на диск, ключ по содержимому.
+    # Пост-хок атрибут на долгоживущем хосте — тот же приём, что host.turn_context_for выше.
+    host.tts_cache = TTSCache(
+        Path(cfg.journal_dir) / "tts_cache",
+        model=cfg.fish_tts_model,
+        voice=cfg.fish_reference_id or "",
+    )
     _h["host"] = host  # fills the on_speak holder -- must precede any runtime SPEAK
     return host
 
@@ -853,13 +866,16 @@ class SynapseSession:
     `SynapseHost` by reference."""
 
     def __init__(self, pipeline: Pipeline, llm_switcher: LLMSwitcher, generation_guard: GenerationGuard,
-                 flush_voice_feed: Any = None) -> None:
+                 flush_voice_feed: Any = None, observers=None) -> None:
         self.pipeline = pipeline
         self.llm_switcher = llm_switcher
         self.generation_guard = generation_guard
         # Gate v2 D3': колбэк «дофлашить context-diff в ленту войс-треда» — webrtc_server зовёт
         # его в on_client_disconnected (последний ответ звонка). None → фича не проведена (стабы).
         self.flush_voice_feed = flush_voice_feed
+        # TTS-кэш (tero 2026-07-14): обсерверы для PipelineTask — тап на выходе TTS пишет
+        # реалтайм-аудио в кэш. Пусто → кэша нет (стабы/тесты без host.tts_cache).
+        self.observers = list(observers or [])
 
 
 def build_session_pipeline(host: SynapseHost) -> SynapseSession:
@@ -1059,6 +1075,11 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
         settings=FishAudioTTSService.Settings(model=host.cfg.fish_tts_model, voice=host.cfg.fish_reference_id),
     )
 
+    # TTS-кэш (tero 2026-07-14): тап на выходе tts пишет реалтайм-аудио в кэш хоста. Нет
+    # host.tts_cache (стабы) → без обсервера, пайплайн неизменен.
+    cache = getattr(host, "tts_cache", None)
+    observers = [TTSCacheObserver(cache, tts)] if cache is not None else []
+
     arbiter = TTSArbiterProcessor(host.arbiter_policy)
 
     # assistant_aggregator MUST sit AFTER tts, not before it: LLMAssistantAggregator.process_frame
@@ -1083,7 +1104,7 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     )
 
     return SynapseSession(pipeline=pipeline, llm_switcher=llm_switcher, generation_guard=generation_guard,
-                          flush_voice_feed=_flush_voice_final)
+                          flush_voice_feed=_flush_voice_final, observers=observers)
 
 
 def run() -> None:

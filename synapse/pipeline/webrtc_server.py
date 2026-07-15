@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from pathlib import Path
 from urllib.parse import quote
@@ -32,7 +33,12 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat_ai_prebuilt.frontend import PipecatPrebuiltUI
 
 from synapse.bridge.state import Liveness, TaskStatus
+from synapse.dispatcher.speakify import speakify
 from synapse.pipeline.app import SynapseHost, build_session_pipeline
+from synapse.pipeline.arbiter import default_sentence_splitter
+from synapse.pipeline.tts_cache import fish_rest_tts
+
+logger = logging.getLogger(__name__)
 
 def _browse_dir(raw: str | None, home: Path) -> dict | None:
     """Папко-пикер «+ проект» (фидбек Теро: абсолютный путь руками — мусор). Read-only
@@ -150,7 +156,7 @@ def build_web_app(host: SynapseHost) -> FastAPI:
                 params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
             )
             full = Pipeline([transport.input(), session.pipeline, transport.output()])
-            task = PipelineTask(full, idle_timeout_secs=None)  # M3: never auto-drop a connected demo session
+            task = PipelineTask(full, idle_timeout_secs=None, observers=(getattr(session, "observers", None) or None))  # M3: never auto-drop a connected demo session
 
             greeted = False
 
@@ -543,6 +549,53 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             return JSONResponse({"error": "no such thread"}, status_code=404)
         return JSONResponse({"entries": host.threads.read_feed(thread_id, limit=limit)})
 
+    @app.get("/api/threads/{thread_id}/diff")
+    async def api_thread_diff(thread_id: str):
+        # DIFF ленты (tero 2026-07-14): git-состояние в корне запуска треда. resolve_thread_root
+        # — публичная поверхность хоста (НЕ приватный _resolve_root_for). stub-host без
+        # threads/резолвера → 503; не-репо / нет директории → честный empty-state {"repo": false}.
+        threads = getattr(host, "threads", None)
+        resolver = getattr(host, "resolve_thread_root", None)
+        if threads is None or resolver is None:
+            return JSONResponse({"error": "unavailable"}, status_code=503)
+        th = threads.get(thread_id)
+        if th is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        root = resolver(th) or str(Path.home() / "synapse-kora-workspace")
+        if not Path(root).is_dir():
+            return JSONResponse({"repo": False, "root": root})
+
+        async def _git(*args):
+            # R-3: wait_for отменяет await, но НЕ убивает git — при зависании на сетевом FS
+            # процесс-зомби. На таймаут: kill + wait, вернуть код 124.
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", root, *args,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                out, _err = await asyncio.wait_for(proc.communicate(), 10.0)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return 124, ""
+            return proc.returncode, out.decode(errors="replace")
+
+        rc, out = await _git("rev-parse", "--is-inside-work-tree")
+        if rc != 0 or out.strip() != "true":
+            return JSONResponse({"repo": False, "root": root})
+        _rc, status_out = await _git("status", "--porcelain")
+        files = [{"status": l[:2].strip(), "path": l[3:]} for l in status_out.splitlines() if l]
+        rc, body = await _git("diff", "HEAD")
+        if rc != 0:  # unborn HEAD (нет коммитов) → diff без ревизии
+            _rc, body = await _git("diff")
+        truncated = False
+        if len(body) > 200_000:
+            body = body[:200_000]
+            truncated = True
+        return JSONResponse(
+            {"repo": True, "root": root, "files": files, "diff": body, "truncated": truncated}
+        )
+
     @app.post("/api/threads/{thread_id}/message")
     async def api_thread_message(thread_id: str, request: Request):
         if not _csrf_ok(request):
@@ -602,6 +655,56 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
         host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": reply})
         return JSONResponse({"reply": reply})
+
+    @app.post("/api/tts")
+    async def api_tts(request: Request):
+        # Play-озвучка ленты (tero 2026-07-14): три ступени — кэш → сборка из посентенсовых
+        # WAV → REST-синтез Fish. Текст Коры (role=kora) прогоняется через speakify перед TTS
+        # (санитайз кода/путей), речь диспетчера уже разговорная. Все cache-IO через to_thread
+        # (R-4: WAV до ~МБ на event loop). x-tts-source сообщает клиенту, откуда взялось аудио.
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        data, err = await _json_body(request)
+        if err is not None:
+            return err
+        text = str(data.get("text") or "").strip()[:4000]
+        if not text:
+            return JSONResponse({"error": "empty text"}, status_code=400)
+        role = data.get("role") or "disp"
+        cache = getattr(host, "tts_cache", None)
+        if cache is None:
+            return JSONResponse({"error": "unavailable"}, status_code=503)
+        cfg = host.cfg
+        if role == "kora":
+            spoken = await asyncio.to_thread(cache.get_speak_text, text)
+            if spoken is None:
+                spoken = await speakify(
+                    text, api_key=cfg.google_api_key, model=cfg.speakify_model,
+                    timeout_s=cfg.request_timeout_s,
+                )
+                await asyncio.to_thread(cache.put_speak_text, text, spoken)
+        else:
+            spoken = text
+        wav = await asyncio.to_thread(cache.get, spoken)
+        source = "cache"
+        if wav is None:
+            wav = await asyncio.to_thread(cache.assemble, spoken, default_sentence_splitter)
+            source = "assembled"
+        if wav is None:
+            if not cfg.fish_audio_api_key:
+                return JSONResponse({"error": "unavailable"}, status_code=503)
+            try:
+                wav = await fish_rest_tts(
+                    spoken, api_key=cfg.fish_audio_api_key, model=cfg.fish_tts_model,
+                    voice=cfg.fish_reference_id or "", timeout_s=30.0,
+                )
+            except Exception as exc:
+                logger.warning("api_tts: REST synth failed (%s)", exc)
+                return JSONResponse({"error": "tts_failed"}, status_code=502)
+            await asyncio.to_thread(cache.put_wav, spoken, wav)
+            source = "synth"
+        return Response(content=wav, media_type="audio/wav",
+                        headers={"x-tts-source": source, "cache-control": "no-store"})
 
     @app.patch("/api/threads/{thread_id}")
     async def api_thread_patch(thread_id: str, request: Request):

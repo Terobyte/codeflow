@@ -63,6 +63,22 @@ function postJSON(url, body) {
                       body: JSON.stringify(body), signal: ctrl.signal })
     .finally(() => clearTimeout(timeout));
 }
+// POST → бинарный ответ (Play-озвучка: /api/tts отдаёт audio/wav). Тот же CSRF/timeout-
+// паттерн, что postJSON; на !ok кидает Error со .status, тело отдаёт Blob-ом.
+async function postBlob(url, body) {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+                                   body: JSON.stringify(body), signal: ctrl.signal });
+    if (!res.ok) {
+      const err = new Error("HTTP " + res.status);
+      err.status = res.status;
+      throw err;
+    }
+    return await res.blob();
+  } finally { clearTimeout(timeout); }
+}
 // UI-5 (S30): PATCH для rename треда — тот же CSRF/timeout-паттерн, что postJSON.
 function patchJSON(url, body) {
   const ctrl = new AbortController();
@@ -189,7 +205,7 @@ $("disp-toggle").addEventListener("click", () => {
   applyDispToggleUI();
 });
 
-// ---------- вкладки Чат / Дифф в топбаре треда (плейсхолдер P2: реальный git diff не подключён) ----------
+// ---------- вкладки Chat / Diff в топбаре треда: Diff = живой git-статус корня задачи ----------
 let tab = "chat";
 function setTab(next) {
   tab = next;
@@ -200,7 +216,49 @@ function setTab(next) {
   $("view-diff").hidden = !(inThread && tab === "diff");
 }
 $("tab-chat").addEventListener("click", () => setTab("chat"));
-$("tab-diff").addEventListener("click", () => setTab("diff"));
+$("tab-diff").addEventListener("click", () => { setTab("diff"); loadDiff(); });
+
+// Diff-вкладка: git-статус корня задачи с сервера (/api/threads/<id>/diff). Только textContent
+// (XSS: пути и строки диффа произвольны); replaceChildren — без накопления между рендерами.
+let diffLoading = false;
+async function loadDiff() {
+  const r = route();
+  if (r.view !== "thread") return;
+  if (diffLoading) return;
+  diffLoading = true;
+  const box = $("view-diff");
+  try {
+    const resp = await getJSON("/api/threads/" + encodeURIComponent(r.id) + "/diff");
+    const kids = [];
+    if (resp.repo === false) {
+      kids.push(el("p", "diff-empty", "Not a git repository — nothing to diff."));
+    } else if ((!resp.files || !resp.files.length) && !(resp.diff || "").trim()) {
+      kids.push(el("p", "diff-empty", "No changes yet — the agent is still working on the task."));
+    } else {
+      if (resp.files && resp.files.length) {
+        const fl = el("div", "diff-files");
+        resp.files.forEach((f) =>
+          fl.appendChild(el("span", "diff-file", (f.status || "") + " " + (f.path || ""))));
+        kids.push(fl);
+      }
+      const pre = el("pre", "diff-body");
+      (resp.diff || "").split("\n").forEach((line) => {
+        let cls = "";
+        if (line.startsWith("@@") || line.startsWith("diff --git")) cls = "diff-hunk";
+        else if (line.startsWith("+")) cls = "diff-add";
+        else if (line.startsWith("-")) cls = "diff-del";
+        pre.appendChild(el("span", cls, line + "\n"));
+      });
+      kids.push(pre);
+      if (resp.truncated) kids.push(el("p", "diff-empty", "…truncated"));
+    }
+    box.replaceChildren(...kids);
+  } catch {
+    box.replaceChildren(el("p", "diff-empty", "Failed to load diff."));
+  } finally {
+    diffLoading = false;
+  }
+}
 
 function render() {
   const r = route();
@@ -226,6 +284,7 @@ function render() {
       setTab("chat"); // новый тред всегда открывается на вкладке «Чат»
     }
     pollFeed();
+    if (tab === "diff") loadDiff(); // вход в тред уже на Diff-вкладке (напр. по hashchange)
   } else if (r.view === "activity") {
     setViewTitle("Code activity");
     $("msg-input").placeholder = taskPlaceholder();
@@ -432,16 +491,61 @@ async function loadLists() {
 }
 
 // ---------- лента треда ----------
-// PF3/P3-плейсхолдер: визуальный toggle озвучки, без реального аудио (парк P3).
-function playButton(role) {
+// Play-озвучка (tero 2026-07-14): реальное аудио с сервера. POST /api/tts (role → disp/kora:
+// текст Коры санитайзится speakify серверно) отдаёт WAV → Blob → Audio. Одновременно играет
+// не больше одной дорожки (nowPlaying), повторный клик по своей кнопке — пауза/резюме.
+let nowPlaying = null; // {btn, audio, url}
+function stopPlayback() {
+  if (!nowPlaying) return;
+  const { btn, audio, url } = nowPlaying;
+  audio.pause();
+  URL.revokeObjectURL(url);
+  btn.replaceChildren(iconSvg(ICON_PLAY));
+  btn.classList.remove("playing", "loading", "err");
+  nowPlaying = null;
+}
+function playButton(role, text) {
+  if (!text) return null; // пустой текст нечего озвучивать — кнопку не рендерим
   const btn = el("button", "play-btn");
   btn.type = "button";
   btn.title = "TTS · " + (role === "disp" ? "Flow" : "Code") + " voice";
   btn.appendChild(iconSvg(ICON_PLAY));
-  btn.addEventListener("click", (ev) => {
+  btn.addEventListener("click", async (ev) => {
     ev.stopPropagation();
-    const playing = btn.classList.toggle("playing");
-    btn.replaceChildren(iconSvg(playing ? ICON_PAUSE : ICON_PLAY));
+    // свой же трек — пауза/резюме без нового запроса
+    if (nowPlaying && nowPlaying.btn === btn) {
+      const a = nowPlaying.audio;
+      if (a.paused) {
+        a.play();
+        btn.replaceChildren(iconSvg(ICON_PAUSE));
+        btn.classList.add("playing");
+      } else {
+        a.pause();
+        btn.replaceChildren(iconSvg(ICON_PLAY));
+        btn.classList.remove("playing");
+      }
+      return;
+    }
+    stopPlayback(); // чужой трек играет — глушим его
+    btn.disabled = true;
+    btn.classList.add("loading");
+    try {
+      const blob = await postBlob("/api/tts", { text, role });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.onended = stopPlayback;
+      await audio.play();
+      nowPlaying = { btn, audio, url };
+      btn.replaceChildren(iconSvg(ICON_PAUSE));
+      btn.classList.add("playing");
+    } catch {
+      btn.classList.add("err");
+      btn.title = "TTS failed";
+      setTimeout(() => btn.classList.remove("err"), 2000);
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove("loading");
+    }
   });
   return btn;
 }
@@ -466,7 +570,8 @@ function addEntry(e) {
       const body = el("div", "msg-body");
       body.appendChild(el("p", "msg-text", e.text || ""));
       col.appendChild(body);
-      col.appendChild(playButton(role));
+      const pb = playButton(role, e.text || "");
+      if (pb) col.appendChild(pb);
       li.appendChild(col);
     }
   } else if (e.kind === "thinking") {

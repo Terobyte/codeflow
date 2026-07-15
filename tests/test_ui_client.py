@@ -219,3 +219,16 @@ def test_browse_dir_is_caged_to_home(tmp_path):
     # побег из клетки (выше HOME, битый путь) молча приземляется на home
     for escape in ("/", str(tmp_path), str(home / ".." / ".."), "/etc"):
         assert webrtc_server._browse_dir(escape, home)["path"] == str(home.resolve())
+
+
+def test_app_js_play_and_diff_are_wired_not_stubs():
+    """tero 2026-07-14: Play-озвучка (реальное аудио через /api/tts → Blob → Audio) и
+    Diff-вкладка (git-статус через /diff) подключены — визуальные стабы P2/P3 сняты."""
+    body = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
+    for token in ("/api/tts", "postBlob", "createObjectURL", "loadDiff", "/diff",
+                  "diff-add", "role"):
+        assert token in body, f"app.js play/diff wiring missing {token!r}"
+    assert "без реального аудио" not in body  # маркер стаба P3 умер
+    css = (CLIENT_DIR / "style.css").read_text(encoding="utf-8")
+    for token in (".diff-add", ".play-btn.loading"):
+        assert token in css, f"style.css missing {token!r}"

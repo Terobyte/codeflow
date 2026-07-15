@@ -650,3 +650,27 @@ li.project:hover .pr-delete, .pr-delete:focus-visible { opacity: 1; }
 #picker-actions button:hover { background: var(--terra-blush); }
 #picker-choose { background: var(--terra) !important; color: var(--bg) !important; border: none !important; }
 #picker-choose:hover { background: var(--terra-deep) !important; }
+
+/* Diff-вкладка (tero 2026-07-14): git-статус корня задачи */
+.diff-files {
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 2px 12px;
+}
+.diff-file {
+  font-family: var(--mono); font-size: 12px; color: var(--umber-deep);
+  background: var(--sand); border: 1px solid var(--hairline);
+  border-radius: var(--r-pill); padding: 3px 10px;
+}
+.diff-body {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+  white-space: pre; overflow-x: auto; margin: 0;
+  padding: 12px; border-radius: var(--r-card);
+  background: var(--cream); border: 1px solid var(--hairline); color: var(--ink-70);
+}
+.diff-add { color: var(--olive-deep); }
+.diff-del { color: var(--terra-deep); }
+.diff-hunk { color: var(--taupe); font-weight: 600; }
+
+/* Play-озвучка: загрузка (пульс) и ошибка (красный акцент) */
+.play-btn.loading { animation: play-pulse 1s ease-in-out infinite; }
+.play-btn.err { color: var(--red); border-color: var(--red); }
+@keyframes play-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
