@@ -9,143 +9,206 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
-  <meta name="theme-color" content="#f5ead8">
-  <!-- R9: не render-blocking @import — preconnect + non-blocking stylesheet swap, системный
-       fallback уже покрывает первый paint мик-кнопки на сотовой связи -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=Caprasimo&family=Figtree:wght@400;500;600;700&display=swap"
-        media="print" onload="this.media='all'">
-  <noscript>
-    <link rel="stylesheet"
-          href="https://fonts.googleapis.com/css2?family=Caprasimo&family=Figtree:wght@400;500;600;700&display=swap">
-  </noscript>
+  <!-- R1 (§16.2): Night Atlas — тема по умолчанию; Hero Drive живёт классом .hero-mode.
+       theme-color держим на фоне Night Atlas: тема стартует тёмной, тёмный старт = без вспышки. -->
+  <meta name="theme-color" content="#090b24">
+  <!-- Веб-шрифтов больше нет: обе темы стоят на системной паре (rounded sans + Georgia).
+       PWA перестала зависеть от fonts.googleapis.com на первом paint. -->
   <link rel="stylesheet" href="./style.css">
   <script type="module" src="./app.js"></script>
 </head>
 <body>
-  <div class="bg-blob bg-blob-1" aria-hidden="true"></div>
-  <div class="bg-blob bg-blob-2" aria-hidden="true"></div>
-  <div class="bg-blob bg-blob-3" aria-hidden="true"></div>
-  <div id="shell">
-    <aside id="sidebar">
-      <div id="side-head">
-        <!-- Вордмарк = логотип: Caprasimo, «Flow» терракотой с волнистым подчёркиванием -->
-        <h1>Code<span class="flow logo-wave">Flow</span></h1>
-        <button id="side-close" type="button" aria-label="Close menu">
+  <div class="ambient" aria-hidden="true">
+    <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+  </div>
+
+  <div class="app-shell" id="shell">
+    <aside class="sidebar" id="sidebar" aria-label="Workspace navigation">
+      <div class="brand-row">
+        <a class="brand" href="#/" aria-label="CodeFlow home">
+          <span class="brand-mark"><span></span></span>
+          <span><b>CodeFlow</b><small id="brand-theme">Night Atlas</small></span>
+        </a>
+        <button class="icon-button close-sidebar" id="side-close" type="button" aria-label="Close menu">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
         </button>
       </div>
-      <button id="new-thread" type="button">
+
+      <button class="new-task" id="new-thread" type="button">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
         New task
       </button>
-      <nav id="side-scroll">
-        <h2>Projects</h2>
-        <ul id="projects-list"></ul>
-        <button id="add-project" type="button">＋ project</button>
-        <h2 id="loose-h" hidden>No project</h2>
-        <ul id="threads-list"></ul>
+
+      <nav class="side-scroll" id="side-scroll" aria-label="Projects and threads">
+        <div class="nav-label"><span>Projects</span><button id="add-project" type="button" aria-label="Add project">＋</button></div>
+        <ul class="project-tree" id="projects-list"></ul>
+        <div class="nav-label" id="loose-h" hidden><span>No project</span></div>
+        <ul class="thread-list loose" id="threads-list"></ul>
       </nav>
-      <div id="disp-toggle-row">
+
+      <div class="disp-row" id="disp-toggle-row">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></svg>
-        <span id="disp-toggle-label">Flow · realtime</span>
-        <button id="disp-toggle" type="button" role="switch" aria-checked="true"
-                aria-label="Flow realtime"></button>
+        <span class="disp-label" id="disp-toggle-label">Flow · realtime</span>
+        <button class="switch" id="disp-toggle" type="button" role="switch" aria-checked="true" aria-label="Flow realtime"></button>
       </div>
-      <a id="kora-card" href="#/activity">
+
+      <a class="kora-card" id="kora-card" href="#/activity">
         <span id="kora-card-dot"></span>
-        <span id="kora-card-text">
-          <span id="kora-card-title">Code</span>
-          <span id="kora-card-sub" aria-live="polite">…</span>
+        <span class="kora-text" id="kora-card-text">
+          <b id="kora-card-title">Code</b>
+          <small id="kora-card-sub" aria-live="polite">…</small>
         </span>
-        <span id="kora-card-chevron" aria-hidden="true">›</span>
+        <span class="kora-chevron" id="kora-card-chevron" aria-hidden="true">›</span>
       </a>
     </aside>
-    <div id="backdrop" hidden></div>
-    <main id="main">
-      <header id="topbar">
-        <button id="menu-btn" type="button" aria-label="Menu">
+
+    <div class="scrim" id="backdrop" hidden></div>
+
+    <main class="main" id="main">
+      <header class="topbar" id="topbar">
+        <button class="icon-button menu-button" id="menu-btn" type="button" aria-label="Menu">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
         </button>
-        <div id="view-title">CodeFlow</div>
-        <span id="thread-badge" role="status" aria-live="polite" hidden></span>
-        <span id="stage-chip" hidden></span>
-        <div id="thread-tabs" hidden>
-          <button id="tab-chat" type="button" aria-selected="true">Chat</button>
-          <button id="tab-diff" type="button" aria-selected="false">Diff</button>
+        <button class="view-title" id="view-title" type="button">CodeFlow</button>
+        <span class="thread-badge" id="thread-badge" role="status" aria-live="polite" hidden></span>
+        <span class="stage-chip" id="stage-chip" hidden></span>
+        <div class="thread-tabs" id="thread-tabs" role="tablist" hidden>
+          <button id="tab-chat" type="button" role="tab" aria-selected="true">Chat</button>
+          <button id="tab-diff" type="button" role="tab" aria-selected="false">Diff</button>
+        </div>
+        <div class="top-actions">
+          <!-- Быстрый свич темы. Канон живёт в настройках (§16.2); состояние у обоих одно. -->
+          <button class="icon-button mode-toggle" id="theme-toggle" type="button" title="Switch theme"><span id="theme-toggle-icon">⚡</span><b id="theme-toggle-label">Hero Drive</b></button>
         </div>
       </header>
-      <section id="view-home" class="view">
-        <div id="hero">
-          <p id="hero-title">What are we building?</p>
-          <p id="hero-sub">Describe a task or turn on the mic — a thread is created for you.</p>
+
+      <p class="conn-status" id="conn-status" role="status" aria-live="assertive" hidden></p>
+
+      <section class="view" id="view-home" aria-labelledby="home-title">
+        <div class="home-wrap">
+          <section class="hero-panel">
+            <div class="hero-copy">
+              <span class="eyebrow">LOCAL CODING AGENT</span>
+              <h1 id="home-title">Build with<br><em>clarity.</em></h1>
+              <p>Describe a task or turn on the mic — a thread is created for you. Flow clarifies the request, then Code plans, implements, and tests it in your workspace.</p>
+              <div class="hero-actions">
+                <button class="primary-button" id="hero-new" type="button"><span>✦</span> Start a task</button>
+              </div>
+            </div>
+            <div class="orbit-scene" aria-label="Code agent illustration">
+              <div class="orbit orbit-one"></div>
+              <div class="orbit orbit-two"></div>
+              <div class="moon-glow"></div>
+              <img class="code-asset hero-code" src="./assets/code-night-atlas.svg" alt="Code, a moon-shaped coding guide holding a glowing code star">
+              <img class="hero-drive-asset" src="./assets/codeflow-hero-drive.svg" alt="Code driving a 1960s endurance racing car with Flow as the dashboard voice navigator">
+              <span class="spark s1">✦</span><span class="spark s2">·</span><span class="spark s3">✧</span>
+            </div>
+          </section>
+
+          <div class="section-heading" id="recent-h" hidden><div><span class="eyebrow">RECENT WORK</span><h2>Recent</h2></div></div>
+          <ul class="recent-list" id="home-recent"></ul>
         </div>
-        <h2 id="recent-h" hidden>Recent</h2>
-        <ul id="home-recent"></ul>
       </section>
-      <section id="view-thread" class="view" hidden>
-        <ol id="feed-list"></ol>
-        <p id="typing" aria-live="polite" hidden>thinking<span class="dots"><span>.</span><span>.</span><span>.</span></span></p>
-      </section>
-      <section id="view-diff" class="view" hidden>
-        <p class="diff-empty">No changes yet — the agent is still working on the task.</p>
-      </section>
-      <section id="view-activity" class="view" hidden>
-        <h2>Code activity</h2>
-        <ol id="activity-list"></ol>
-      </section>
-      <p id="conn-status" role="status" aria-live="assertive" hidden></p>
-      <footer id="composer">
-        <div id="composer-pill">
-          <button id="proj-chip" type="button" title="Active project"></button>
-          <button id="mic-btn" type="button" data-state="idle" aria-label="Microphone">
-            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
-          </button>
-          <textarea id="msg-input" rows="1" placeholder="Say or type a task…" autocomplete="off" enterkeyhint="send"></textarea>
-          <button id="msg-send" type="button" aria-label="Send">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 14 0"/><path d="m13 6 6 6-6 6"/></svg>
-          </button>
+
+      <section class="view" id="view-thread" aria-labelledby="thread-title" hidden>
+        <div class="thread-wrap">
+          <div class="thread-header">
+            <div class="thread-title-block">
+              <span class="eyebrow">TASK</span>
+              <h1 id="thread-title" title="Rename thread">Thread</h1>
+              <p><span class="folder-chip" id="thread-folder">No project</span><span id="thread-ago"></span></p>
+            </div>
+          </div>
+          <!-- Рельс стадий — только показ: стадия живёт в серверном FSM и двигается гейт-карточками. -->
+          <div class="stage-rail" id="stage-rail" aria-label="Task stage"></div>
+          <ol class="feed-list" id="feed-list"></ol>
+          <p class="typing" id="typing" aria-live="polite" hidden>thinking<span class="dots"><span>.</span><span>.</span><span>.</span></span></p>
         </div>
-      </footer>
-    </main>
-    <div id="live-overlay" hidden>
-      <div id="live-glow" aria-hidden="true"></div>
-      <div id="live-orb-wrap" aria-hidden="true">
-        <span id="live-ring"></span>
-        <div id="live-orb">
-          <svg viewBox="0 0 24 24" width="46" height="46" fill="none" stroke="#f5ead8" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+      </section>
+
+      <section class="view" id="view-diff" hidden>
+        <div class="thread-wrap" id="diff-wrap">
+          <p class="diff-empty">No changes yet — the agent is still working on the task.</p>
         </div>
-      </div>
-      <p id="live-status" aria-live="polite">Flow is listening…</p>
-      <div id="live-wave" aria-hidden="true">
-        <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
-        <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
-      </div>
-      <div id="live-controls">
-        <button id="live-mute" type="button" aria-pressed="false" aria-label="Toggle microphone" title="Toggle microphone">
+      </section>
+
+      <section class="view" id="view-activity" aria-labelledby="activity-title" hidden>
+        <div class="activity-wrap">
+          <div class="activity-page-head">
+            <span class="eyebrow">LIVE ACTIVITY</span>
+            <h1 id="activity-title">Code activity</h1>
+            <p>What Code is doing in your local workspace.</p>
+          </div>
+          <div class="activity-layout">
+            <section class="agent-stage">
+              <div class="agent-sky">
+                <span class="sky-label"><i></i> <span id="sky-status">IDLE</span></span>
+                <div class="activity-orbit">
+                  <img class="code-asset activity-code" src="./assets/code-night-atlas.svg" alt="Code working in the local workspace">
+                  <img class="activity-drive-asset" src="./assets/codeflow-hero-drive.svg" alt="Code driving with Flow as the dashboard voice navigator">
+                  <span class="orbit-particle p1"></span><span class="orbit-particle p2"></span><span class="orbit-particle p3"></span>
+                </div>
+                <h2 id="sky-title">Code is idle</h2>
+                <p id="sky-detail">No task running</p>
+              </div>
+            </section>
+            <section class="journal-card">
+              <header><span class="eyebrow">ACTIVITY LOG</span><h2>Tool activity</h2></header>
+              <ol class="journal-list" id="activity-list"></ol>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <footer class="composer" id="composer">
+        <button class="proj-chip" id="proj-chip" type="button" title="Active project" hidden></button>
+        <button class="mic-btn" id="mic-btn" type="button" data-state="idle" aria-label="Microphone">
           <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
         </button>
-        <button id="live-end" type="button">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
-          End — back to chat
+        <textarea id="msg-input" rows="1" placeholder="Say or type a task…" autocomplete="off" enterkeyhint="send"></textarea>
+        <button class="send" id="msg-send" type="button" aria-label="Send">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 14 0"/><path d="m13 6 6 6-6 6"/></svg>
         </button>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Модалки живут ВНЕ #shell: пикер делает shell inert — живой звонок не должен
+       замерзать заодно с фоном. -->
+  <div class="modal-layer" id="live-overlay" hidden>
+    <div class="call-sheet" role="dialog" aria-modal="true" aria-label="Voice session">
+      <span class="call-eyebrow"><i></i> LIVE WITH FLOW</span>
+      <div class="voice-orb" aria-hidden="true"><div class="code-orb"><span class="orb-eye left"></span><span class="orb-eye right"></span><span class="orb-smile"></span></div><i></i><i></i></div>
+      <h2 id="live-status" aria-live="polite">Flow is listening…</h2>
+      <div class="wave" id="live-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="call-actions">
+        <button id="live-mute" type="button" aria-pressed="false" aria-label="Toggle microphone">
+          <span aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+          </span>
+          <!-- §16.5: подпись — ОТДЕЛЬНЫЙ узел; app.js пишет в неё, а не в кнопку,
+               иначе textContent стёр бы иконку. -->
+          <small id="live-mute-label">Mute</small>
+        </button>
+        <button class="end-call" id="live-end" type="button"><span aria-hidden="true">×</span><small>End — back to chat</small></button>
       </div>
-      <p id="live-note">Realtime with Flow · the conversation is saved to chat</p>
+      <p class="call-note">Realtime with Flow · the conversation is saved to chat</p>
     </div>
   </div>
-  <div id="picker" hidden>
-    <div id="picker-panel" role="dialog" aria-modal="true" aria-label="Choose project folder">
-      <p id="picker-path"></p>
-      <p id="picker-error" role="status" aria-live="assertive"></p>
-      <ul id="picker-dirs"></ul>
-      <div id="picker-actions">
-        <button id="picker-choose" type="button">Choose this folder</button>
-        <button id="picker-cancel" type="button">Cancel</button>
+
+  <div class="modal-layer" id="picker" hidden>
+    <div class="picker-panel" id="picker-panel" role="dialog" aria-modal="true" aria-label="Choose project folder">
+      <span class="eyebrow">NEW PROJECT — CHOOSE FOLDER</span>
+      <p class="picker-path" id="picker-path"></p>
+      <p class="picker-error" id="picker-error" role="status" aria-live="assertive"></p>
+      <ul class="picker-dirs" id="picker-dirs"></ul>
+      <div class="picker-actions" id="picker-actions">
+        <button class="primary-button" id="picker-choose" type="button">Choose this folder</button>
+        <button class="ghost-button" id="picker-cancel" type="button">Cancel</button>
       </div>
     </div>
   </div>
+
   <audio id="bot-audio" autoplay playsinline></audio>
 </body>
 </html>

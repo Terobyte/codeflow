@@ -9,6 +9,9 @@ const $ = (id) => document.getElementById(id);
 const COLORS = { green: "#7a8a5e", yellow: "#f6a06b", red: "#b2622d" };
 const KIND_ICONS = { task: "▶", text: "💬", thinking: "🧠", tool_use: "🔧",
                      tool_result: "·", result: "🏁", system: "⚙", user: "🗣", assistant: "🤖" };
+// Иконки журнала активности — своя пара к .ji-<kind> (глифы ленты слишком шумны в кружке 27px).
+const JOURNAL_ICONS = { task: "▶", thinking: "✦", tool_use: "⌁", tool_result: "·",
+                        result: "✓", text: "💬" };
 
 // R6 guardrail: никакой сырой HTML-вставки — динамические иконки идут через SVG-узлы,
 // собранные createElementNS-ом, текст — только textContent.
@@ -150,6 +153,9 @@ function outcomeLabel(outcome) { return OUTCOME[outcome] || null; }
 const STAGES = {
   collect: "Collect", propose: "Propose", spec_plan: "Plan", code: "Coding", done: "Done",
 };
+// Порядок рельса = порядок FSM сервера (threads.py::_STAGE_TRANSITIONS). Рельс — ТОЛЬКО показ:
+// стадию двигает сервер по гейт-карточкам, клик по стадии не делает ничего и обработчика не имеет.
+const STAGE_ORDER = ["collect", "propose", "spec_plan", "code", "done"];
 
 // B45: пока открыт inline-редактор rename, узел #view-title ЗАКОННО снят из DOM
 // (replaceWith(input)) — фоновые писатели title (render на hashchange, loadLists каждые 5с)
@@ -205,6 +211,30 @@ $("disp-toggle").addEventListener("click", () => {
   applyDispToggleUI();
 });
 
+// ---------- тема: Night Atlas ⇄ Hero Drive (§16.2) ----------
+// Тема — свойство УСТРОЙСТВА, не воркспейса: живёт в localStorage и никогда не едет в
+// серверный settings-стор. Телефон в тёмной комнате и мак на столе законно расходятся,
+// а CAS-ревизия за смену цвета — абсурдная цена. Свича два (топбар + настройки),
+// состояние одно: оба зовут applyTheme, второго источника правды нет.
+const THEME_META = { night: "#090b24", drive: "#07111f" };
+function currentTheme() {
+  return document.body.classList.contains("hero-mode") ? "drive" : "night";
+}
+function applyTheme(theme, persist = true) {
+  const drive = theme === "drive";
+  document.body.classList.toggle("hero-mode", drive);
+  $("brand-theme").textContent = drive ? "Hero Drive" : "Night Atlas";
+  $("theme-toggle-icon").textContent = drive ? "☾" : "⚡";
+  $("theme-toggle-label").textContent = drive ? "Night Atlas" : "Hero Drive";
+  $("theme-toggle").setAttribute("aria-label", drive ? "Switch to Night Atlas mode" : "Switch to Hero Drive mode");
+  // meta[theme-color] — цвет системной обвязки standalone-PWA; расходится с темой = видимый шов
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = THEME_META[drive ? "drive" : "night"];
+  if (persist) localStorage.setItem("codeflow-theme", theme);
+}
+$("theme-toggle").addEventListener("click", () =>
+  applyTheme(currentTheme() === "drive" ? "night" : "drive"));
+
 // ---------- вкладки Chat / Diff в топбаре треда: Diff = живой git-статус корня задачи ----------
 let tab = "chat";
 function setTab(next) {
@@ -226,7 +256,9 @@ async function loadDiff() {
   if (r.view !== "thread") return;
   if (diffLoading) return;
   diffLoading = true;
-  const box = $("view-diff");
+  // §16.5: пишем в #diff-wrap, а НЕ в #view-diff — вью само по себе скроллер, а
+  // replaceChildren по нему стёр бы центрирующую обёртку первым же рендером диффа.
+  const box = $("diff-wrap");
   try {
     const resp = await getJSON("/api/threads/" + encodeURIComponent(r.id) + "/diff");
     const kids = [];
@@ -273,9 +305,11 @@ function render() {
     // B54/B55: тред не в списке ПОСЛЕ успешной загрузки списков = его реально нет (архив/
     // мусорный id) — честный title вместо generic-заглушки; до первой загрузки не паникуем.
     setViewTitle(t ? t.title : (listsLoaded ? "thread not found" : "thread"));
+    setThreadHeader(t);
     $("msg-input").placeholder = "Message…";
     renderBadge(t);
     renderStageChip(t);
+    renderStageRail(t);
     if (feedThread !== r.id) {
       feedThread = r.id;
       feedNotFound = null; // B55: новый тред — прошлый not-found не должен глушить его поллинг
@@ -290,6 +324,7 @@ function render() {
     $("msg-input").placeholder = taskPlaceholder();
     $("thread-badge").hidden = true;
     renderStageChip(null);
+    renderStageRail(null);
     feedThread = null;
     pollActivity();
   } else {
@@ -297,6 +332,7 @@ function render() {
     $("msg-input").placeholder = taskPlaceholder();
     $("thread-badge").hidden = true;
     renderStageChip(null);
+    renderStageRail(null);
     feedThread = null;
   }
   // Голос адресуется открытому треду; дом = авто-тред диспетчера в активном проекте.
@@ -342,6 +378,46 @@ function renderStageChip(t) {
   chip.textContent = label || "";
   chip.hidden = !label;
   chip.className = t && t.stage ? "stage-" + t.stage : "";
+}
+
+// Шапка треда: крупный заголовок + папка проекта + относительное время. Питается тем же
+// объектом треда, что бейдж/чип/рельс — второго источника правды нет.
+// B45: #thread-title, как и #view-title, ЗАКОННО снят из DOM, пока открыт inline-редактор
+// rename — фоновые писатели (render на hashchange, loadLists каждые 5с) обязаны пережить
+// null и молча пропустить тик, а не рушить весь цикл рендера TypeError-ом.
+function setThreadHeader(t) {
+  const title = $("thread-title");
+  if (title) title.textContent = t ? t.title : (listsLoaded ? "thread not found" : "thread");
+  const folder = $("thread-folder");
+  if (folder) {
+    const proj = t && projects.find((p) => p.id === t.project_id);
+    folder.textContent = proj ? "📁 " + proj.name : "No project";
+  }
+  const ago = $("thread-ago");
+  if (ago) {
+    // relTime — общий форматтер с карточками тредов: одно время в UI, один формат.
+    const rel = t && t.updated_ts ? relTime(t.updated_ts) : "";
+    ago.textContent = !rel ? "" : rel === "just now" ? "updated just now" : "updated " + rel + " ago";
+  }
+}
+
+// Рельс стадий — display-only зеркало renderStageChip: пройденные ✓, текущая ✦, будущие номером.
+function renderStageRail(t) {
+  const rail = $("stage-rail");
+  rail.replaceChildren();
+  const idx = t ? STAGE_ORDER.indexOf(t.stage) : -1;
+  // стадии нет (дом/активность/мусорный id) — пустая обводка врала бы про прогресс
+  rail.hidden = idx === -1;
+  if (idx === -1) return;
+  STAGE_ORDER.forEach((sid, i) => {
+    const s = el("span", "stage" + (i < idx ? " done" : i === idx ? " active" : ""));
+    s.appendChild(el("i", "", i < idx ? "✓" : i === idx ? "✦" : String(i + 1)));
+    s.appendChild(el("b", "", STAGES[sid]));
+    rail.appendChild(s);
+    if (i < STAGE_ORDER.length - 1) {
+      rail.appendChild(el("span", "rail-line" + (i === idx - 1 ? " active-line" : "")));
+    }
+  });
 }
 
 // ---------- сайдбар: дерево проект → его треды-ветки ----------
@@ -486,7 +562,13 @@ async function loadLists() {
   const r = route();
   if (r.view === "thread") {
     const t = threads.find((x) => x.id === r.id);
-    if (t) { setViewTitle(t.title); renderBadge(t); renderStageChip(t); }
+    if (t) {
+      setViewTitle(t.title);
+      setThreadHeader(t);
+      renderBadge(t);
+      renderStageChip(t);
+      renderStageRail(t);
+    }
   }
 }
 
@@ -561,8 +643,10 @@ function addEntry(e) {
       body.appendChild(el("p", "msg-text", e.text || ""));
       li.appendChild(body);
     } else {
-      // канон макета: аватар-иконка + имя роли над пузырём + play под ним
-      const av = el("span", "msg-avatar");
+      // канон макета: аватар-иконка + имя роли над пузырём + play под ним.
+      // .avatar-kora — лиловая заливка Коры против кремовой Диспетчера: роли различимы
+      // до чтения подписи (обе темы красят обе заливки).
+      const av = el("span", "msg-avatar" + (role === "kora" ? " avatar-kora" : ""));
       av.appendChild(strokeIcon(role === "disp" ? AV_DISP : AV_KORA));
       li.appendChild(av);
       const col = el("div", "msg-col");
@@ -748,18 +832,36 @@ function setKora(color, sub, threadId = null) {
   card.href = activeThread ? "#/thread/" + encodeURIComponent(threadId) : "#/activity";
   card.title = activeThread ? "Open active thread" : "Open Code activity";
 }
+// Сцена страницы активности — ВТОРОЙ вид того же /client/kora-status, что питает карточку
+// сайдбара. Своего эндпоинта у неё нет и не будет: два источника правды про одно состояние
+// Коры разошлись бы уже на первом лаге.
+function setSky(status, title, detail) {
+  $("sky-status").textContent = status;
+  $("sky-title").textContent = title;
+  $("sky-detail").textContent = detail;
+}
 async function pollStatus() {
   let data;
-  try { data = await getJSON("./kora-status"); }
-  catch { setKora("#888", "no connection"); return; }
+  try {
+    data = await getJSON("./kora-status");
+  } catch {
+    setKora("#888", "no connection");
+    setSky("IDLE", "Code is idle", "no connection to the server");
+    return;
+  }
   const context = data.thread_id
     ? (data.thread_title || "thread") + (data.thread_stage && STAGES[data.thread_stage]
       ? " · " + STAGES[data.thread_stage] : "")
     : (data.task_text || "");
   // task_text живёт и ПОСЛЕ завершения задачи — «работает» только при running.
+  const running = data.task_status === "running";
   const sub = data.awaiting_answer ? "waiting for an answer in " + context
-    : data.task_status === "running" ? "working in " + context : "idle";
+    : running ? "working in " + context : "idle";
   setKora(COLORS[data.color] || "#888", sub, data.thread_id || null);
+  setSky(running ? "LIVE · " + (context || "task").toUpperCase() : "IDLE",
+         data.awaiting_answer ? "Code is waiting for you"
+           : running ? "Code is working" : "Code is idle",
+         running ? sub : "No task running");
 }
 
 async function pollActivity() {
@@ -771,11 +873,19 @@ async function pollActivity() {
   const list = $("activity-list");
   list.replaceChildren();
   data.entries.forEach((entry) => {
-    const item = el("li", "activity-entry");
-    item.textContent = (entry.kind || entry.type || "event") + ": " + (entry.text || entry.detail || "");
+    const kind = entry.kind || entry.type || "event";
+    const item = el("li", "journal-entry");
+    // ji-<kind> вешаем ТОЛЬКО на известный kind: строка с сервера в className дописала бы
+    // произвольные классы через пробел (не XSS, но чужой вид у записи).
+    item.appendChild(el("i", "journal-icon" + (JOURNAL_ICONS[kind] ? " ji-" + kind : ""),
+                        JOURNAL_ICONS[kind] || "·"));
+    const body = el("div");
+    body.appendChild(el("b", "", kind));
+    body.appendChild(el("p", "", entry.text || entry.detail || ""));
+    item.appendChild(body);
     list.appendChild(item);
   });
-  if (!data.entries.length) list.appendChild(el("li", "activity-entry", "no events yet"));
+  if (!data.entries.length) list.appendChild(el("li", "journal-entry empty", "no events yet"));
 }
 
 // ---------- композер: текст ----------
@@ -842,9 +952,9 @@ $("msg-input").addEventListener("keydown", (e) => {
   }
 });
 
-// UI-5 (S30): rename треда по тапу на заголовке (#view-title, НЕ #thread-badge — тот скрыт
-// до конца рана). Inline-редактор (input), НЕ window.prompt — проектная дисциплина его выкинула.
-// textContent/appendChild only; hash-router и голос не трогаются.
+// UI-5 (S30): rename треда по тапу на заголовке (#view-title в топбаре и #thread-title в шапке
+// треда — НЕ #thread-badge, тот скрыт до конца рана). Inline-редактор (input), НЕ window.prompt —
+// проектная дисциплина его выкинула. textContent/appendChild only; hash-router и голос не трогаются.
 let renaming = false;
 async function commitRename(input, titleEl, oldTitle, cur) {
   if (renaming) return;
@@ -874,13 +984,16 @@ async function commitRename(input, titleEl, oldTitle, cur) {
     renaming = false;
   }
 }
-function renameCurrentThread() {
-  if (renaming) return;
+// Узел-заголовок берётся из СОБЫТИЯ (currentTarget), а не lookup-ом по фиксированному id:
+// тап-таргетов два (#view-title в топбаре, #thread-title в шапке треда), и редактируется
+// ровно тот, по которому тапнули.
+function renameCurrentThread(ev) {
+  const titleEl = ev && ev.currentTarget;
+  if (renaming || !titleEl) return;
   const r = route();
   if (r.view !== "thread") return;
   const cur = threads.find((t) => t.id === r.id);
   if (!cur) return;
-  const titleEl = $("view-title");
   const input = el("input");
   input.value = cur.title;
   input.maxLength = 80;
@@ -888,7 +1001,7 @@ function renameCurrentThread() {
   titleEl.replaceWith(input);
   input.focus();
   input.select();
-  // B45: узел с id передаётся в commitRename ЗАХВАЧЕННЫМ — lookup по $("view-title")
+  // B45: узел с id передаётся в commitRename ЗАХВАЧЕННЫМ — lookup по id
   // после replaceWith вернул бы null.
   const restore = () => commitRename(input, titleEl, cur.title, cur);
   input.addEventListener("blur", restore, { once: true });
@@ -897,7 +1010,10 @@ function renameCurrentThread() {
     else if (e.key === "Escape") { input.value = cur.title; input.blur(); }
   });
 }
+// Слушатель уезжает из DOM вместе со своим узлом и возвращается тем же replaceWith —
+// второй тап после переименования работает без перепривязки.
 $("view-title").addEventListener("click", renameCurrentThread);
+$("thread-title").addEventListener("click", renameCurrentThread);
 
 // ---------- голос: vendored SDK → session-less POST /api/offer, видимые стейты ----------
 const botAudio = $("bot-audio");
@@ -1041,7 +1157,8 @@ let liveMuted = false;
 $("live-mute").addEventListener("click", () => {
   liveMuted = !liveMuted;
   if (liveMuteFn) liveMuteFn(!liveMuted);
-  $("live-mute").textContent = liveMuted ? "Unmute" : "Mute";
+  // §16.5: подпись — в СВОЙ узел. textContent по самой кнопке стёр бы svg-иконку внутри неё.
+  $("live-mute-label").textContent = liveMuted ? "Unmute" : "Mute";
   $("live-mute").setAttribute("aria-pressed", String(liveMuted));
   $("live-mute").classList.toggle("muted", liveMuted);
 });
@@ -1153,12 +1270,17 @@ syncDrawerA11y();
 $("menu-btn").addEventListener("click", openDrawer);
 $("side-close").addEventListener("click", closeDrawer);
 $("backdrop").addEventListener("click", closeDrawer);
-$("new-thread").addEventListener("click", () => {
+// Вход в новую задачу — один путь на две кнопки: «New task» в сайдбаре и «Start a task» на
+// герое. Тред рождается не тут, а первым сообщением (sendMessage) — обе кнопки лишь уводят
+// домой и отдают фокус композеру.
+function startNewTask() {
   location.hash = "#/";
   closeDrawer();
   // B-CORE-16: rAF после закрытия drawer — синхронный .focus() на iOS Safari не поднимает клавиатуру
   requestAnimationFrame(() => $("msg-input").focus());
-});
+}
+$("new-thread").addEventListener("click", startNewTask);
+$("hero-new").addEventListener("click", startNewTask);
 document.addEventListener("keydown", (e) => {
   // Удерживаем Tab в верхней модалке. inert изолирует фон, trap замыкает цикл.
   if (e.key === "Tab") {
@@ -1257,6 +1379,9 @@ const draft = sessionStorage.getItem("synapse-draft");
 if (draft) { $("msg-input").value = draft; sessionStorage.removeItem("synapse-draft"); }
 resizeMessageInput();
 applyDispToggleUI();
+// §16.2: тема — ДО первого рендера, иначе Hero Drive моргнёт ночью на каждом старте.
+// persist=false: чтение сохранённого выбора не должно выглядеть как новый выбор.
+applyTheme(localStorage.getItem("codeflow-theme") === "drive" ? "drive" : "night", false);
 setTab("chat");
 loadLists().then(render);
 pollStatus();

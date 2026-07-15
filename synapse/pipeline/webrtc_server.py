@@ -375,6 +375,18 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     async def client_vendor_pipecat():
         return Response(content=_vendor_pipecat_bytes, media_type="text/javascript")
 
+    # R1 (§16.5): SVG-иллюстрации темы. Имя приходит из URL, поэтому путь НЕ склеивается из
+    # него: белый список решает ДО обращения к диску, и наружу уходит одна из двух констант —
+    # обходу каталога («../../.env», абсолютный путь, %2e%2e) нечего эксплуатировать.
+    # Роут точный и стоит ДО mount /client/dev (S24), иначе StaticFiles съел бы префикс.
+    _CLIENT_ASSETS = {"code-night-atlas.svg", "codeflow-hero-drive.svg"}
+
+    @app.get("/client/assets/{name}")
+    async def client_asset(name: str):
+        if name not in _CLIENT_ASSETS:
+            return Response(content="no such asset", status_code=404)
+        return _client_file("assets/" + name, "image/svg+xml")
+
     @app.get("/client/thread")
     async def client_thread(id: str | None = None):
         # UI v3: страница треда умерла, тред живёт в SPA-хеше. Старые ссылки/закладки
