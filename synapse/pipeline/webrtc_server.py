@@ -585,6 +585,14 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         try:
             record, reply = await host.text_loop.ingest_user_turn(text, thread_id=thread_id)
         finally:
+            # С2 (Ф0.2): HTTP закрывает ход. У HTTP нет tts_texts (ждать нечего), end_turn идёт
+            # в finally — exception-путь уже закрыл сам (loop.py exception-ветка зовёт end_turn),
+            # но end_turn идемпотентен (_current is None → return), двойной вызов безвреден.
+            # check_grounding уже прошёл в ingest_user_turn's finally. Без этого happy-path
+            # HTTP-ход оставался вечно открытым → следующий ход сливался в ту же запись (B08-бэкстоп
+            # отдавал её), turn_id не рос, turn-строки в JSONL не появлялись вовсе.
+            host.journal.end_turn()
+            host.http_handlers.end_turn()  # С2: сброс _last_turn_id (anti-misattribution)
             async with host.turn_lock:
                 host.current_http_thread["id"] = None
         now = host.clock.now()

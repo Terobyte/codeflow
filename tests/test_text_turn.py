@@ -154,13 +154,18 @@ def _api_host(tmp_path):
     threads = ThreadStore(clock, tmp_path / "threads")
     loop_obj, llm = _loop(tmp_path, feed_reader=threads.read_feed)
     from synapse.projects import ProjectStore
+    # С2: роут зовёт journal.end_turn() и http_handlers.end_turn() на конце хода. Стаб-journal
+    # делегирует no-op (loop внутри уже пишет в свой реальный журнал через ingest_user_turn).
+    _stub_journal = SimpleNamespace(close=lambda: None, end_turn=lambda: None,
+                                    check_grounding=lambda *a, **k: None)
     return SimpleNamespace(
         clock=clock, store=loop_obj._store, threads=threads,
         projects=ProjectStore(tmp_path / "projects.json"),
         text_loop=loop_obj, turn_lock=asyncio.Lock(),
         current_http_thread={"id": None}, voice_thread={"id": None},
         voice_project={"id": None},
-        journal=SimpleNamespace(close=lambda: None),
+        journal=_stub_journal,
+        http_handlers=SimpleNamespace(end_turn=lambda: None),
     )
 
 

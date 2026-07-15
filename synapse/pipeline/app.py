@@ -784,6 +784,9 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # Kept on the long-lived host so the independently constructed voice session can refresh
     # its system prompt from the same stage resolver as the HTTP DispatcherTurnLoop.
     host.stage_block_for = _stage_block_for
+    # С2: HTTP-канал зовёт handlers.end_turn() рядом с journal.end_turn() — нужно держать
+    # http_handlers на хосте (раньше это была только локальная переменная build_host).
+    host.http_handlers = http_handlers
     # С1: голосовой путь собирает контекст хода через ту же фабрику, что HTTP DispatcherTurnLoop.
     # Резолвер owner_thread_for — тот же, что у text_loop (скоуп терминальной задачи к треду).
     # `task_dictionary` де-факто пустой (см. Parking lot в спеке) — передаём как есть, честно.
@@ -938,17 +941,33 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
         fresh = msgs[_voice_cursor["n"]:]
         _voice_cursor["n"] = len(msgs)
         tid = host.voice_thread["id"]
-        if host.threads is None or tid is None:
-            return
-        for m in fresh:
-            if m.get("role") != "assistant":
-                continue
-            content = m.get("content")
-            if not isinstance(content, str) or not content.strip():
-                continue
-            host.threads.append_feed(tid, {"ts": host.clock.now(), "kind": "assistant", "text": content})
-            if host.text_loop is not None:
-                host.text_loop.note_external_turn(tid, "assistant", content)
+        committed_text = ""
+        if host.threads is not None and tid is not None:
+            for m in fresh:
+                if m.get("role") != "assistant":
+                    continue
+                content = m.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                committed_text = content
+                host.threads.append_feed(tid, {"ts": host.clock.now(), "kind": "assistant", "text": content})
+                if host.text_loop is not None:
+                    host.text_loop.note_external_turn(tid, "assistant", content)
+        # С2 (Ф0.2): голос закрывает ход в момент коммита ответа (on_commit) — то самое
+        # «remaining grounding-wiring work» из B13-коммента. Раньше голос НИКОГДА не закрывал
+        # ход: journal.end_turn() на happy-path звали только консоль и exception-путь, а B08-бэкстоп
+        # превращал это в слияние — ВСЕ войс/HTTP-ходы процесса писутся в одну вечно открытую
+        # запись, turn_id не рос. Теперь on_commit (ответ зафиксирован) → check_grounding (голос
+        # наконец получает grounding-проверку, как консольный) + end_turn. Идемпотентность: end_turn
+        # no-op когда _current уже None (повторные on_commit / _flush_voice_final после закрытия).
+        # committed_text — последний зафлашенный assistant-контент: это и есть llm_output хода.
+        record = host.journal.current
+        if record is not None:
+            if committed_text:
+                record.llm_output = committed_text
+            host.journal.check_grounding(record, host.store.has_active_task())
+            host.journal.end_turn()
+            host.handlers.end_turn()  # С2: сброс _last_turn_id (anti-misattribution)
     # S1: replicate LLMContextAggregatorPair's own __init__ recipe (user first, then the
     # assistant with a back-reference to it) so the assistant half can be the guarded
     # subclass from make_guarded_assistant_aggregator -- LLMContextAggregatorPair itself

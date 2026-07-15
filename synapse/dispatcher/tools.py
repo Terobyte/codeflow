@@ -213,6 +213,16 @@ class ToolHandlers:
             oldest_key = next(iter(self._dedup))
             self._dedup.pop(oldest_key, None)
 
+    def end_turn(self) -> None:
+        """С2 (Ф0.2): сброс _last_turn_id на конце хода. Раньше глобальный fallback жил вечно —
+        поздний tool-хвост (трейлинг tool-call pipecat-потока после конца хода) приписывался
+        ЧУЖому ходу: _last_turn_id указывал на последний begin, а ContextVar в трейлинг-таске
+        уже не несла своего id → добирался fallback. После end_turn fallback None, и поздний
+        хвост получает честный turn_id="" (record_tool_call / _guarded уже это поддерживают).
+        Полный OperationContext через command handler — Фаза 1; здесь минимум, убирающий
+        misattribution. Хост зовёт это рядом с journal.end_turn()."""
+        self._last_turn_id = None
+
     async def _guarded(
         self, name: str, args: dict[str, Any], fn: Callable[[], Any]
     ) -> tuple[dict[str, Any], bool]:

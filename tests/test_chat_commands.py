@@ -96,7 +96,10 @@ def _api_host(tmp_path):
         text_loop=loop_obj, turn_lock=asyncio.Lock(),
         current_http_thread={"id": None}, voice_thread={"id": None},
         voice_project={"id": None},
-        journal=SimpleNamespace(close=lambda: None),
+        # С2: роут зовёт journal.end_turn() и http_handlers.end_turn() на конце хода.
+        journal=SimpleNamespace(close=lambda: None, end_turn=lambda: None,
+                                check_grounding=lambda *a, **k: None),
+        http_handlers=SimpleNamespace(end_turn=lambda: None),
     )
     return host, loop_obj, llm
 

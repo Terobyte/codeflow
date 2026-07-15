@@ -62,9 +62,13 @@ def test_b13_voice_end_of_turn_arms_turn_latch(tmp_path):
 
     asyncio.run(handler(stt, "создай файл заметки"))
 
-    # POST-FIX: the voice turn must arm the dedup latch (handlers.begin_turn ran). Currently the
-    # handler only calls note_user_turn, so _current_turn_id stays None → RED here.
-    assert host.handlers._current_turn_id is not None
+    # POST-FIX: the voice turn must arm the dedup latch — handlers.begin_turn ran (B13: раньше
+    # голос звал только note_user_turn → R1 dedup мёртв). Признак — begin_turn создаёт слот под
+    # turn_id в _dedup. С2 (Ф0.2) сбрасывает _last_turn_id в end_turn на конце хода (anti-
+    # misattribution поздних tool-хвостов), поэтому _current_turn_id больше не годится как
+    # индикатор взвода: он None после закрытия хода. _dedup — прямой структурный признак begin_turn,
+    # не зависящий от сброса fallback-а.
+    assert any(host.handlers._dedup), "B13: voice end_of_turn не взвёл dedup-слот (begin_turn не позвался)"
 
 
 # =========================================================================================

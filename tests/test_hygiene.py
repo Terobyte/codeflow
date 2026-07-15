@@ -581,7 +581,8 @@ async def test_message_route_autotitles_sentinel_thread(tmp_path):
     threads = ThreadStore(clock, tmp_path / "threads")
     host = SimpleNamespace(clock=clock, threads=threads, text_loop=text_loop,
                            store=store, turn_lock=asyncio.Lock(),
-                           current_http_thread={"id": None})
+                           current_http_thread={"id": None},
+                           journal=journal, http_handlers=handlers)
     app = webrtc_server.build_web_app(host=host)
     th = threads.create("новый тред")  # композерный сентинель
     ep = _endpoint(app, "api_thread_message")
