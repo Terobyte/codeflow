@@ -4,5 +4,6 @@ __pycache__/
 .env
 journals/
 journals-staging/
+benchmarks/
 *.egg-info/
 .playwright-mcp/

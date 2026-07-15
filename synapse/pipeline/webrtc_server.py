@@ -33,6 +33,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat_ai_prebuilt.frontend import PipecatPrebuiltUI
 
 from synapse.bridge.state import Liveness, TaskStatus
+from synapse.dispatcher.llm_client import CostCapBlocked, ProviderUnavailable
 from synapse.dispatcher.speakify import speakify
 from synapse.pipeline.app import SynapseHost, build_session_pipeline
 from synapse.pipeline.arbiter import default_sentence_splitter
@@ -637,6 +638,24 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             host.current_http_thread["id"] = thread_id
         try:
             record, reply = await host.text_loop.ingest_user_turn(text, thread_id=thread_id)
+        except CostCapBlocked:
+            # P1 (Ф0.4): дневной лимит — degraded ответ вместо 500.
+            _fallback = "Дневной лимит платных запросов исчерпан. Попробуйте позже."
+            now = host.clock.now()
+            host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
+            host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": _fallback})
+            from synapse.journal import AlertKind
+            host.journal.alert(AlertKind.COST_CAP, {"channel": "http"})
+            return JSONResponse({"reply": _fallback, "degraded": True})
+        except ProviderUnavailable:
+            # P1 (CR-7): провайдер-сбой — degraded ответ вместо 500.
+            _fallback = "Связь с мозгом потеряна. Попробуйте повторить через минуту."
+            now = host.clock.now()
+            host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
+            host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": _fallback})
+            from synapse.journal import AlertKind
+            host.journal.alert(AlertKind.ALL_TIERS_FAILED, {"channel": "http", "reason": "provider"})
+            return JSONResponse({"reply": _fallback, "degraded": True})
         finally:
             # С2 (Ф0.2): HTTP закрывает ход. У HTTP нет tts_texts (ждать нечего), end_turn идёт
             # в finally — exception-путь уже закрыл сам (loop.py exception-ветка зовёт end_turn),
