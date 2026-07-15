@@ -532,10 +532,18 @@ class _CostCountingLLMSwitcher(LLMSwitcher):
     tier1 turn (the common case) made a real billed call that never counted and the daily cap was
     structurally inert. A completed generation pushes an `LLMFullResponseEndFrame` DOWNSTREAM out
     of the switcher; the ParallelPipeline filters ensure only the ACTIVE tier's frames escape, so
-    one such frame == one completed paid attempt. Gated on `active_tier_index()==0`: the INITIAL
-    tier is the one the failover path never pre-counts (`strategy._advance` already counts every
-    tier it switches TO), so this counts exactly the attempt that was being missed without
-    double-counting a failover-then-success."""
+    one such frame == one completed paid attempt.
+
+    B-CASC-5: the gate is `advanced_this_generation()`, NOT `active_tier_index()==0`. The original
+    B04 fix counted only the initial tier, on the reasoning that `strategy._advance` already counts
+    every tier it switches TO — true, but `_advance` counts the SWITCH, not the turns after it, and
+    the switcher is sticky: pipecat's `_active_service` moves only in `_set_active_if_available`
+    (reached solely from `_advance`), and nothing here ever sends `ManuallySwitchServiceFrame`. So
+    after one failover the active tier stays put for the rest of the connection and every later
+    healthy turn on it was invisible to the cap — R9 reopened one tier over. `advanced_this_generation()`
+    alone is the correct discriminator: it is True exactly when `_advance` already counted this
+    generation, so counting the active paid tier whenever it is False covers the initial tier, the
+    sticky failover tier, and never double-counts a failover-then-success."""
 
     def __init__(self, services, *, strategy_type, cost_cap: CostCap,
                  labels: list, clock: Clock) -> None:
@@ -547,10 +555,11 @@ class _CostCountingLLMSwitcher(LLMSwitcher):
     async def push_frame(self, frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
             idx = self.strategy.active_tier_index()
-            # B21: only count the INITIAL tier0 attempt here. If failover RETURNED to tier0
-            # this generation, strategy._advance already counted it — recounting double-charges
-            # the cap and trips it prematurely. `advanced_this_generation()` is the guard.
-            if (idx == 0 and self._labels[idx].paid
+            # B21: if failover already counted a paid attempt this generation, strategy._advance
+            # did it — recounting double-charges the cap and trips it prematurely.
+            # B-CASC-5: which tier is active is irrelevant to that question, so it is not part of
+            # the condition; the sticky post-failover tier must count too.
+            if (idx is not None and self._labels[idx].paid
                     and not self.strategy.advanced_this_generation()):
                 self._cost_cap.record_paid_attempt(self._clock.now())
         await super().push_frame(frame, direction)

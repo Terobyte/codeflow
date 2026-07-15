@@ -247,6 +247,14 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: malformed entries skipped or treated as error · actual: function crashes with AttributeError, halting history rehydration.
 - evidence: lines 63-66 `for e in entries: kind = e.get("kind")` assumes each `e` is dict. No type check or try/except. Comment at line 51 says "единая точка регидрации" and emphasizes consistency, but doesn't mention resilience to malformed input. Function used in cold-cache rehydration (line 121), so corrupted feed file would crash dispatcher's first turn on that thread.
 
+### B-DISP-7 — note_external_turn revives history cleared by clear_history (C6 asymmetry) — MAJOR — proven(2026-07-15)
+- class: concurrency/lifecycle · location: `synapse/dispatcher/loop.py:149-159` · found-by: 2026-07-15 sweep over the diff
+- symptom: `note_external_turn` дописывает реплику в общую LLM-историю треда БЕЗ сверки поколения. `clear_history` инкрементит `_generations` (C6); `ingest_user_turn` сверяет поколение на коммите (B20-стиль), чтобы `clear`, прилетевший во время `await`, не воскресил очищенную историю. `note_external_turn` делает ровно то же — дописывает в shared history — но **без** этой проверки, образуя асимметрию с C6/B20. Голосовой путь зовёт его из `_flush_voice_context` (`app.py:1068`, ВНЕ `turn_lock`), а `clear_history` идёт из HTTP-роута под `turn_lock` — это разные локи, так что «clear» и голосовой flush не сериализуются.
+- trigger: (1) голосовой ход идёт, `_flush_voice_context` готовит assistant-реплику, (2) юзер параллельно шлёт `clear` через HTTP-тред (тот же id) → `clear_history` чистит `hist[:] = []`, generation→N+1, (3) голосовой `note_external_turn("…", "assistant", text)` дописывает реплику БЕЗ сверки поколения → очищенная история воскресла. На следующем HTTP-ходе `_history_for` вернёт кэшированный (оживший) список вместо свежей регидрации из ленты.
+- expected vs actual: после `clear` последующий `note_external_turn` — no-op (как холодная регидрация: writer уже положил запись в ленту, подхватится сам) · actual: реплика дописана, история воскресла.
+- evidence: `loop.py:149-159` — `note_external_turn` берёт `_history_lock_for` и зовёт `_append_coalesced(hist, …)` без всякого `_generations.get(thread_id)` снимка/сверки, в отличие от `ingest_user_turn`'s commit-блока (`loop.py:256-260`). Зонд (unit): warm → `note_external(user)` len=1 → `clear_history` len=0 gen=1 → `note_external(assistant)` len=**1** (ожило).
+- proven 2026-07-15: pinned red by `tests/test_bughunt_2026_07_15_failing.py::test_b_disp_7_note_external_turn_revives_cleared_history`. Fix: `note_external_turn` должен либо снимать поколение и сверять (как ingest), либо — проще и симметричнее холодной регидрации — инвалидировать кэш по факту clear (тогда writer уже в ленте, подхватится на следующем miss). parked до выбора API: чистый пред-фикс красный тест сейчас пинит только эффект, не форму решения.
+
 ---
 
 ## ⚖ 5. Cascade & Strategy (`B-CASC-*`)
@@ -308,12 +316,13 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: `_write()` should catch `OSError` on fsync, set `self._closed = True`, close file to prevent further corruption · actual: exception propagates; file remains open.
 - evidence: lines 169-172 show `self._file.write(...)`, `self._file.flush()`, `if fsync: os.fsync(self._file.fileno())`. No try/except around fsync. While `alert()` has try/except (lines 123-126), `end_turn()` (line 160) and `record_kora_event()` (line 154) call `_write()` without protection, so fsync failure propagates and may leave journal in bad state.
 
-### B-CORE-4 — TTS cache tmp file cleanup races with process exit — MINOR — reported
-- class: resource leak · location: `synapse/pipeline/tts_cache.py:62-71` · found-by: H-CORE
+### B-CORE-4 — TTS cache tmp file cleanup races with process exit — MINOR — proven(2026-07-15)
+- class: resource leak · location: `synapse/pipeline/tts_cache.py:42-46,62-71` · found-by: H-CORE
 - symptom: if process killed (SIGKILL) or crashes hard between line 65 (`os.replace(tmp, path)`) completing and line 69 (`tmp.unlink()`), tmp file leaks on disk.
 - trigger: (1) `_atomic_write()` creates `.tmp` file (line 62), (2) lines 64-65 write data, call `os.replace(tmp, path)` — succeeds, (3) process crashes or killed before line 69 `tmp.unlink()` runs, (4) `.tmp` file remains on disk forever (the `if tmp.exists()` check at line 67 will never run).
 - expected vs actual: accept this edge case, or use startup cleanup sweep for stale `.tmp` files · actual: tmp files leak on hard crash.
 - evidence: lines 62-71 show `tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")`, try block writes and replaces, finally unlinks. `os.replace()` atomic and main goal achieved, but tmp file not cleaned atomically with replace. Minor leak (tmp files .hidden, each uniquely named, accumulate slowly), but over time cache directory grows.
+- proven 2026-07-15: pinned red by `tests/test_bughunt_2026_07_15_failing.py::test_b_core_4_tts_cache_init_does_not_sweep_orphaned_tmp` — an orphaned `.*.tmp` survives `TTSCache(...)` construction, so it accumulates across restarts (no startup sweep in `__init__`, lines 42-46 only `mkdir`). Fix: sweep `root.glob(".*.tmp")` in `__init__` and unlink survivors (same `.*.tmp` pattern `_atomic_write` mints), best-effort (ignore missing/OSError).
 
 ### B-CORE-5 — subprocess not killed on exception during communicate() — MINOR — reported
 - class: resource leak · location: `synapse/pipeline/webrtc_server.py:576-582` · found-by: H-CORE
@@ -322,12 +331,13 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: catch all exceptions, kill proc, wait for it, then re-raise · actual: only `TimeoutError` handled.
 - evidence: lines 572-582 show subprocess creation, try/except around wait_for. Only `TimeoutError` caught (lines 578-581 kill and wait). Any other exception (e.g., `CancelledError` if HTTP request cancelled) escapes without cleanup.
 
-### B-CORE-6 — KoraRunner._active task leaks on RuntimeError during start() — MAJOR — reported
-- class: resource leak · location: `synapse/bridge/kora.py:460-465` · found-by: H-CORE
-- symptom: if `asyncio.create_task(coro)` at line 462 raises `RuntimeError` (no running loop), coroutine closed at line 464, but if `_active` was not None and was cancelled at line 459, that task never awaited and may leak.
-- trigger: (1) `start()` called when `_active` not None and not done, (2) line 459 `self._active.cancel()` schedules cancellation, (3) line 462 `asyncio.create_task(coro)` raises `RuntimeError` (no loop), (4) line 464 `coro.close()` runs, line 465 `_terminalize_if_running(task_id)` runs, (5) old `_active` task (cancelled at line 459) never awaited — remains in cancelled state and may leak coroutine/resources.
-- expected vs actual: `try: await old_active except CancelledError: pass` before closing coro · actual: cancelled task not awaited.
-- evidence: lines 458-465 show `if self._active is not None and not self._active.done(): self._active.cancel()`, then `coro = self._run(...)`, try/except around `create_task`. Cancelled `_active` never awaited. While cancelling schedules cleanup, without `await` task object itself may not be fully cleaned until GC.
+### B-CORE-6 — KoraRunner._active task leaks on RuntimeError during start() — MAJOR — proven(2026-07-15)
+- class: resource leak · location: `synapse/bridge/kora.py:453-465` · found-by: H-CORE
+- symptom: if `asyncio.create_task(coro)` raises `RuntimeError` (no running loop — the console + `kora_enabled` path, or a sync test), the `except RuntimeError` branch closes the coroutine and terminalizes the task, but leaves `self._active` pointing at the PREVIOUSLY-CANCELLED task instead of `None`. The runner's live-run invariant ("`_active` is a live run or `None`") is violated.
+- trigger: (1) a prior run left `self._active` set and not done, (2) `start()` line 458-459 cancels it, (3) line 462 `asyncio.create_task(coro)` raises `RuntimeError` (no loop), (4) `coro.close()` (464) + `_terminalize_if_running` (465) run, (5) `self._active` is NEVER reset to `None` — it still references the cancelled task.
+- expected vs actual: after a failed launch there is no live run, so `_active is None` · actual: `_active` dangles at the cancelled task; the next `start()` happens to recover (`.done()` is True after cancel) but the invariant is silently broken.
+- evidence: lines 458-465 show the cancel, the `try/except RuntimeError`, `coro.close()`, `_terminalize_if_running` — but no `self._active = None` in the except branch. The success path (462) rebinds `_active` to the new task, masking the defect on the happy path.
+- proven 2026-07-15: pinned red by `tests/test_bughunt_2026_07_15_failing.py::test_b_core_6_runner_active_not_cleared_when_create_task_raises` — `_active` is still the stale mock after a `create_task` RuntimeError. Fix: `self._active = None` in the `except RuntimeError` branch (the original H-CORE framing, "await the cancelled task", was a different concern — GC reaps a cancelled task fine; the real hole is the dangling reference).
 
 ---
 
@@ -364,6 +374,82 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - **B-PIPE-2 (CRIT):** kora_runner.start() failure after state mutations leaves zombie run — UI shows "running" but nothing running, watchdog eventual but no immediate feedback
 - **B-BRIDGE-3 (CRIT):** apply_event race — second event lost when first's _persist in flight (data loss on restart)
 - **B-CASC-3 (CRIT):** reset_day=None bypasses daily reset — permanent money-blocking after restart if previous run tripped cap
+
+---
+
+## 🔐 Hunt 2026-07-15 (вечер) — Фаза 0: auth + money (5 hunters)
+
+Зона: `bridge/{approvals,affirm,confirm}.py` · `bridge/kora.py` (гейт) · `dispatcher/{tools,llm_client,loop}.py` · `cascade/{services,breaker,strategy,classify}.py` · `pipeline/{app,webrtc_server}.py` (места Ф0). Дерево заморожено на `058faf2`.
+Линзы: H1 security/input-validation · H2 state-machines · H3 money-correctness · H4 silent-failures · H5 concurrency.
+В бриф вшит **гейт достижимости** (назови реальный call path) — после урока B-CASC-3, где «фикс» недостижимой премисы сам оказался money-багом.
+
+### B-BRIDGE-6 — ConfirmFlow: двухключевой контракт необратимых задач не скоупится к треду — CRIT — proven
+- class: security · location: `synapse/bridge/confirm.py:152-158` (`note_user_turn`), `:178-187` (self-attempt guard + affirm) · found-by: H1 (corroborated: H2 нашёл ту же асимметрию с другой стороны)
+- symptom: `ConfirmFlow` защищает **необратимые** задачи (`is_destructive` → readback → подтверждение), но не имеет понятия треда/канала вообще. `_staged` — один на весь процесс, `_last_user_turn_transcript` — одна строка, у `note_user_turn(transcript, now)` нет параметра треда. Любой ход в любом треде (a) гасит `awaiting_user_turn` чужого staged-таска и (b) становится тем транскриптом, который `confirm()` отклассифицирует. Оба ключа выдаёт посторонний разговор.
+- trigger: (1) тред A: реплика проходит `is_destructive` (`config.py:63-74`) → `submit()` стажирует таск, `awaiting_user_turn=True` (confirm.py:142). (2) В пределах `confirm_timeout_s=30` любой ход в треде B: `POST /api/threads/{B}/message` → `loop.py:187 note_user_turn(B-текст)` → глобальный флаг снят, транскрипт перезаписан текстом B. (3) Активная задача глобальна по дизайну (`state.py:162-163`), поэтому LLM треда B видит «задача ждёт подтверждения» и зовёт `confirm_task(decision="confirm")` (`_VALID_TOOL_NAMES`, `loop.py:281`). (4) `confirm()`: self-attempt guard не срабатывает (флаг снят чужим ходом), TTL не истёк, `_classify_response(текст B)` — любое бытовое «да» (`config.py:61`) → COMMITTED → необратимая задача A запускается.
+- expected vs actual: expected — оба ключа обязаны прийти из того же треда, что владеет pending; ровно это свойство `ApprovalService` получил явно: пер-тредовые `_pending`/`_last_user_turn`/`_user_turn_seq` (`approvals.py:88-94`) + монотонный вотермарк (`approvals.py:138`), закреплено `tests/test_phase0_approval.py::test_note_user_turn_is_thread_scoped` · actual — у `ConfirmFlow` ни одного `thread_id` в сигнатурах, ни вотермарка; вместо него булев `awaiting_user_turn`, снимаемый любым ходом откуда угодно.
+- reachability: голос → `app.py:988` (`_on_end_of_turn`, каждая живая реплика); HTTP → `loop.py:187` (`ingest_user_turn`) ← `webrtc_server.py:669`. Один инстанс `ConfirmFlow` строится в `app.py:571-574` и раздаётся в `bridge` (:778), `http_bridge` (:797), `text_loop` (:840), `host` (:867) — тот же Python-объект.
+- evidence: confirm.py:152-158 (безусловная перезапись глобального транскрипта + снятие чужого флага); confirm.py:178-187 (guard читает снятый флаг); контраст — approvals.py:88-94/107-112/138 (тред-скоуп + вотермарк).
+- note: асимметрия «новый механизм закалён, старый нет». C3/C4 усиливали `gate_action`/`ApprovalService`; `ConfirmFlow` охраняет не менее опасный путь и остался с исходной моделью угроз.
+
+### B-CASC-5 — залипший failover-тир уходит от CostCap: дневной лимит слепнет после первого сбоя — CRIT — fixed
+- class: money correctness · location: `synapse/pipeline/app.py:547-556` (`_CostCountingLLMSwitcher.push_frame`) × `synapse/cascade/strategy.py:96-124` (`_advance`) · found-by: H3
+- symptom: `record_paid_attempt` достижим ровно из двух мест: `_advance` (только по ошибке, т.е. только в момент переключения) и `push_frame`, где счёт зажат условием `idx == 0`. После файловера на платный тир idx>0 активный тир **залипает** до конца соединения: вендорный `_active_service` присваивается только в `__init__` (`services[0]`) и в `_set_active_if_available`, который у нас зовётся исключительно из `_advance`; `ManuallySwitchServiceFrame` не шлёт никто. Значит каждый следующий УСПЕШНЫЙ ход на залипшем тире — реальный платный вызов, который не считает никто.
+- trigger: (1) `webrtc_server.py:160 build_session_pipeline` строит один свитчер на всё WebRTC-соединение (докстринг app.py:931-936: свежий только на реконнект). (2) Ход 1: тир0 отдаёт любую нефатальную ошибку (RPM/TIMEOUT/5xx) → `handle_error` → `_advance` → тир1 посчитан один раз (strategy.py:103), `_active_service = services[1]`. (3) Ход 2+: тир1 здоров → `ErrorFrame` нет → `_advance` не зовётся; `push_frame` видит `idx==1` → `idx == 0` ложно → счёта нет. Повторяется неограниченно.
+- expected vs actual: expected — каждая платная попытка инкрементит дневной счётчик (собственный докстринг strategy.py:12: «CostCap gates every paid-tier attempt») · actual — после одного файловера неограниченное число оплаченных вызовов невидимы для `CostCap`; `max_paid_calls_per_day` не триггерится до конца соединения.
+- reachability: живой путь, без тестовой оснастки — одного рядового рейт-лимита на первичном тире в живом звонке достаточно. `webrtc_server.py:160` → `app.py:941` → `strategy.py:73 handle_error` → `strategy.py:96 _advance` (счёт один раз) → все дальнейшие `LLMFullResponseEndFrame` в `app.py:547` с `idx==1` молча мимо счёта.
+- evidence: app.py:553-555 (`if (idx == 0 and self._labels[idx].paid and not self.strategy.advanced_this_generation())`); strategy.py:102-110 (единственный второй call site, только на error-пути); вендор `pipecat/pipeline/service_switcher.py:60,119` (`_active_service` — только `__init__` и `_set_active_if_available`), `grep -rn "_set_active_if_available\|ManuallySwitchServiceFrame" synapse/` → единственный хит strategy.py:112.
+- note: это **рецидив R9**. Докстринг B04 (app.py:530-538) описывает ровно эту дыру — «a healthy tier1 turn made a real billed call that never counted and the daily cap was structurally inert» — и закрывает её только для стартового тира. Тесты обошли границу с обеих сторон: `test_hunt0714_a.py:189-213` (один ход на тире0), `test_hunt0714b_app.py:229-269` (возврат на тир0 не двоит). Второго успешного хода на залипшем ненулевом тире не делает ни один.
+
+### B-DISP-8 — пустой ответ провайдера отдаётся как успешный 200 без degraded — MAJOR — proven
+- class: silent failure · location: `synapse/dispatcher/llm_client.py:91-99` · `synapse/dispatcher/loop.py:259-261` · `synapse/pipeline/webrtc_server.py:703-705` · found-by: H4
+- symptom: если в `content` нет ни одного непустого `text`-блока и ни одного `tool_use`, `AnthropicLLMClient.complete` возвращает `("", [])`. Ниже по потоку это неотличимо от легитимного ответа: роут коммитит пустую `assistant`-запись в ленту и отдаёт `{"reply": ""}` со статусом 200 **без ключа `degraded`** — той же формы, что настоящий ответ. Соседние отказы в том же роуте (`CostCapBlocked`/`ProviderUnavailable`, webrtc_server.py:670-687) честно ставят `degraded: True` + журнальный алерт. Пустой ответ не получает ни того, ни другого.
+- trigger: `POST /api/threads/{id}/message` любым текстом, провайдер отвечает 200 с вырожденным `content` (обрезанная генерация).
+- expected vs actual: expected — принцип объявлен самим проектом в P2 (`e5dd0a4`): «пустой ответ провайдера не даёт ok=True» · actual — эта проверка приехала **только** в `tools/bench_llm_providers.py` (пинится `test_p2_run_task_empty_response_not_ok`), в боевой диспетчер — нет. На выходе `_complete()` в проде нет ни одной проверки (`webrtc_server.py:641` валидирует лишь ВХОДНОЙ текст).
+- reachability: `webrtc_server.py:669` → `loop.py:218` (`tool_calls == []` → цикл `loop.py:225` не крутится) → `loop.py:261 return record, text` с `text == ""` → `webrtc_server.py:703-705`.
+- evidence: llm_client.py:99 (`return "".join(text_parts), calls`); loop.py:259-261 (`if text:` — falsy просто не пишется в историю, сигнала об отказе нет); контраст webrtc_server.py:670-687 vs :703-705. Корроборация: `loop.py:352-356` (`_maybe_compact`) в том же файле явно защищается от пустой сводки (`(summary or "").strip() or "[история сжата]"`) — режим отказа известен и обработан рядом, но не на главном пути хода.
+
+### B-DISP-9 — поздний пасс падает после закоммиченного tool-вызова: degraded-200 противоречит реальному состоянию — MAJOR — proven
+- class: state machine (два состояния расходятся) · location: `synapse/dispatcher/loop.py:216-244` · `synapse/dispatcher/llm_client.py:132` · `synapse/pipeline/webrtc_server.py:668-687` · found-by: H2 (corroborated: H3 запарковал ровно это)
+- symptom: `ingest_user_turn` крутит до `_MAX_TOOL_PASSES=5` пассов. Пасс 1 может выполнить мутирующий инструмент (`gate_action`/`submit_task`/`confirm_task`/`request_cancel`), эффект коммитится синхронно (напр. `_launch_run` реально стартует Кору, app.py:481-524). `_complete()` пасса ≥2 — тот же `GuardedLLMClient`, который резервирует слот в начале **каждого** вызова (llm_client.py:132) и нормализует сбой в `ProviderUnavailable`. Если на пассе 2 срабатывает дневной кап (правдоподобно: голос и текст делят один `CostCap`, а пасс 1 только что списал попытку) — исключение уходит наверх мимо всякого catch (loop.py:241-244) в роут.
+- trigger: `POST /api/threads/{id}/message` («отправляй») при почти исчерпанном капе: пасс 1 → `gate_action(send_to_kora, confirm=true)` → Кора реально запущена (стадия сдвинута, таск RUNNING); пасс 2 → `CostCapBlocked` → `webrtc_server.py:670-687` → `{"reply": "Дневной лимит…", "degraded": True}`, 200.
+- expected vs actual: expected — ответ отражает то, что произошло в ходе · actual — пользователю сказано «лимит, ничего не вышло», хотя ран уже запущен и исполняется; наивный повтор упирается в `{"error":"busy"}` (app.py:416-417) без всякой связи с «неудавшимся» предыдущим ходом.
+- reachability: `webrtc_server.py:629` → `loop.py:180` → `loop.py:236` (диспатч коммитит) → `loop.py:237` (`_complete` бросает) → `webrtc_server.py:670/679`. Детерминировано при заданной последовательности.
+- evidence: llm_client.py:132-133 (резерв-и-бросок на КАЖДОМ `complete()`, не только первом); loop.py:236-237 (диспатч строго до потенциально бросающего второго `_complete`); webrtc_server.py:670-687 (сплошной degraded-200 без упоминания уже закоммиченных tool-вызовов).
+
+### B-BRIDGE-7 — gate_action(revise) идёт мимо busy-чека: стадия врёт при живом ране — MAJOR — proven
+- class: state machine · location: `synapse/pipeline/app.py:395-413` (revise) vs `:418-432` (send_to_kora/write_code — под `_launch_lock` + busy-чек) · found-by: H2
+- symptom: ветка `revise` зовёт `set_stage(thread_id, "collect")` без `store.has_active_task()` и не трогает `kora_runner`. `_STAGE_TRANSITIONS` разрешает `code→collect` и `spec_plan→collect` (threads.py:22-28), так что переход проходит и при живом ране этого треда. `KoraRunner._run` снимает `_run_root`/`_run_gate_mode` один раз на старте (kora.py:501-505) — от `ThreadStore` он независим.
+- trigger: `gate_action(send_to_kora, confirm=true)` запускает реальный ран, стадия → `code`. До финиша — `gate_action(action="revise")` (голос или текст, оба `user_initiated=False`, app.py:711-719): стадия → `collect`, `last_outcome=None`, pending инвалидирован, возвращается `{"ok": True, "stage": "collect"}` — при `store.task.status == RUNNING` того же треда.
+- expected vs actual: expected — revise либо блокируется на занятом синглтоне, либо реально гасит ран · actual — UI показывает «COLLECT — сбор» (правила стадии буквально говорят «Не запускай Кору»), пока Кора продолжает писать файлы на диск и жечь `kora_max_budget_usd` по до-revise RunSpec.
+- reachability: `tools.py:344 gate_action` → `on_gate` → `app.py:711/716` → `app.py:701 _gate_for` → `app.py:372` → revise-ветка `app.py:395`. Busy-чека на пути нет.
+- evidence: app.py:395-413 (нет `has_active_task()`, в отличие от :421); kora.py:501-505 (снапшот на старте, иммунен к позднему `set_stage`).
+- design-tension: `threads.py:180` документирует revise-во-время-дренажа явно («old completion is ignored») — т.е. сценарий предвидели и защитили **бухгалтерию**, но не сам ран. Отдельный `request_cancel` существует. Возможно, контракт «revise ≠ cancel» намеренный, и баг только во вранье стадии. Решение — за владельцем.
+
+### B-BRIDGE-8 — ApprovalService: явное «нет» неотличимо от «ещё не ответил» — MINOR — proven
+- class: state machine (нет обязательного перехода) · location: `synapse/bridge/approvals.py:140-144` · found-by: H2 (corroborated: H4; H1 запарковал как намеренное)
+- symptom: `consume()` сворачивает `deny` и `unclear` в один `None`. Caller (`app.py:430-432`) на `approval is None` безусловно пере-стажирует свежий pending и возвращает тот же `{"error": "confirm_required", "readback": …}` — независимо от того, отказал пользователь или промолчал. Перехода «отклонено» не существует вовсе.
+- trigger: pending staged на треде; следующий ход содержит deny-слово («нет»); LLM зовёт `gate_action` с теми же аргументами → вотермарк проходит, affirm-проверка даёт `deny` → тихий re-stage вместо отмены.
+- expected vs actual: expected — явное «нет» гасит pending, как у соседа: `ConfirmFlow.confirm()` (confirm.py:188-189) отдельно ловит `deny` → `_reset("хорошо, задачу отменяю")` · actual — pending перезаряжается со свежим TTL и задаётся ровно тот же вопрос.
+- reachability: `tools.py:344` → `app.py:711-719` → `app.py:372-432` → `approvals.py:119-144`.
+- evidence: approvals.py:141-144 (deny/unclear в одной ветке; комментарий оправдывает только половину про unclear); confirm.py:187-191 (у сиблинга ветка deny есть).
+- design-tension: комментарий в коде утверждает намеренность («deny / unclear → pending НЕ гасится»). Запуска не происходит ни в одном случае — это UX/контрактная асимметрия, не дыра в авторизации. Отсюда MINOR, а не MAJOR. Решение — за владельцем.
+
+### B-BRIDGE-9 — KoraRunner: read-side гейта без identity-guard, который есть на write-side — MAJOR — proven
+- class: concurrency/lifecycle · location: `synapse/bridge/kora.py:497-518` (снапшот 502-505 / очистка 512-517), `:578-586` (`_current_root`/`_current_gate_mode`), `:642-762` (`_gate_decision`) · found-by: H5
+- symptom: `_run_root`/`_run_gate_mode`/`_run_model` — обычные поля инстанса, общие для всех ранов. `finally` в `_run()` защищён identity-guard-ом (`if self._run_owner == task_id`), чтобы вытесненный ран не затёр преемника — но guard стоит **только на стороне записи/сноса**. Сторона чтения (`_gate_decision`, вызываемая из PreToolUse-хука, который и есть граница containment) guard-а не имеет вовсе: у неё нет параметра `task_id`, и она доверяет тому, что сейчас лежит в полях.
+- trigger: (1) тред T1 стартует `docs_only`-ран (root `rootX`). (2) `request_cancel` (`tools.py:309-318` → `kora.py:467-472`): `self._active.cancel()` только планирует отмену, не джойнит; `TaskStore.request_cancel` (state.py:322-328) ставит CANCEL_REQUESTED, а `has_active_task()` (state.py:224-228) считает это «не активен». (3) Busy-чек `app.py:421` немедленно пропускает новый запуск — тред T2, root `rootY`, `gate_mode="full"`. (4) `_run()` таска B перетирает поля (kora.py:502-505). (5) Если у таска A остался in-flight PreToolUse-хук (SDK диспатчит колбэк отдельной задачей через `_tg.start_soon`), он читает `"full"`/`rootY` вместо своих `"docs_only"`/`rootX`.
+- expected vs actual: expected — tool-вызовы вытесненного рана судятся по ЕГО параметрам запуска либо отклоняются · actual — решение containment для таска A принимается по gate mode/root таска B: запись, которая должна быть `docs_only_violation`, может быть разрешена, и/или файл уедет в корень чужого проекта.
+- reachability: `tools.py:313` → `kora.py:472` (fire-and-forget cancel) открывает окно; `app.py:421` (busy-чек уже False) → `app.py:452/475` → `kora.py:453 start()` → `kora.py:503-505` — второй конкурирующий вызов в этом окне. Обе точки достижимы рядовой парой действий (отмена, затем перезапуск).
+- evidence: kora.py:502-505 (безусловная перезапись) против kora.py:513-517 (условная очистка под guard-ом) — guard ровно на одной стороне; kora.py:578-586 и `_gate_decision` не принимают `task_id` вообще; `tests/test_kora.py:624-649` пинит вытеснение по идентичности таска, но не корректность `_run_gate_mode`/`_run_root` в окне перекрытия.
+- risk: премиса требует in-flight хука одновременно с отменой — детерминированный красный может не получиться. Если так → `not-test-verifiable` + ручная команда, а не подгонка теста.
+
+### Hunt 2026-07-15 (вечер) — Summary
+- **7 находок** из 8 сырых репортов (слито 2 дубликата: `deny==unclear` принесли трое, «поздний пасс после коммита tool-а» — двое).
+- **Severity:** 2 CRIT · 4 MAJOR · 1 MINOR. Все `reported` — фаза 2 (доказательство) не начата.
+- **Проверено старшим лично** (не по пересказу охотника): B-CASC-5 — вендорный `service_switcher.py` прочитан, залипание подтверждено; B-DISP-8 — `llm_client.py:99` возвращает `("", [])`; B-BRIDGE-7 — revise-ветка без busy-чека; B-BRIDGE-6 — контраст `confirm.py` vs `approvals.py` вычитан построчно.
+- **Сквозной паттерн:** *усиление приезжает в новый механизм, старый остаётся с исходной моделью угроз.* B-BRIDGE-6 (ConfirmFlow не получил тред-скоуп и вотермарк, которые получил ApprovalService), B-CASC-5 (фикс B04 закрыл R9 только для стартового тира), B-DISP-8 (проверка P2 приехала в бенчмарк, но не в прод). Три независимых охотника с разными линзами вышли на одну форму.
+- **Не переоткрыто:** B-CASC-1/2/4, B-DISP-3/4/6, B-PIPE-3/4/5/6, B-BRIDGE-2 (open); B-CASC-3, B-DISP-5 (rejected) — гейт достижимости в брифе сработал, воскрешений нет.
 - **B-CORE-2 (CRIT):** Thread never joined in record_commands.py — daemon thread left dangling
 
 **Next phase:** dispatch test-writers (phase 2) to write red tests for CRIT/MAJOR bugs, verify via `proven` status, then fix (phase 3).
@@ -374,3 +460,36 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - H-DISP (state machines & illegal transitions) — 6 bugs
 - H-CASC (data integrity & money correctness) — 4 bugs
 - H-CORE (resource leaks & cleanup) — 6 bugs
+
+---
+
+## 📊 Hunt 2026-07-15 (свит 2) — верификация диффа origin/main..HEAD
+
+**Scope:** невыпушенная работа (13 коммитов, 50 файлов, +9507/−1156). Сверил все 27 утверждений из `tests/test_*_reported_bugs_failing.py` с исходником и прогнал тесты (13 fail / 14 pass); плюс прошёлся по новому коду, которого в тех файлах нет (`speakable.py`, `approvals.py`, `tts_cache.py`, KV-1a/KV-2, `note_external_turn`).
+
+**Итог по 27 отчётам первого свипа:**
+- **3 настоящих бага** → доказаны красными тестами (ниже).
+- **7 намеренного дизайна** — тесты спорят с принятым решением, обоснование в комментариях: B-PIPE-3 (monitor_forever не падает — единственный watchdog Р-15г), B-PIPE-4 (observer не пробрасывает, иначе роняет живое TTS), B-DISP-5 (зомби-UNREACHABLE честен, R6), B-CASC-2 (inclusive max — разумно), B-CASC-3 (состояние недостижимо), B-CORE-3 (закрыть журнал = потерять все будущие алерты), и rejects ниже.
+- **3 сломанных теста** — падают в собственном сетапе, до кода не доходят: B-PIPE-1 (`NameError: name 'threads'`), B-DISP-1 (`FrozenInstanceError`), B-PIPE-5 (fragile lock/PipelineRunner mock).
+- **2 фича-запроса**, не баги: B-DISP-3 (порядок элементов списка в args — семантическая интерпретация), B-CORE-2 (daemon-thread не join — косметика).
+- подтверждённо починенные коммитом `272cf7f` и последующими: B-PIPE-2, B-PIPE-6, B-BRIDGE-1..5, B-DISP-2/4/6, B-CASC-1/4, B-CORE-1/5.
+
+**Доказанные красными тестами (3):**
+- **B-CORE-4** (MINOR → proven) — `TTSCache.__init__` не вычищает осиротевшие `.tmp`; `test_b_core_4_tts_cache_init_does_not_sweep_orphaned_tmp`.
+- **B-CORE-6** (MAJOR → proven, диагноз уточнён) — `KoraRunner.start()` при `create_task` RuntimeError оставляет `_active` dangling на отменённом таске вместо `None`; `test_b_core_6_runner_active_not_cleared_when_create_task_raises`. Исходная формулировка H-CORE («await the cancelled task») была о другом — GC убирает отменённый таск нормально; реальная дыра — оборванная ссылка.
+- **B-DISP-8** (MAJOR, новая — proven/parked) — `note_external_turn` дописывает в общую историю БЕЗ сверки поколения, асимметрия с C6/B20: `clear` + голосовой flush воскрешают очищенную историю; `test_b_disp_7_note_external_turn_revives_cleared_history`. parked до выбора API фикса.
+
+**Канонические тесты:** `tests/test_bughunt_2026_07_15_failing.py` (3 red). Дублирующие/сломанные утверждения в `tests/test_new_reported_bugs_failing.py` (где часть тестов падает в собственном сетапе) следует при консолидации удалить, чтобы не держать два источника правды.
+
+### Фаза 2+3 — итог прогона (2026-07-15, вечер)
+- **Тесты:** `tests/test_hunt0715_money.py` (B-CASC-5, B-DISP-8, B-DISP-9) · `tests/test_hunt0715_auth.py` (B-BRIDGE-6..9). Все 7 красные на своих ассертах, прогнаны старшим лично.
+- **Починен 1:** B-CASC-5 — `app.py:547-556`, условие `idx == 0` → `idx is not None`; дискриминатором остаётся `advanced_this_generation()`, который и так уже был написан рядом. Красный→зелёный доказан прямым откатом фикса. Регрессии B04/B21/costcap зелёные.
+- **Доказаны, не починены (6):** xfail(strict=True) с указателем на реестр — суита зелёная, доказательство живо, а починка снимет xfail сама и strict закричит.
+- **Поймано на верификации:** первая редакция теста B-CASC-5 была красной по НЕПРАВИЛЬНОЙ причине — слала 3 end-фрейма в ОДНОЙ генерации и требовала счёт 3. Это премиса B21 (двойной счёт), а не B-CASC-5; зазеленение такого теста вернуло бы B21. Возвращено писателю, премиса переписана на 3 генерации. **Урок ровно тот же, что у B-CASC-3: красный тест — это claim, проверять надо НА ЧЁМ он красный.**
+- **Поймано на полной суите:** ID `B-DISP-7` уже был занят утренним заходом (`note_external_turn revives history`, proven). Мои находки перенумерованы в B-DISP-8/B-DISP-9. Ловится только прогоном ВСЕЙ суиты, не своих файлов.
+
+### Backlog утреннего захода — разбор (не трогать вслепую)
+13 красных тестов лежат вне гита (`tests/test_reported_bugs_failing.py`, `test_new_reported_bugs_failing.py`, `test_bughunt_2026_07_15_failing.py`). «13 красных» ≠ «13 багов»:
+- **Чинить нельзя (2):** B-CASC-3, B-DISP-5 — `rejected`, премисы недостижимы. «Фикс» B-CASC-3 уже однажды открыл затрипленный дневной лимит.
+- **Красный принадлежит тесту (2):** B-PIPE-1, B-DISP-1 — `fixed(worktree, UNVERIFIED: test crashes in its own setup)`.
+- **Легитимно открыты (9):** B-PIPE-3/4/5, B-DISP-3, B-CASC-2, B-CORE-2 (CRIT), B-CORE-3, B-CORE-4 (proven), B-CORE-6 (proven).
