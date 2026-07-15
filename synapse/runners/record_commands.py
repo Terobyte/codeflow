@@ -60,8 +60,10 @@ def record_session(phrases_path: str, out_dir: str, bg: str, resume: bool) -> in
             input()
             stop_event.set()
 
+        # B-CORE-2: вейтер заводится ДО try, иначе упавший конструктор потока оставил бы
+        # finally с NameError вместо честной ошибки.
+        waiter = threading.Thread(target=_wait_for_enter, daemon=True)
         try:
-            waiter = threading.Thread(target=_wait_for_enter, daemon=True)
             waiter.start()
             while not stop_event.is_set():
                 data, _ = stream.read(sample_rate // 10)
@@ -69,6 +71,13 @@ def record_session(phrases_path: str, out_dir: str, bg: str, resume: bool) -> in
         finally:
             stream.stop()
             stream.close()
+            # B-CORE-2: дождаться вейтера, а не бросить его. Поток спавнится НА КАЖДУЮ фразу,
+            # и на штатном пути он уже возвращается (input() отдал Enter → stop_event) — join
+            # лишь честно это подтверждает. Если же stream.read() бросил, вейтер остался висеть
+            # в input(): его join не добудится (прервать input() в Python нечем) и он уйдёт
+            # драться за stdin со следующей фразой. Таймаут держит цикл живым; полное лечение
+            # требует убрать input() из потока — за рамками этого бага.
+            waiter.join(timeout=1.0)
 
         audio = np.concatenate(recording, axis=0) if recording else np.zeros((0, 1), dtype="int16")
         filename = f"{idx:03d}_{bg}.wav"

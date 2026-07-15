@@ -52,6 +52,10 @@ from synapse.threads import ThreadStore
 
 logger = logging.getLogger(__name__)
 
+# B-PIPE-3: сколько подряд сбойных итераций monitor_forever считать УСТОЙЧИВЫМ сбоем (а не
+# транзиентным блипом, который цикл обязан пережить молча — B2) и поднять MONITOR_DEGRADED.
+_MONITOR_DEGRADED_AFTER = 3
+
 # UI-4 (S34): серверный модельный allowlist для гейт-запусков. kora_model из конфига — дефолт,
 # он в allowlist не обязан входить исторически; валидируем только то, что пришло из UI/инструмента.
 _KORA_MODELS = frozenset({"claude-opus-4-8", "claude-sonnet-5", "claude-fable-5"})
@@ -273,8 +277,10 @@ class SynapseHost:
         """R8: periodically drives speak_ledger.check()/store.liveness() so the Р-15г/Р-11
         invariants fire even between turns, not only incidentally when a turn happens to run."""
         last_live = Liveness.OK
+        fail_streak = 0
         while True:
             await asyncio.sleep(self.cfg.heartbeat_interval_s)
+            now: float | None = None
             # B2: one transient failure in the loop body (e.g. journal.alert's os.fsync raising)
             # must NOT permanently kill this task — it is the SOLE voice-path driver of the Р-15г
             # CRITICAL_WITHOUT_SPEAK check. Log and keep looping; only CancelledError stops it.
@@ -289,12 +295,42 @@ class SynapseHost:
                 if live != last_live and live != Liveness.OK:
                     self.journal.alert(AlertKind.KORA_UNREACHABLE, {"liveness": live.value})
                 last_live = live
-                # B30: drive the cost cap's daily recovery even when idle (no failover turns).
-                self.cost_cap.maybe_reset(now)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # B-PIPE-3: B2 запрещает умирать, но молчать о ЗАСТРЯВШЕМ цикле — это и был баг:
+                # устойчивый сбой (store в разобранном состоянии, liveness бросает каждый тик)
+                # значит, что проверки Р-15г/Р-11 не идут ВООБЩЕ, а видно это только в логгере.
+                # Алерт ровно на пороге серии: `== _MONITOR_DEGRADED_AFTER` срабатывает один раз,
+                # streak растёт дальше молча, успех обнуляет. Транзиентный сбой (B2, серия=1)
+                # порога не достигает и алерта не рождает.
+                fail_streak += 1
                 logger.exception("monitor_forever iteration failed; continuing")
+                if fail_streak == _MONITOR_DEGRADED_AFTER:
+                    try:
+                        self.journal.alert(
+                            AlertKind.MONITOR_DEGRADED, {"consecutive_failures": fail_streak}
+                        )
+                    except Exception:
+                        # Сам журнал и мог быть источником сбоя — алерт о сбое не имеет права
+                        # стать вторым сбоем и убить цикл (это ровно B2).
+                        logger.exception("monitor_forever failed to alert MONITOR_DEGRADED")
+            else:
+                fail_streak = 0
+
+            # B30: drive the cost cap's daily recovery even when idle (no failover turns).
+            # B-PIPE-3: ОТДЕЛЬНЫЙ шаг, а не хвост общего try. Он стоял ниже store.liveness() в
+            # одном блоке — и устойчиво бросающий liveness молча отключал ЕДИНСТВЕННЫЙ драйвер
+            # суточного сброса денежного лимита: затрипленный кэп не сбрасывался никогда, платные
+            # вызовы оставались заблокированы. Шаги независимы — пусть и падают независимо.
+            # now is None → упал сам clock.now(), считать нечем.
+            if now is not None:
+                try:
+                    self.cost_cap.maybe_reset(now)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("monitor_forever cost-cap reset failed; continuing")
 
     # --- UI-4: стадийный гейт -----------------------------------------------------------
 
@@ -1149,8 +1185,14 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
 
     # TTS-кэш (tero 2026-07-14): тап на выходе tts пишет реалтайм-аудио в кэш хоста. Нет
     # host.tts_cache (стабы) → без обсервера, пайплайн неизменен.
+    # B-PIPE-4: журнал — канал видимости сбоев записи (R-1 запрещает пробрасывать их в аудио-путь,
+    # так что алерт — единственный способ узнать, что кэш умер и каждый Play платит REST-ресинтез).
+    # getattr, а не host.journal: у стабов его может не быть, а обсервер это переживает (journal=None).
     cache = getattr(host, "tts_cache", None)
-    observers = [TTSCacheObserver(cache, tts)] if cache is not None else []
+    observers = (
+        [TTSCacheObserver(cache, tts, journal=getattr(host, "journal", None))]
+        if cache is not None else []
+    )
 
     arbiter = TTSArbiterProcessor(host.arbiter_policy)
 

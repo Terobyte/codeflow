@@ -29,6 +29,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 
+from synapse.journal import AlertKind
+
 logger = logging.getLogger(__name__)
 
 _FISH_REST_URL = "https://api.fish.audio/v1/tts"
@@ -44,6 +46,24 @@ class TTSCache:
         self.root.mkdir(parents=True, exist_ok=True)
         self._model = model
         self._voice = voice
+        self._sweep_orphaned_tmp()
+
+    def _sweep_orphaned_tmp(self) -> None:
+        """B-CORE-4: подмести `.*.tmp`, осиротевшие рухнувшим _atomic_write. Его finally
+        снимает tmp сам, но жёсткий килл между os.replace и unlink оставляет файл навсегда:
+        имена уникальны по uuid, так что мусор копится от рестарта к рестарту и его никто
+        не перезапишет. Возраст не проверяем: journal_dir эксклюзивен для процесса (там же
+        state.json таск-стора), значит чужого ЖИВОГО tmp в этом корне быть не может.
+        Best-effort — кэш не критичен, и падать на старте из-за него нельзя."""
+        try:
+            orphans = list(self.root.glob(".*.tmp"))
+        except OSError:
+            return
+        for tmp in orphans:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def key(self, text: str, voice_id: str | None = None) -> str:
         # KV-1a §4.1: ключ voice-aware — иначе аудио Коры легло бы под ключ диспетчера и
@@ -150,9 +170,13 @@ class TTSCacheObserver(BaseObserver):
     TTSStoppedFrame у Fish не гарантирован (word-timestamps), поэтому стейт-машина
     толерантна к обоим: поздний текст финализирует «pending»-прогон."""
 
-    def __init__(self, cache: TTSCache, tts_source) -> None:
+    def __init__(self, cache: TTSCache, tts_source, journal=None) -> None:
         self._cache = cache
         self._tts = tts_source
+        # B-PIPE-4: опциональный журнал — единственный канал видимости сбоев кэша. Опциональный,
+        # потому что обсервер конструируют стабы и тесты без хоста; None → поведение как раньше.
+        self._journal = journal
+        self._degraded = False              # B-PIPE-4: серия сбоев записи уже отмечена алертом
         self._open: dict | None = None      # текущий открытый прогон
         self._pending: dict | None = None   # аудио собрано, ждём поздний TTSTextFrame
 
@@ -204,9 +228,32 @@ class TTSCacheObserver(BaseObserver):
             return
         if self._cache.wav_path(text).exists():
             return  # уже в кэше — не пишем повторно
-        await asyncio.to_thread(
-            self._cache.put_pcm, text, b"".join(audio), run["sr"], run["ch"]
-        )
+        # B-PIPE-4: ловим ЗДЕСЬ, у самой записи, а не на уровне on_push_frame. Обсервер зовут на
+        # КАЖДЫЙ фрейм, и почти все они кэша не касаются — считай их успехом, и любой Started
+        # сбрасывал бы анти-спам, превращая алерт-раз-в-серию в алерт-на-каждый-прогон.
+        try:
+            await asyncio.to_thread(
+                self._cache.put_pcm, text, b"".join(audio), run["sr"], run["ch"]
+            )
+        except Exception as exc:  # noqa: BLE001 — R-1: наружу не пробрасываем НИКОГДА
+            self._note_cache_failure(exc)
+        else:
+            self._degraded = False  # запись прошла — серия кончилась, следующая позовёт алерт
+
+    def _note_cache_failure(self, exc: BaseException) -> None:
+        """B-PIPE-4: сбой записи в кэш неустраним (R-1 запрещает ронять живой звук отсюда), и
+        раньше он не оставлял ничего, кроме logger-строки: каждый следующий Play молча платил
+        дорогим REST-ресинтезом, а узнать об этом было неоткуда. Алерт ОДИН на серию — обсервер
+        сидит в аудио-пути, алерт на каждый сбой залил бы журнал."""
+        logger.warning("TTSCacheObserver: cache write failed: %r", exc)
+        if self._degraded or self._journal is None:
+            return
+        self._degraded = True
+        try:
+            self._journal.alert(AlertKind.TTS_CACHE_DEGRADED, {"error": repr(exc)})
+        except Exception:  # noqa: BLE001
+            # Алерт о сбое не имеет права стать вторым сбоем и уйти в push-путь (R-1).
+            logger.exception("TTSCacheObserver: failed to alert TTS_CACHE_DEGRADED")
 
 
 async def fish_rest_tts(

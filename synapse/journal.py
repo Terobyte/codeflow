@@ -36,6 +36,14 @@ class AlertKind(str, Enum):
     # B12 (Р-11): Kora's liveness degraded to stale/unreachable between turns — surfaced once on
     # the transition so a Kora that dies silently doesn't just read "running" until the next turn.
     KORA_UNREACHABLE = "KORA_UNREACHABLE"
+    # B-PIPE-3: monitor_forever's loop body keeps failing. B2 forbids dying on a transient blip,
+    # so the loop survives — but a PERSISTENT failure means the Р-15г/Р-11 checks silently never
+    # run, and logger alone gave no evidence. Fired once per failure streak, not every tick.
+    MONITOR_DEGRADED = "MONITOR_DEGRADED"
+    # B-PIPE-4: TTS cache writes keep failing (disk full/permissions). R-1 forbids propagating out
+    # of the observer (it sits in the live audio push path), so the write is lost by design — this
+    # is the only evidence that every Play now pays a REST re-synthesis. Once per streak.
+    TTS_CACHE_DEGRADED = "TTS_CACHE_DEGRADED"
 
 
 @dataclass
@@ -166,10 +174,30 @@ class TurnJournal:
             # ASGI lifecycle and may fire a late write after shutdown ran close(). A closed journal
             # is a silent no-op, not a ValueError bubbling out of record_tool_call/alert.
             return
-        self._file.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-        self._file.flush()
-        if fsync:
-            os.fsync(self._file.fileno())
+        try:
+            self._file.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+            self._file.flush()
+            if fsync:
+                os.fsync(self._file.fileno())
+        except OSError:
+            # B-CORE-3: сбойная запись ЗАКРЫВАЕТ журнал. Упавший fsync на Linux потребляет
+            # ошибку и может выбросить грязные страницы: следующий fsync вернёт УСПЕХ, хотя
+            # данные уже потеряны (fsyncgate). Значит после сбоя этот fd врёт о долговечности,
+            # а отличить ложь изнутри нечем — для §8-евиденса денег/авторизации это хуже, чем
+            # честно замолчать. `_closed` уже несёт ровно семантику «тихий no-op» (B28), а
+            # запасной канал — logger ниже: он единственный, кто теперь расскажет о дыре.
+            self._closed = True
+            try:
+                self._file.close()
+            except OSError:
+                pass
+            logger.error(
+                "journal write failed; journal CLOSED — дальнейшие записи no-op, аудит-след "
+                "оборван на этой строке: %r", row.get("kind"), exc_info=True,
+            )
+            # Пробрасываем дальше: кто ловил OSError раньше (alert/B39), ловит и теперь;
+            # менять тут ещё и контракт распространения ошибок — не этот баг.
+            raise
 
     def close(self) -> None:
         self._closed = True

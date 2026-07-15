@@ -649,15 +649,19 @@ def build_web_app(host: SynapseHost) -> FastAPI:
                 return JSONResponse({"ok": True, "command": "compact"})
             # clear: под host.turn_lock — сериализуемся с ОТКРЫТИЕМ ходов (голос/HTTP);
             # хвост уже начатого хода добивает generation-механизм в loop (C6, B20-стиль).
-            async with host.turn_lock:
-                host.text_loop.clear_history(thread_id)
+            # B-DISP-7: маркер пишется в ленту ПЕРВЫМ и ВНУТРИ лока. Clear теперь роняет кэш
+            # треда, а холодная регидрация режет ленту по последнему clear-маркеру — значит
+            # порядок несущий: упади кэш раньше маркера, чтение в этом окне подняло бы из
+            # ленты НЕочищенную историю и отменило clear (да ещё и закэшировало её обратно).
             # Clear-маркер пишет РОУТ (канонический слой записи лент — как user/assistant).
             # id-штамп: две команды clear в один clock-tick иначе схлопнулись бы в клиентском
             # feedKey (ts|kind|text коллизия — MINOR принят).
-            host.threads.append_feed(thread_id, {
-                "ts": host.clock.now(), "kind": "clear", "text": "история очищена",
-                "id": f"clear-{uuid.uuid4().hex[:12]}",
-            })
+            async with host.turn_lock:
+                host.threads.append_feed(thread_id, {
+                    "ts": host.clock.now(), "kind": "clear", "text": "история очищена",
+                    "id": f"clear-{uuid.uuid4().hex[:12]}",
+                })
+                host.text_loop.clear_history(thread_id)
             return JSONResponse({"ok": True, "command": "clear"})
         # NB (B08): turn_lock is intentionally NOT held across ingest_user_turn — B-PIPE-5 requires
         # releasing it before the LLM call so one slow client can't block others. The journal-level

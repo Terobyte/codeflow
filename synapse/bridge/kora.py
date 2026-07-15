@@ -463,6 +463,11 @@ class KoraRunner:
             self._active = asyncio.create_task(coro)
         except RuntimeError:
             coro.close()  # no running loop — close the coroutine so it isn't "never awaited"
+            # B-CORE-6: и снять `_active`. Инвариант рунера — «_active это ЖИВОЙ ран либо None»;
+            # без этого слот держит отменённый выше таск, и предикаты, читающие `_active`,
+            # видят ран там, где запуск провалился. Следующий start() случайно выруливает
+            # (`.done()` уже True после cancel), что и маскировало дыру на happy-path.
+            self._active = None
             self._terminalize_if_running(task_id)
 
     def request_cancel(self) -> None:

@@ -129,21 +129,21 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - root cause: the refactor merged two operations with DIFFERENT preconditions into one compare-and-set. The outcome write was unconditional; only the B47 collect→done transition was stage-gated. Merging them under the transition's precondition made the outcome write inherit a guard it never had. Atomicity is only sound for operations that share a precondition.
 - fixed 2026-07-15: guard against the CURRENT stage (`expected_stage=th.stage`) and gate only the transition — mirroring what the same changeset's own task_id-less branch already does two lines above. Pinned by `tests/test_bugs_0714_realtime.py::test_second_direct_dispatch_outcome_is_not_dropped` (verified red against the defect, on the target assertion). The stale-run generation guard that motivated the CAS survives for gate runs, which do set a stage at launch and therefore have a real generation token.
 
-### B-PIPE-3 — monitor_forever exception handler continues silently, heartbeat checks skipped indefinitely — MAJOR — reported
+### B-PIPE-3 — monitor_forever exception handler continues silently, heartbeat checks skipped indefinitely — MAJOR — fixed(2026-07-15)
 - class: silent failure · location: `synapse/pipeline/app.py:281-297` · found-by: H-PIPE
 - symptom: `monitor_forever` loop catches all non-CancelledError exceptions and logs with `logger.exception`, then continues next iteration. If exception is transient (e.g., `os.fsync` failure during `journal.alert`), correct. But if persistent (e.g., `self.store` in corrupted state and `store.liveness()` raises every time), loop log-spams forever and never actually performs heartbeat checks.
 - trigger: (1) TaskStore enters bad state (internal invariant violated, filesystem unavailable), (2) `store.liveness()` on line 285 raises on every iteration, (3) exception caught, logged, loop continues, (4) CRITICAL_WITHOUT_SPEAK checks (283-284) and KORA_UNREACHABLE alerts (285-291) never executed.
 - expected vs actual: persistent failures should either halt monitor (fail-stop) or escalate to higher supervisor · actual: loop continues indefinitely, logging same exception every `heartbeat_interval_s`, while watchdog checks silently skipped.
 - evidence: lines 281-297 show broad `except Exception` on line 296 catches ALL errors in block (282-293) including from `speak_ledger.check()`, `store.liveness()`, `journal.alert()`, `cost_cap.maybe_reset()`. Persistent failure in any makes entire monitor ineffective.
 
-### B-PIPE-4 — TTSCacheObserver exception handler swallows all cache write failures — MAJOR — reported
+### B-PIPE-4 — TTSCacheObserver exception handler swallows all cache write failures — MAJOR — fixed(2026-07-15)
 - class: silent failure · location: `synapse/pipeline/tts_cache.py:152-158` · found-by: H-PIPE
 - symptom: `TTSCacheObserver.on_push_frame` wraps all cache logic in broad `except Exception` that logs and ignores ALL errors. If cache writes fail persistently (disk full, permissions error, filesystem corruption), frames silently dropped from cache and system continues as if fine. Users experience cache misses on every play, triggering expensive REST TTS synthesis, but no alert raised.
 - trigger: (1) disk fills or cache directory permissions change, (2) `cache.put_pcm()` on line 201 (called from `_finalize`) raises `OSError`, (3) exception caught in `on_push_frame`, logged once, ignored, (4) every subsequent TTS frame fails to cache, all future plays require REST synthesis.
 - expected vs actual: persistent cache write failures should either alert (journal.alert) OR disable cache gracefully · actual: errors logged but observer continues silently failing, degrading performance with no visibility.
 - evidence: lines 152-158 show try/except around `_handle()`. Comment lines 153-154 justifies catching to avoid crashing audio pipeline, but doesn't address that persistent failures should surface as alerts rather than silent degradation.
 
-### B-PIPE-5 — run_session finally block cleanup racing with state assignment leaves stale current/bind — MAJOR — reported
+### B-PIPE-5 — run_session finally block cleanup racing with state assignment leaves stale current/bind — MAJOR — rejected(misdiagnosis: pop уже защищён гвардом ровно на этот случай)
 - class: silent failure · location: `synapse/pipeline/webrtc_server.py:223-254` · found-by: H-PIPE
 - symptom: `finally` block acquires `lock` to clean up `current["task"]` and `current["session_id"]`, but race window exists: if new connection preempts old one AFTER old task enters finally but BEFORE old task acquires lock, new task has already published itself as `current["task"]`. When old task's finally runs, it checks `if current["task"] is task` (line 238) — check fails (it's new task), so old task takes `else` branch and checks session IDs. If new connection reused same session_id (unlikely but structurally possible via `active_sessions` dict), old task pops it from `active_sessions` on line 247, breaking new connection's session.
 - trigger: (1) Connection A starts `run_session` with `session_id="abc"`, (2) A hits error, enters finally (line 223), (3) before A acquires `lock` (line 237), Connection B starts with SAME `session_id="abc"` (reused from `active_sessions`), (4) B acquires `lock`, sets `current["task"]` to B's task, publishes `current["session_id"]="abc"`, (5) A now acquires `lock`, sees `current["task"] is not task` (line 238), takes else branch, (6) lines 246-247 conditional logic can pop B's session_id from `active_sessions`, breaking B.
@@ -216,7 +216,7 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: each `end_turn()` clears previous anonymous slot if existed · actual: anonymous slot created but never explicitly cleared when turn_id is None.
 - evidence: line 227 `self._dedup.pop(turn_id, None)` when `turn_id = None` removes nothing. Line 231 `self._dedup.setdefault("<anonymous>", {})` always runs after pop, creating fresh slot. But no `self._dedup.pop("<anonymous>", None)` when `turn_id is None`, so prior anonymous entries survive. Comment at lines 228-230 says "Keep its one bounded slot ready after real turn closes" but doesn't address None case — when turn_id is None (already cleared), anonymous slot should also be cleared/reset, not just setdefault'd (which preserves existing entries).
 
-### B-DISP-3 — _guarded dedup dict comparison fragile for nested args — MINOR — reported
+### B-DISP-3 — _guarded dedup dict comparison fragile for nested args — MINOR — rejected(misdiagnosis: dict `==` в Python УЖЕ order-independent; «фикс» родил бы ложные HIT'ы)
 - class: state machines/illegal transitions · location: `synapse/dispatcher/tools.py:243` · found-by: H-DISP
 - symptom: dedup check `entry.args == args` compares two dicts using Python's `==`, which compares keys and values but doesn't guarantee order-independent comparison for nested structures. If `args` contains nested dicts or lists with different insertion orders but semantically identical content, equality check can fail, causing false dedup miss — same logical call executed twice.
 - trigger: tool takes dict-valued argument (e.g., nested config object); two semantically identical but structurally different dicts (e.g., `{"a": 1, "b": 2}` vs dict from JSON with float `2.0`) might not compare equal. Current tools all take flat str/bool args, so actual risk low, but design fragile — future tool with nested args would break dedup silently.
@@ -247,7 +247,7 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: malformed entries skipped or treated as error · actual: function crashes with AttributeError, halting history rehydration.
 - evidence: lines 63-66 `for e in entries: kind = e.get("kind")` assumes each `e` is dict. No type check or try/except. Comment at line 51 says "единая точка регидрации" and emphasizes consistency, but doesn't mention resilience to malformed input. Function used in cold-cache rehydration (line 121), so corrupted feed file would crash dispatcher's first turn on that thread.
 
-### B-DISP-7 — note_external_turn revives history cleared by clear_history (C6 asymmetry) — MAJOR — proven(2026-07-15)
+### B-DISP-7 — note_external_turn revives history cleared by clear_history (C6 asymmetry) — MAJOR — fixed(2026-07-15)
 - class: concurrency/lifecycle · location: `synapse/dispatcher/loop.py:149-159` · found-by: 2026-07-15 sweep over the diff
 - symptom: `note_external_turn` дописывает реплику в общую LLM-историю треда БЕЗ сверки поколения. `clear_history` инкрементит `_generations` (C6); `ingest_user_turn` сверяет поколение на коммите (B20-стиль), чтобы `clear`, прилетевший во время `await`, не воскресил очищенную историю. `note_external_turn` делает ровно то же — дописывает в shared history — но **без** этой проверки, образуя асимметрию с C6/B20. Голосовой путь зовёт его из `_flush_voice_context` (`app.py:1068`, ВНЕ `turn_lock`), а `clear_history` идёт из HTTP-роута под `turn_lock` — это разные локи, так что «clear» и голосовой flush не сериализуются.
 - trigger: (1) голосовой ход идёт, `_flush_voice_context` готовит assistant-реплику, (2) юзер параллельно шлёт `clear` через HTTP-тред (тот же id) → `clear_history` чистит `hist[:] = []`, generation→N+1, (3) голосовой `note_external_turn("…", "assistant", text)` дописывает реплику БЕЗ сверки поколения → очищенная история воскресла. На следующем HTTP-ходе `_history_for` вернёт кэшированный (оживший) список вместо свежей регидрации из ленты.
@@ -267,7 +267,7 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: day bucket should never be negative; bucket transitions only at actual day boundaries · actual: `_day_bucket(7*3600, 8)` returns `-1`, causing premature resets.
 - evidence: lines 72-75 show `return int((now - self._reset_hour * 3600) // 86400)`. When `now < self._reset_hour * 3600`, numerator negative, producing negative buckets. Comparison at line 85 `bucket > self._reset_day` treats `-1 < 0` as "new day" when transitioning from negative to zero.
 
-### B-CASC-2 — CostCap allows exactly max calls but docs imply < max — MINOR — reported
+### B-CASC-2 — CostCap allows exactly max calls but docs imply < max — MINOR — rejected(спор о значении «max»; «фикс» отключил бы платные вызовы при max=1)
 - class: data integrity · location: `synapse/cascade/services.py:103` · found-by: H-CASC
 - symptom: cap trips on or after reaching `_max`, not before. With `max_paid_calls_per_day=3`, calls 1, 2, and 3 all succeed (returning True), only call 4 blocked. Off-by-one from intuitive interpretation of "max 3 per day" meaning "up to 2 allowed".
 - trigger: `cap = CostCap(max_paid_calls_per_day=3)`, three consecutive `cap.record_paid_attempt()` all return True (allowed), fourth blocked.
@@ -302,21 +302,21 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: file opened in context manager or with explicit try/finally protection · actual: bare `.open()` with cleanup only via explicit `close()` call.
 - evidence: line 73 `self._file = self._path.open("a", encoding="utf-8")`. No context manager, no try/finally around lifetime. File only closed in two places: line 176 `close()` method (requires explicit call), line 115 console.py calls `journal.close()`, line 125 webrtc_server.py shutdown handler calls `host.journal.close()`. If any code path fails to call `close()` (early exception in setup, or forgotten call site), fd leaks.
 
-### B-CORE-2 — Thread never joined in record_commands.py on early exit — CRIT — reported
+### B-CORE-2 — Thread never joined in record_commands.py on early exit — MINOR (был CRIT — переоценён, см. fix) — fixed(2026-07-15)
 - class: resource leak · location: `synapse/runners/record_commands.py:64-71` · found-by: H-CORE
 - symptom: daemon thread running `_wait_for_enter` never joined; on process exit it's forcibly killed, but recording loop can exit early (e.g., `stop_event.set()`) leaving thread dangling until GC or process death.
 - trigger: (1) start recording, (2) user presses Enter to stop, (3) `stop_event.set()` fires, (4) loop exits at line 68, (5) finally block closes stream (lines 70-71), (6) thread at line 64 never joined — remains alive until it completes `input()` on its own or process exits.
 - expected vs actual: `waiter.join(timeout=0.1)` after loop to clean up promptly · actual: thread left running.
 - evidence: lines 64-71 show `waiter = threading.Thread(target=_wait_for_enter, daemon=True)`, `waiter.start()`, recording loop, finally closes stream. No `waiter.join()`. Daemon flag prevents blocking process exit, but thread remains alive consuming stack until it naturally completes. Not leak that grows unbounded (one thread per recording session), but still resource held longer than necessary.
 
-### B-CORE-3 — TurnJournal._write fsync exception leaves _file inconsistent — MAJOR — reported
+### B-CORE-3 — TurnJournal._write fsync exception leaves _file inconsistent — MAJOR — fixed(2026-07-15)
 - class: resource leak · location: `synapse/journal.py:169-172` · found-by: H-CORE
 - symptom: if `os.fsync(self._file.fileno())` raises (disk full, fd closed externally), exception propagates but file remains open with unflushed data or inconsistent fd state.
 - trigger: (1) journal writes row via `_write()`, (2) line 170 `self._file.flush()` succeeds, (3) line 172 `os.fsync(self._file.fileno())` raises `OSError` (disk full, ENOSPC), (4) exception propagates to caller (e.g., `alert()` swallows it at line 126, but `end_turn()` does not), (5) file handle remains open, potentially in bad state.
 - expected vs actual: `_write()` should catch `OSError` on fsync, set `self._closed = True`, close file to prevent further corruption · actual: exception propagates; file remains open.
 - evidence: lines 169-172 show `self._file.write(...)`, `self._file.flush()`, `if fsync: os.fsync(self._file.fileno())`. No try/except around fsync. While `alert()` has try/except (lines 123-126), `end_turn()` (line 160) and `record_kora_event()` (line 154) call `_write()` without protection, so fsync failure propagates and may leave journal in bad state.
 
-### B-CORE-4 — TTS cache tmp file cleanup races with process exit — MINOR — proven(2026-07-15)
+### B-CORE-4 — TTS cache tmp file cleanup races with process exit — MINOR — fixed(2026-07-15)
 - class: resource leak · location: `synapse/pipeline/tts_cache.py:42-46,62-71` · found-by: H-CORE
 - symptom: if process killed (SIGKILL) or crashes hard between line 65 (`os.replace(tmp, path)`) completing and line 69 (`tmp.unlink()`), tmp file leaks on disk.
 - trigger: (1) `_atomic_write()` creates `.tmp` file (line 62), (2) lines 64-65 write data, call `os.replace(tmp, path)` — succeeds, (3) process crashes or killed before line 69 `tmp.unlink()` runs, (4) `.tmp` file remains on disk forever (the `if tmp.exists()` check at line 67 will never run).
@@ -331,7 +331,7 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: catch all exceptions, kill proc, wait for it, then re-raise · actual: only `TimeoutError` handled.
 - evidence: lines 572-582 show subprocess creation, try/except around wait_for. Only `TimeoutError` caught (lines 578-581 kill and wait). Any other exception (e.g., `CancelledError` if HTTP request cancelled) escapes without cleanup.
 
-### B-CORE-6 — KoraRunner._active task leaks on RuntimeError during start() — MAJOR — proven(2026-07-15)
+### B-CORE-6 — KoraRunner._active task leaks on RuntimeError during start() — MAJOR — fixed(2026-07-15)
 - class: resource leak · location: `synapse/bridge/kora.py:453-465` · found-by: H-CORE
 - symptom: if `asyncio.create_task(coro)` raises `RuntimeError` (no running loop — the console + `kora_enabled` path, or a sync test), the `except RuntimeError` branch closes the coroutine and terminalizes the task, but leaves `self._active` pointing at the PREVIOUSLY-CANCELLED task instead of `None`. The runner's live-run invariant ("`_active` is a live run or `None`") is violated.
 - trigger: (1) a prior run left `self._active` set and not done, (2) `start()` line 458-459 cancels it, (3) line 462 `asyncio.create_task(coro)` raises `RuntimeError` (no loop), (4) `coro.close()` (464) + `_terminalize_if_running` (465) run, (5) `self._active` is NEVER reset to `None` — it still references the cancelled task.
@@ -515,6 +515,69 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - **Цена API-фикса (честно):** скоупинг ConfirmFlow сломал 8 замороженных тестов — все мигрировали писатели, ассерты не тронуты, два теста стали СТРОЖЕ (security-posture хука пинит теперь и личность рана). Ещё один — `test_b_bridge_5` в бэклоге — был зелёным и упал сигнатурой мока: любой спай на `confirm_flow.submit` ломается об API. Мигрирован тем же порядком.
 - **Поймано на верификации:** первая редакция теста B-CASC-5 была красной по НЕПРАВИЛЬНОЙ причине — слала 3 end-фрейма в ОДНОЙ генерации и требовала счёт 3. Это премиса B21 (двойной счёт), а не B-CASC-5; зазеленение такого теста вернуло бы B21. Возвращено писателю, премиса переписана на 3 генерации. **Урок ровно тот же, что у B-CASC-3: красный тест — это claim, проверять надо НА ЧЁМ он красный.**
 - **Поймано на полной суите:** ID `B-DISP-7` уже был занят утренним заходом (`note_external_turn revives history`, proven). Мои находки перенумерованы в B-DISP-8/B-DISP-9. Ловится только прогоном ВСЕЙ суиты, не своих файлов.
+
+### Backlog добит (2026-07-15, третий заход): 7 fixed, 3 rejected, 2 негодных теста заменены
+Взят «легитимно открытый» остаток бэклога. **10 «багов» → 7 настоящих, 3 не-бага.** Отслеживаемая
+суита **798 green / 1 xfailed** (B15, чужой). Красных в бэклог-файлах: 16 → 9, и каждый оставшийся
+учтён (см. разбор ниже) — ни одного неизвестного.
+
+**Починено (7):**
+- **B-CORE-6** — `self._active = None` в except-ветке `start()`. Инвариант «_active это ЖИВОЙ ран либо None».
+- **B-CORE-4** — `TTSCache._sweep_orphaned_tmp()` в `__init__`. Возраст не проверяем: `journal_dir`
+  эксклюзивен для процесса (там же `state.json`), чужого ЖИВОГО tmp в корне быть не может.
+- **B-CORE-2** — `waiter.join(timeout=1.0)` + конструктор потока вынесен ДО `try` (иначе finally
+  ловил бы NameError). **Severity переоценён CRIT→MINOR:** реестр сам писал «not a leak that grows
+  unbounded». Честная граница фикса: на пути, где `stream.read()` бросил, вейтер остаётся висеть в
+  `input()` — join его не добудится (прервать `input()` в Python нечем), и он уйдёт драться за stdin
+  со следующей фразой. Полное лечение = убрать `input()` из потока; за рамками бага, не заявлено сделанным.
+- **B-CORE-3** — сбойная запись ЗАКРЫВАЕТ журнал (`_closed = True` + close + logger.error), пробрасывая
+  дальше (контракт распространения не тронут — B39 ловит как ловил). Основание — **fsyncgate**: упавший
+  fsync на Linux потребляет ошибку и может выбросить грязные страницы, следующий fsync вернёт УСПЕХ при
+  уже потерянных данных. Для §8-евиденса денег/авторизации врать о долговечности хуже, чем замолчать;
+  `_closed` уже несёт семантику тихого no-op (B28), запасной канал — logger.
+- **B-DISP-7** — `clear_history` теперь ВЫКИДЫВАЕТ кэш треда, а не оставляет пустой список, + роут пишет
+  clear-маркер в ленту ПЕРВЫМ и ВНУТРИ `turn_lock`. Порядок несущий (см. урок ниже).
+- **B-PIPE-3** — `cost_cap.maybe_reset(now)` вынесен в ОТДЕЛЬНЫЙ guarded-шаг + `MONITOR_DEGRADED`
+  один раз на серию из `_MONITOR_DEGRADED_AFTER=3` сбоев подряд (успех обнуляет). Цикл по-прежнему не умирает.
+- **B-PIPE-4** — `TTSCacheObserver(cache, tts, journal=None)` + `TTS_CACHE_DEGRADED` один раз на серию.
+  Ловим у САМОЙ записи в `_finalize`, не на уровне `on_push_frame`: обсервер зовут на каждый фрейм, и
+  почти все кэша не касаются — любой успешный `TTSStartedFrame` сбрасывал бы анти-спам в флуд.
+
+**Не баги — rejected (3). Все три «фикса» были бы ХУЖЕ «багов»:**
+- **B-DISP-3** — охотник ошибся о самом Python: `{'a':1,'b':2} == {'b':2,'a':1}` → True, рекурсивно, и
+  `2 == 2.0` → True. Единственное реальное различие — порядок СПИСКА, а он семантичен. Тест требовал,
+  чтобы `[1,2]` и `[2,1]` дали дедуп-**HIT**; рядом в `_guarded` уже записано решение обратного трейдоффа:
+  «a false dedup hit cannot be recovered». Ложный промах = инструмент отработал дважды; ложное попадание =
+  легитимный вызов проглочен молча. Плюс ни одна схема инструмента не берёт вложенных аргументов.
+- **B-CASC-2** — спор о значении слова «max», а не баг. `max=1` в конфиге значит «один платный вызов»;
+  при эксклюзивной границе он значил бы НОЛЬ. Семантика пинится замороженным
+  `test_b30_costcap_recovers_after_day_boundary`: `assert cap.record_paid_attempt(now=day0) is True
+  # the tripping call is itself allowed`. Шаблон B-CASC-3 в чистом виде — денежная семантика по наводке имени.
+- **B-PIPE-5** — misdiagnosis: `pop` в else-ветке уже стоит ЗА гвардом `current["session_id"] != session_id`,
+  то есть ровно за случаем «B переиспользовал тот же sid» → ничего не выпадает, B не ломается. Охотник
+  прочитал условие наоборот. Плюс тест падал `TypeError` в собственном сетапе, а не на ассерте.
+
+**Два негодных доказательства заменены (та же болезнь, третий заход подряд):**
+- **B-PIPE-3** — `test_reported_bugs_failing.py` требовал, чтобы монитор УМЕР с первым исключением. Это
+  переоткрытие **B2** (замороженный тест назван прямым текстом: «monitor_forever dies permanently on any
+  loop-body exception»), и хуже: мёртвый монитор гарантированно не тикает `maybe_reset` — то самое
+  восстановление денег, которое баг и защищает. Реестр писал «halt ИЛИ escalate»; тест выбрал halt, не
+  заметив, что escalate'ить в системе некому, а halt убивает деньги.
+- **B-PIPE-4** — требовал `pytest.raises(OSError)` из `on_push_frame`, т.е. ровно того, что запрещает **R-1**
+  («обсервер НИКОГДА не пробрасывает — уронило бы живое аудио») и что противоречит собственному «expected»
+  этого же бага («alert ИЛИ disable gracefully»).
+Оба возвращены писателям; новые красные — `tests/test_hunt0715_monitor.py`, `tests/test_hunt0715_tts_cache_alert.py`
+(5 тестов, включая анти-спам-стражи и зеркало R-1). Старые негодные оставлены красными в бэклог-файлах вне гита.
+
+**Урок захода — B-DISP-7: фикс инвалидации был бы регрессией без переупорядочивания.** «Воскрешение» было
+не тем, чем звалось: `clear_history` делает `hist[:] = []`, старых реплик уже нет — дописывается ОДНА новая.
+Настоящий инвариант: **тёплая история обязана совпадать с тем, что вернула бы холодная регидрация**, а
+`history_from_feed` режет ленту по ПОСЛЕДНЕМУ clear-маркеру. Значит правду знает ЛЕНТА, и сделать
+`note_external_turn` безусловным no-op было бы ошибкой — реплика, легшая ПОСЛЕ маркера, честно принадлежит
+новому контексту. Отсюда фикс: уронить кэш → следующий читатель регидрируется из ленты → порядок «реплика vs
+маркер» решает всё. НО: роут писал маркер ПОСЛЕ `clear_history` и ВНЕ лока — уронив кэш в этом окне, чтение
+подняло бы из ленты НЕочищенную историю, отменило clear и закэшировало результат. **Инвалидация кэша без
+переноса маркера внутрь лока = регрессия.** Ищи это в любом фиксе «сделаем кэш честнее».
 
 ### Backlog утреннего захода — разбор (не трогать вслепую)
 13 красных тестов лежат вне гита (`tests/test_reported_bugs_failing.py`, `test_new_reported_bugs_failing.py`, `test_bughunt_2026_07_15_failing.py`). «13 красных» ≠ «13 багов»:
