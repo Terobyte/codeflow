@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Synapse — voice dispatcher bridge to Kora (Claude Code executor on the user's home machine)"
 requires-python = ">=3.12"
 dependencies = [
+    "claude-agent-sdk==0.2.116",
     "pipecat-ai[deepgram,fish,openai,anthropic,google]>=1.5",
     "openai",
     "anthropic",
