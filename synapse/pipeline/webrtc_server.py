@@ -34,6 +34,7 @@ from pipecat_ai_prebuilt.frontend import PipecatPrebuiltUI
 
 from synapse.bridge.state import Liveness, TaskStatus
 from synapse.dispatcher.llm_client import CostCapBlocked, ProviderUnavailable
+from synapse.dispatcher.speakable import speakable
 from synapse.dispatcher.speakify import speakify
 from synapse.pipeline.app import SynapseHost, build_session_pipeline
 from synapse.pipeline.arbiter import default_sentence_splitter
@@ -706,9 +707,10 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     @app.post("/api/tts")
     async def api_tts(request: Request):
         # Play-озвучка ленты (tero 2026-07-14): три ступени — кэш → сборка из посентенсовых
-        # WAV → REST-синтез Fish. Текст Коры (role=kora) прогоняется через speakify перед TTS
-        # (санитайз кода/путей), речь диспетчера уже разговорная. Все cache-IO через to_thread
-        # (R-4: WAV до ~МБ на event loop). x-tts-source сообщает клиенту, откуда взялось аудио.
+        # WAV → REST-синтез Fish. Текст Коры (role=kora), если он не разговорный, прогоняется
+        # через speakify перед TTS (санитайз кода/путей); речь диспетчера уже разговорная.
+        # Все cache-IO через to_thread (R-4: WAV до ~МБ на event loop). x-tts-source сообщает
+        # клиенту, откуда взялось аудио.
         if not _csrf_ok(request):
             return JSONResponse({"error": "csrf"}, status_code=403)
         data, err = await _json_body(request)
@@ -722,7 +724,10 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         if cache is None:
             return JSONResponse({"error": "unavailable"}, status_code=503)
         cfg = host.cfg
-        if role == "kora":
+        if role == "kora" and not speakable(text, max_chars=cfg.kora_speak_max_chars):
+            # KV-2 §4.2: speakify — только для НЕразговорного текста. Чистый по форматному
+            # фильтру идёт в TTS как есть: минус платный Gemini-вызов и его задержка. Кэш
+            # speak_text не трогаем на этой ветке — переписывать было нечего.
             spoken = await asyncio.to_thread(cache.get_speak_text, text)
             if spoken is None:
                 spoken = await speakify(

@@ -29,6 +29,9 @@ class SynapseConfig:
     # (отдельная квота от tier1-каскада; benchmarks/gemini-vs-openrouter-20260715). Таймаут
     # переиспользует request_timeout_s.
     speakify_model: str = "gemini-3.5-flash"
+    # KV-2 §4.2: кап длины для speakable() — форматного фильтра «текст Коры звучит как речь,
+    # а не как зачитанный markdown». Длиннее — не разговорная реплика, идёт через speakify.
+    kora_speak_max_chars: int = 350
 
     request_timeout_s: float = 10.0
 
@@ -149,6 +152,10 @@ class SynapseConfig:
         compact = _num("DISPATCHER_COMPACT_AFTER", int)
         if compact is not None:
             kwargs["dispatcher_compact_after"] = compact
+        # KV-2: тот же two-step, что у остальных kora_*-порогов (малформа/пусто → дефолт).
+        speak_cap = _num("KORA_SPEAK_MAX_CHARS", int)
+        if speak_cap is not None:
+            kwargs["kora_speak_max_chars"] = speak_cap
         return cls(**kwargs)
 
     def validate_voice_keys(self) -> None:
