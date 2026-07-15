@@ -154,6 +154,18 @@ class KoraBridge:
     projects: Any = None
     threads: Any = None
     thread_id_for: Callable[[], str | None] | None = None
+    # B-BRIDGE-6: имя канала этого моста ("voice"/"http") — сентинел разговора, когда треда ещё
+    # нет. У голоса это норма: авто-тред рождается в on_task_committed, то есть ПОСЛЕ подтверждения,
+    # так что необратимая задача СТАВИТСЯ при thread_id_for() == None. Скоупить её в None значило бы
+    # «подтвердить некому» — голосовой confirm умер бы совсем. Канал же — честный разговор: голос
+    # один, а HTTP-треды различаются своими id.
+    channel: str = "voice"
+
+    def confirm_scope(self) -> str:
+        """Разговор для ConfirmFlow: тред, если он есть, иначе канал. Одна точка на submit и
+        confirm — оба ключа обязаны считать скоуп одинаково, иначе задачу нельзя подтвердить."""
+        tid = self.thread_id_for() if self.thread_id_for is not None else None
+        return tid or self.channel
 
 
 def _submit_result_to_dict(res: SubmitResult) -> dict[str, Any]:
@@ -260,7 +272,8 @@ class ToolHandlers:
 
     async def submit_task(self, text: str) -> dict[str, Any]:
         async def _do() -> dict[str, Any]:
-            res = self.bridge.confirm_flow.submit(text, self.bridge.clock.now())
+            res = self.bridge.confirm_flow.submit(text, self.bridge.clock.now(),
+                                                  thread_id=self.bridge.confirm_scope())
             speak_text = res.readback_text or res.reject_text
             if speak_text and self.bridge.on_speak:
                 self.bridge.on_speak(speak_text)
@@ -276,7 +289,8 @@ class ToolHandlers:
 
     async def confirm_task(self, decision: str) -> dict[str, Any]:
         async def _do() -> dict[str, Any]:
-            res = self.bridge.confirm_flow.confirm(decision, self.bridge.clock.now())
+            res = self.bridge.confirm_flow.confirm(decision, self.bridge.clock.now(),
+                                                   thread_id=self.bridge.confirm_scope())
             if res.text and self.bridge.on_speak:
                 self.bridge.on_speak(res.text)
             # A confirmed destructive task just flipped to RUNNING → launch Kora. Read the task

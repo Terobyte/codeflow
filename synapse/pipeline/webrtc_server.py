@@ -665,26 +665,42 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         # concurrent begin_turn; full per-turn serialization stays the parked pipecat residual.
         async with host.turn_lock:  # S7: одна очередь ходов на хост
             host.current_http_thread["id"] = thread_id
+
+        def _degraded(idle_text: str, active_text: str, alert_kind, alert_payload) -> JSONResponse:
+            """P1 (Ф0.4/CR-7): сбой хода — degraded-ответ вместо 500. Общая точка обеих веток.
+
+            B-DISP-9: ход падает ПОСЛЕ того, как его собственный первый пасс мог уже реально
+            закоммитить мутирующий tool call — loop.py диспатчит tool-ы (:236) ДО следующего
+            _complete (:237), а GuardedLLMClient резервирует лимит на КАЖДОМ complete, не только
+            на первом. Контекстно-свободное «ничего не вышло, попробуйте позже» в этот момент
+            противоречит состоянию, которое ответ обязан отражать: задача уже запущена, наивный
+            повтор упирается в {"error": "busy"} без всякой связи с этим «провалившимся» ходом.
+            Реплику выбирает ПРАВДА стора, а не ветка исключения."""
+            now = host.clock.now()
+            reply_text = active_text if host.store.has_active_task() else idle_text
+            host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
+            host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": reply_text})
+            host.journal.alert(alert_kind, alert_payload)
+            return JSONResponse({"reply": reply_text, "degraded": True})
+
         try:
             record, reply = await host.text_loop.ingest_user_turn(text, thread_id=thread_id)
         except CostCapBlocked:
-            # P1 (Ф0.4): дневной лимит — degraded ответ вместо 500.
-            _fallback = "Дневной лимит платных запросов исчерпан. Попробуйте позже."
-            now = host.clock.now()
-            host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
-            host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": _fallback})
             from synapse.journal import AlertKind
-            host.journal.alert(AlertKind.COST_CAP, {"channel": "http"})
-            return JSONResponse({"reply": _fallback, "degraded": True})
+            return _degraded(
+                "Дневной лимит платных запросов исчерпан. Попробуйте позже.",
+                "Дневной лимит платных запросов исчерпан, договорить не могу. Но задача уже "
+                "запущена и выполняется — не отправляй её заново, спроси статус.",
+                AlertKind.COST_CAP, {"channel": "http"},
+            )
         except ProviderUnavailable:
-            # P1 (CR-7): провайдер-сбой — degraded ответ вместо 500.
-            _fallback = "Связь с мозгом потеряна. Попробуйте повторить через минуту."
-            now = host.clock.now()
-            host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
-            host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": _fallback})
             from synapse.journal import AlertKind
-            host.journal.alert(AlertKind.ALL_TIERS_FAILED, {"channel": "http", "reason": "provider"})
-            return JSONResponse({"reply": _fallback, "degraded": True})
+            return _degraded(
+                "Связь с мозгом потеряна. Попробуйте повторить через минуту.",
+                "Связь с мозгом потеряна, договорить не могу. Но задача уже запущена и "
+                "выполняется — не отправляй её заново, спроси статус.",
+                AlertKind.ALL_TIERS_FAILED, {"channel": "http", "reason": "provider"},
+            )
         finally:
             # С2 (Ф0.2): HTTP закрывает ход. У HTTP нет tts_texts (ждать нечего), end_turn идёт
             # в finally — exception-путь уже закрыл сам (loop.py exception-ветка зовёт end_turn),
@@ -701,6 +717,17 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         # Не меняет stage/request semantics (stage движется только propose_request/gate).
         host.threads.maybe_autotitle(thread_id, text)
         host.threads.append_feed(thread_id, {"ts": now, "kind": "user", "text": text})
+        if not (reply or "").strip():
+            # B-DISP-8: вырожденный ответ провайдера — llm_client отдаёт литеральный ("", []) на
+            # content без text/tool_use-блоков — доезжал сюда обычным 200 без единого признака,
+            # неотличимо от настоящего ответа; соседние CostCapBlocked/ProviderUnavailable ветки
+            # выше обе метят degraded, эта не метила ничем. Пустую реплику НЕ пишем в ленту:
+            # history_from_feed развернул бы её в assistant-сообщение с пустым текстом, а такой
+            # шейп Anthropic отвергает — молчание провайдера отравило бы рехидрацию всего треда.
+            from synapse.journal import AlertKind
+            host.journal.alert(AlertKind.ALL_TIERS_FAILED,
+                               {"channel": "http", "reason": "empty_response"})
+            return JSONResponse({"reply": "", "degraded": True})
         host.threads.append_feed(thread_id, {"ts": now, "kind": "assistant", "text": reply})
         return JSONResponse({"reply": reply})
 

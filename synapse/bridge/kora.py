@@ -23,6 +23,7 @@ boilerplate. Keep the two bodies in sync if either changes.
 from __future__ import annotations
 
 import asyncio
+import functools
 import itertools
 import json
 import os
@@ -631,7 +632,12 @@ class KoraRunner:
             allowed_tools=[],
             disallowed_tools=[],
             setting_sources=[],
-            hooks={"PreToolUse": [HookMatcher(hooks=[self._pretool_hook], timeout=None)]},
+            # B-BRIDGE-9: хук несёт личность СВОЕГО рана — без неё гейт судил вызов по снапшоту
+            # того, кто занял поля последним. task_id известен ровно здесь, в момент сборки.
+            hooks={"PreToolUse": [
+                HookMatcher(hooks=[functools.partial(self._pretool_hook, task_id=task_id)],
+                            timeout=None)
+            ]},
             model=self._run_model or self._cfg.kora_model,
             cli_path=self._cfg.kora_cli_path,
             max_turns=self._cfg.kora_max_turns,
@@ -639,7 +645,8 @@ class KoraRunner:
             system_prompt=self._system_prompt(workspace, text),
         )
 
-    def _gate_decision(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str | None, str]:
+    def _gate_decision(self, tool_name: str, tool_input: dict[str, Any],
+                       task_id: str | None = None) -> tuple[bool, str | None, str]:
         """Pure containment decision (RISK-M6; gate v2 A1'-A8'). Returns
         (allowed, detail, category) — an EXPLICIT category, never string-parsed by the caller.
 
@@ -667,7 +674,20 @@ class KoraRunner:
           non_file_tool       — неизвестный non-file инструмент (fail-closed);
           path_error          — resolve() пути упал.
         Пути сверяются через Path.resolve().is_relative_to (NOT startswith — that would leak
-        the sibling /ws-evil)."""
+        the sibling /ws-evil).
+
+        B-BRIDGE-9: `task_id` — личность рана, от имени которого пришёл tool-вызов. Снапшот
+        (`_run_root`/`_run_gate_mode`) — поля ЭКЗЕМПЛЯРА, общие для всех ранов: сторона ЗАПИСИ
+        (`finally` в `_run`) прикрыта identity-guard'ом, чтобы уходящий ран не затёр снапшот
+        преемника, а сторона ЧТЕНИЯ — вот эта — гварда не имела и читала что лежит. Пара
+        обычных действий (request_cancel fire-and-forget + немедленный второй запуск: busy-чек
+        уже считает отменяемый ран неактивным) оставляла tool-вызов docs_only-рана судимым по
+        правилам преемника — та же запись, что была denied, становилась allowed. Fail-closed:
+        чужой снапшот — не «судить по чужим правилам», а deny; ран, потерявший владение,
+        доигрывается в отмену и права действовать больше не имеет. task_id=None — юнит-вызовы
+        предиката, снапшот в них ставится тестом напрямую; гвард не включается."""
+        if task_id is not None and self._run_owner != task_id:
+            return False, "superseded_run", "superseded_run"
         key = _PATH_KEY.get(tool_name)
         if key is None:
             if tool_name in _SAFE_META_TOOLS:
@@ -761,7 +781,8 @@ class KoraRunner:
             return True, str(resolved), "allow"
         return False, "outside_workspace", "outside_workspace"
 
-    async def _pretool_hook(self, input_data: dict[str, Any], tool_use_id: Any, context: Any) -> dict[str, Any]:
+    async def _pretool_hook(self, input_data: dict[str, Any], tool_use_id: Any, context: Any,
+                            task_id: str | None = None) -> dict[str, Any]:
         # The ONE gate (slice-4 repair): a PreToolUse hook fires for EVERY tool Кора invokes,
         # unlike can_use_tool which only fired for permission-requiring tools (Read/Glob/Bash
         # slipped past it and a secret leaked). It returns an EXPLICIT allow/deny hook dict per
@@ -771,10 +792,15 @@ class KoraRunner:
         # E5 (§2b): AskUserQuestion is Кора asking the USER something mid-task. It has no path key
         # → the fail-closed policy would Deny it. Intercept FIRST and turn it into the interactive
         # block that parks the stream until the dispatcher delivers the answer.
-        if name == "AskUserQuestion":
+        # B-BRIDGE-9: личность рана сверяется ДО перехвата AskUserQuestion — вопрос это тоже
+        # действие. Ран, потерявший владение полями, не должен парковать future и говорить с
+        # пользователем от имени задачи, которой уже нет; он падает в общий deny ниже (и в
+        # журнал как gate_deny/superseded_run, а не молча).
+        superseded = task_id is not None and self._run_owner != task_id
+        if name == "AskUserQuestion" and not superseded:
             return await self._handle_question(tinput)
 
-        allowed, detail, category = self._gate_decision(name, tinput)
+        allowed, detail, category = self._gate_decision(name, tinput, task_id)
         payload = {"tool": name, "detail": detail, "category": category}
         if name == "Bash":
             # Gate v2 A7'-а: Bash слеп для файлового гейта — журнал обязан нести САМУ команду

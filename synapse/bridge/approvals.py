@@ -139,8 +139,15 @@ class ApprovalService:
             return None
         # (b) affirm-проверка транскрипта
         response = classify_affirm(transcript, self._affirm_words, self._deny_words)
+        if response == "deny":
+            # B-BRIDGE-8: явный отказ ГАСИТ pending — как ConfirmFlow._reset у брата-механизма.
+            # Пока pending переживал «нет», он оставался неотличим от unclear: любой более
+            # поздний «да» (в т.ч. про другое) проходил вотермарк и запускал уже отклонённое.
+            # Отказ ≠ отсутствие ответа; воскресить его может только новый stage().
+            self._pending.pop(thread_id, None)
+            return None
         if response != "affirm":
-            # deny / unclear → pending НЕ гасится (unclear → повторный readback в gate_action)
+            # unclear → pending НЕ гасится (повторный readback в gate_action)
             return None
         # успех — одноразовый: гасим pending, возвращаем approval
         self._pending.pop(thread_id, None)

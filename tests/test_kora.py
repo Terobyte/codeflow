@@ -9,6 +9,7 @@ never spawn the CLI or hit the API.
 from __future__ import annotations
 
 import asyncio
+import functools
 import itertools
 import json
 import os
@@ -612,7 +613,18 @@ def test_build_options_security_posture(tmp_path):
     # (which only fired for permission-requiring tools and let Read/Glob/Bash bypass the gate).
     assert opts.can_use_tool is None
     matcher = opts.hooks["PreToolUse"][0]
-    assert matcher.hooks == [runner._pretool_hook]  # bound method: same __self__/__func__
+    assert len(matcher.hooks) == 1
+    hook = matcher.hooks[0]
+    # B-BRIDGE-9: the hook must carry THIS run's identity (task_id) baked in — a bare bound
+    # method let the gate judge a call by whatever run last occupied `self._run_owner`, not by
+    # who actually issued the call. functools.partial binds task_id at build time so nothing
+    # downstream (a later _build_options for a different run) can swap it out from under this
+    # hook instance — the strict check: same underlying _pretool_hook of THIS runner, no stray
+    # positional args, and the exact task_id passed to _build_options above.
+    assert isinstance(hook, functools.partial)
+    assert hook.func == runner._pretool_hook  # bound method: same __self__/__func__
+    assert hook.args == ()
+    assert hook.keywords == {"task_id": "tk"}
     assert str(ws) in opts.system_prompt  # LOAD-BEARING: prompt must name the workspace
 
 
@@ -715,8 +727,13 @@ async def test_confirm_committed_launches_with_store_text(tmp_path):
     handlers, store, confirm_flow, committed, _, clock = make_handlers(tmp_path)
     handlers.begin_turn("t1")
     assert (await handlers.submit_task(text="удали старьё"))["outcome"] == "staged"
-    # double-key: a user turn must intervene, and it must affirm.
-    confirm_flow.note_user_turn("да", clock.now())
+    # double-key: a user turn must intervene, and it must affirm. submit/confirm go through the
+    # real handlers, i.e. through KoraBridge.confirm_scope() — make_handlers wires no
+    # thread_id_for, so confirm_scope() falls back to the bridge's default channel ("voice").
+    # note_user_turn is called directly here (bypassing the dispatcher loop), so it must be
+    # scoped to that SAME "voice" conversation, or B-BRIDGE-6 makes it a no-op (thread_id=None
+    # is ignored entirely) and the double-key never clears.
+    confirm_flow.note_user_turn("да", clock.now(), thread_id="voice")
     handlers.begin_turn("t2")
     res = await handlers.confirm_task(decision="confirm")
     assert res["outcome"] == "committed"

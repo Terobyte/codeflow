@@ -52,9 +52,9 @@ def test_confirm_without_user_turn_is_self_attempt_and_alerts(tmp_path):
 
 def test_confirm_affirm_commits(tmp_path):
     flow, store, clock, journal = make_flow(tmp_path)
-    flow.submit("удали старые бэкапы", now=0.0)
-    flow.note_user_turn("да, подтверждаю", now=1.0)
-    result = flow.confirm("confirm", now=1.0)
+    flow.submit("удали старые бэкапы", now=0.0, thread_id="t1")
+    flow.note_user_turn("да, подтверждаю", now=1.0, thread_id="t1")
+    result = flow.confirm("confirm", now=1.0, thread_id="t1")
     assert result.outcome == ConfirmDecisionOutcome.COMMITTED
     assert store.task.status == TaskStatus.RUNNING
 
@@ -70,36 +70,36 @@ def test_confirm_llm_and_affirm_mismatch_rejected(tmp_path):
 
 def test_confirm_deny_resets(tmp_path):
     flow, store, clock, journal = make_flow(tmp_path)
-    flow.submit("удали старые бэкапы", now=0.0)
-    flow.note_user_turn("нет", now=1.0)
-    result = flow.confirm("deny", now=1.0)
+    flow.submit("удали старые бэкапы", now=0.0, thread_id="t1")
+    flow.note_user_turn("нет", now=1.0, thread_id="t1")
+    result = flow.confirm("deny", now=1.0, thread_id="t1")
     assert result.outcome == ConfirmDecisionOutcome.RESET
     assert store.task is None
 
 
 def test_confirm_unclear_rereadbacks_then_resets_after_max(tmp_path):
     flow, store, clock, journal = make_flow(tmp_path, max_rereadbacks=2)
-    flow.submit("удали старые бэкапы", now=0.0)
+    flow.submit("удали старые бэкапы", now=0.0, thread_id="t1")
 
-    flow.note_user_turn("шум", now=1.0)
-    r1 = flow.confirm("confirm", now=1.0)
+    flow.note_user_turn("шум", now=1.0, thread_id="t1")
+    r1 = flow.confirm("confirm", now=1.0, thread_id="t1")
     assert r1.outcome == ConfirmDecisionOutcome.REREADBACK
 
-    flow.note_user_turn("ещё шум", now=2.0)
-    r2 = flow.confirm("confirm", now=2.0)
+    flow.note_user_turn("ещё шум", now=2.0, thread_id="t1")
+    r2 = flow.confirm("confirm", now=2.0, thread_id="t1")
     assert r2.outcome == ConfirmDecisionOutcome.REREADBACK
 
-    flow.note_user_turn("снова шум", now=3.0)
-    r3 = flow.confirm("confirm", now=3.0)
+    flow.note_user_turn("снова шум", now=3.0, thread_id="t1")
+    r3 = flow.confirm("confirm", now=3.0, thread_id="t1")
     assert r3.outcome == ConfirmDecisionOutcome.RESET
     assert store.task is None
 
 
 def test_confirm_timeout_resets(tmp_path):
     flow, store, clock, journal = make_flow(tmp_path, confirm_timeout_s=5.0)
-    flow.submit("удали старые бэкапы", now=0.0)
-    flow.note_user_turn("да", now=10.0)  # after the 5s window
-    result = flow.confirm("confirm", now=10.0)
+    flow.submit("удали старые бэкапы", now=0.0, thread_id="t1")
+    flow.note_user_turn("да", now=10.0, thread_id="t1")  # after the 5s window
+    result = flow.confirm("confirm", now=10.0, thread_id="t1")
     assert result.outcome == ConfirmDecisionOutcome.RESET
 
 
@@ -107,3 +107,46 @@ def test_confirm_with_nothing_staged_is_rejected(tmp_path):
     flow, store, clock, journal = make_flow(tmp_path)
     result = flow.confirm("confirm", now=0.0)
     assert result.outcome == ConfirmDecisionOutcome.REJECTED
+
+
+def test_confirm_is_scoped_to_the_conversation_that_staged_it(tmp_path):
+    """B-BRIDGE-6: one ConfirmFlow serves every thread and both channels — a destructive task
+    staged by conversation A must be confirmable ONLY by A. A foreign conversation's OWN
+    ordinary turn (its own "да"/"нет") must not feed A's double-key: it must not launch A's
+    task, and it must not reset it either — a stranger's "no" is not the owner's decision.
+    Only A's own turn may actually commit it."""
+    flow, store, clock, journal = make_flow(tmp_path)
+
+    # A stages a destructive task -> PENDING_CONFIRMATION, awaiting A's own turn.
+    submit_res = flow.submit("удали старые бэкапы", now=0.0, thread_id="A")
+    assert submit_res.outcome == ConfirmOutcome.STAGED
+    assert flow.staged is not None
+    assert flow.staged.awaiting_user_turn is True
+
+    # B has its own, unrelated turn in the same window ("да") — this must NOT count as A's
+    # answer, and B's confirm must not commit A's task.
+    flow.note_user_turn("да", now=1.0, thread_id="B")
+    foreign_affirm = flow.confirm("confirm", now=1.0, thread_id="B")
+    assert foreign_affirm.outcome == ConfirmDecisionOutcome.REJECTED
+    assert store.task is not None
+    assert store.task.status == TaskStatus.PENDING_CONFIRMATION
+    assert flow.staged is not None
+    assert flow.staged.task_id == submit_res.task_id
+    assert flow.staged.awaiting_user_turn is True  # B's turn must not have cleared A's key
+
+    # C's own "нет" must not reset A's task either — _reset is the OWNER's decision, and a
+    # stranger declining on A's behalf is just as illegitimate as a stranger confirming.
+    flow.note_user_turn("нет", now=1.5, thread_id="C")
+    foreign_deny = flow.confirm("deny", now=1.5, thread_id="C")
+    assert foreign_deny.outcome == ConfirmDecisionOutcome.REJECTED
+    assert store.task is not None
+    assert store.task.status == TaskStatus.PENDING_CONFIRMATION
+    assert flow.staged is not None
+
+    # Positive half: A's own turn actually confirms it — proves the guard discriminates
+    # "foreign" from "owner" rather than just rejecting everything.
+    flow.note_user_turn("да, подтверждаю", now=2.0, thread_id="A")
+    own = flow.confirm("confirm", now=2.0, thread_id="A")
+    assert own.outcome == ConfirmDecisionOutcome.COMMITTED
+    assert own.task_id == submit_res.task_id
+    assert store.task.status == TaskStatus.RUNNING

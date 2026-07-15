@@ -105,9 +105,9 @@ async def test_b14_same_turn_different_args_not_deduped(tmp_path):
     submitted_texts: list[str] = []
     original_submit = confirm_flow.submit
 
-    def spy_submit(text, now):
+    def spy_submit(text, now, thread_id=None):
         submitted_texts.append(text)
-        return original_submit(text, now)
+        return original_submit(text, now, thread_id=thread_id)
 
     confirm_flow.submit = spy_submit  # type: ignore[method-assign]
 

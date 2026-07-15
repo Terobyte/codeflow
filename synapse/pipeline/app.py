@@ -393,7 +393,14 @@ class SynapseHost:
             if model is not None and model not in _KORA_MODELS:
                 return {"error": "invalid_model"}
             if action == "revise":
-                # revise не запускает ран — launch_lock не нужен.
+                # B-BRIDGE-7: busy-чек, как у launch-веток ниже. Без него revise двигал стадию на
+                # "collect" при ЖИВОМ ране: UI показывает «сбор» (правило UI-4: Кора не работает),
+                # а под ним синглтон-стор держит задачу RUNNING — и её колбэк завершения потом
+                # переставит стадию сам, поверх «сбора». Отмену ран_а revise не выдумывает: она
+                # разрушительна и остаётся явным действием пользователя (request_cancel), после
+                # которого revise проходит. launch_lock тут не нужен — стадию мы не двигаем.
+                if self.kora_runner is not None and self.store.has_active_task():
+                    return {"error": "busy"}
                 try:
                     self.threads.set_stage(thread_id, "collect")
                 except ValueError:
@@ -797,6 +804,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         projects=projects,
         threads=threads,
         thread_id_for=lambda: voice_thread["id"],
+        channel="voice",  # B-BRIDGE-6: скоуп confirm-а, пока авто-тред ещё не родился
     )
     handlers = ToolHandlers(bridge, journal)
 
@@ -814,6 +822,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         projects=projects,
         threads=threads,
         thread_id_for=lambda: current_http_thread["id"],
+        channel="http",  # B-BRIDGE-6: HTTP-ход всегда несёт тред; сентинел — страховка
     )
 
     def _http_task_committed(task_id: str, text: str) -> None:
@@ -994,7 +1003,11 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
             record = host.journal.begin_turn(transcript)
             host.handlers.begin_turn(record.turn_id)
             # R3: every user turn must reach confirm_flow.note_user_turn() before the LLM runs.
-            host.confirm_flow.note_user_turn(transcript, host.clock.now())
+            # B-BRIDGE-6: со скоупом разговора — то же выражение, что у KoraBridge.confirm_scope()
+            # голосового моста (`тред или канал`), иначе ключи (a) и (b) считали бы разный
+            # разговор и подтвердить задачу стало бы нечем.
+            host.confirm_flow.note_user_turn(transcript, host.clock.now(),
+                                             thread_id=host.voice_thread["id"] or "voice")
             # С3: fan-out на ApprovalService — тот же user turn кормит и confirm-flow, и
             # approval-flow (gate_action). Ключится по голосовому треду.
             if host.approvals is not None:

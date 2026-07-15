@@ -78,6 +78,8 @@ class _Staged:
     rereadback_count: int = 0
     awaiting_user_turn: bool = True
     last_readback_ts: float = 0.0
+    # B-BRIDGE-6: разговор, в котором задача поставлена. Оба ключа обязаны прийти ИЗ НЕГО.
+    thread_id: str | None = None
 
 
 class ConfirmFlow:
@@ -100,8 +102,12 @@ class ConfirmFlow:
         self._deny_words = deny_words
         self._max_rereadbacks = max_rereadbacks
         self._confirm_timeout_s = confirm_timeout_s
-        self._last_user_turn_transcript = ""
-        self._last_user_turn_ts: float | None = None
+        # B-BRIDGE-6: транскрипт последнего user turn — ПЕР-РАЗГОВОР, а не одно поле на процесс.
+        # Один ConfirmFlow обслуживает все треды и оба канала (app.py: bridge/http_bridge/
+        # text_loop/host держат ОДИН объект), поэтому единственное поле означало: реплика из
+        # любого разговора кормит ключ (b) для задачи, поставленной в другом. Так же, как это
+        # уже сделано у брата-механизма — ApprovalService._last_user_turn (approvals.py:90).
+        self._last_user_turn: dict[str, tuple[str, float]] = {}
 
         self._staged: _Staged | None = None
         persisted = store.staged
@@ -113,6 +119,14 @@ class ConfirmFlow:
                 self._staged = _Staged(**persisted)
             except (TypeError, ValueError):
                 self._staged = None
+            # B-BRIDGE-6: блоб, записанный ДО скоупинга, не несёт разговора-владельца — значит
+            # подтвердить его не может никто (оба ключа обязаны прийти из известного разговора),
+            # и он навсегда занял бы синглтон-стор. Роняем: неатрибутируемая необратимая задача
+            # не переживает рестарт. Ниже её висящий PENDING_CONFIRMATION добьёт B12-реконсиляция
+            # (тот же путь, что для «блоб потерян»), и пользователь ставит задачу заново.
+            if self._staged is not None and self._staged.thread_id is None:
+                self._staged = None
+                store.set_staged(None)
         # B12: reconcile the crash-between-writes scar. A PENDING_CONFIRMATION task with NO staged
         # blob (submit persisted start_task but died before set_staged, pre-atomic-stage_task) can
         # never be resolved by the normal flow — has_active_task() blocks every submit while
@@ -128,7 +142,10 @@ class ConfirmFlow:
     def staged(self) -> _Staged | None:
         return self._staged
 
-    def submit(self, text: str, now: float) -> SubmitResult:
+    def submit(self, text: str, now: float, thread_id: str | None = None) -> SubmitResult:
+        """`thread_id` — разговор, ставящий задачу. Для необратимой он становится ЕДИНСТВЕННЫМ,
+        чей ответ её подтверждает (B-BRIDGE-6). Вызывающий обязан дать непустой скоуп: канал без
+        треда — это тоже один разговор, и у него есть свой сентинел (tools.py: `channel`)."""
         if self._store.has_active_task():
             return SubmitResult(
                 outcome=ConfirmOutcome.REJECTED_ACTIVE,
@@ -140,6 +157,7 @@ class ConfirmFlow:
             self._staged = _Staged(
                 task_id=task_id, text=text, readback_text=readback,
                 rereadback_count=0, awaiting_user_turn=True, last_readback_ts=now,
+                thread_id=thread_id,
             )
             # B12: ONE atomic persist for task + staged. The old two-write pair (start_task then
             # set_staged) had a crash window that wedged the flow forever if it hit between them.
@@ -149,15 +167,23 @@ class ConfirmFlow:
         self._store.start_task(task_id, text, TaskStatus.RUNNING, now)
         return SubmitResult(outcome=ConfirmOutcome.COMMITTED, task_id=task_id)
 
-    def note_user_turn(self, transcript: str, now: float) -> None:
+    def note_user_turn(self, transcript: str, now: float, thread_id: str | None = None) -> None:
         """R3: the dispatcher loop MUST call this for every user turn, before the LLM runs
-        — this is half (a) of the double-key check in confirm()."""
-        self._last_user_turn_transcript = transcript
-        self._last_user_turn_ts = now
-        if self._staged is not None:
+        — this is half (a) of the double-key check in confirm().
+
+        B-BRIDGE-6: ключится по разговору. Реплика без скоупа не кормит НИЧЕГО: неизвестно, чей
+        это ответ, а «неизвестно» не имеет права снимать половину ключа с необратимой задачи.
+        Снять `awaiting_user_turn` может только ход ТОГО разговора, что задачу поставил —
+        раньше это делал любой, и посторонний ход открывал чужой staged к подтверждению."""
+        if thread_id is None:
+            return
+        self._last_user_turn[thread_id] = (transcript, now)
+        if self._staged is not None and self._staged.thread_id == thread_id:
             self._staged.awaiting_user_turn = False
 
-    def confirm(self, llm_decision: str, now: float) -> ConfirmResult:
+    def confirm(self, llm_decision: str, now: float, thread_id: str | None = None) -> ConfirmResult:
+        """`thread_id` — разговор, из которого пришёл confirm_task. Оба ключа Р-16 обязаны
+        принадлежать разговору, поставившему задачу (B-BRIDGE-6)."""
         if self._staged is None:
             return ConfirmResult(
                 outcome=ConfirmDecisionOutcome.REJECTED,
@@ -175,6 +201,19 @@ class ConfirmFlow:
                 outcome=ConfirmDecisionOutcome.REJECTED,
                 text="Эта задача уже не ждёт подтверждения.",
             )
+        # B-BRIDGE-6: скоуп-гвард СТРОГО до обоих ключей. Задачу подтверждает только тот
+        # разговор, что её поставил: посторонний confirm не должен ни запускать её, ни гасить
+        # (`_reset` по «нет» из чужого треда — тоже чужое решение), ни жечь re-readback-бюджет.
+        # None-скоуп сюда доходить не должен — все прод-точки резолвят разговор (тред или
+        # сентинел канала); если дошёл, значит ход неатрибутируем, и это отказ, а не «сойдёт».
+        if thread_id is None or self._staged.thread_id is None or self._staged.thread_id != thread_id:
+            self._journal.alert(AlertKind.CONFIRM_SELF_ATTEMPT,
+                                {"task_id": self._staged.task_id, "reason": "foreign_thread",
+                                 "staged_thread": self._staged.thread_id, "from_thread": thread_id})
+            return ConfirmResult(
+                outcome=ConfirmDecisionOutcome.REJECTED,
+                text="Эту задачу подтверждает только тот разговор, в котором она поставлена.",
+            )
         if self._staged.awaiting_user_turn:
             self._journal.alert(AlertKind.CONFIRM_SELF_ATTEMPT, {"task_id": self._staged.task_id})
             return ConfirmResult(
@@ -184,7 +223,9 @@ class ConfirmFlow:
         if now - self._staged.last_readback_ts >= self._confirm_timeout_s:
             return self._reset("подтверждение не разобрал, задача отложена")
 
-        response = _classify_response(self._last_user_turn_transcript, self._affirm_words, self._deny_words)
+        noted = self._last_user_turn.get(thread_id)
+        transcript = noted[0] if noted is not None else ""
+        response = _classify_response(transcript, self._affirm_words, self._deny_words)
         if response == "deny":
             return self._reset("хорошо, задачу отменяю")
         if response == "unclear":

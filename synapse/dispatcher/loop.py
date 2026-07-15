@@ -184,7 +184,10 @@ class DispatcherTurnLoop:
         self._handlers.begin_turn(record.turn_id)
 
         # R3: MUST run before the LLM call — half (a) of Р-16's double-key confirm check.
-        self._confirm_flow.note_user_turn(transcript, now)
+        # B-BRIDGE-6: со скоупом разговора. thread_id здесь — тот же, что увидит
+        # KoraBridge.confirm_scope() на tool-пути этого хода (роут выставляет
+        # current_http_thread до ingest; дефолт "voice" совпадает с сентинелом канала).
+        self._confirm_flow.note_user_turn(transcript, now, thread_id=thread_id)
         # С3: fan-out на ApprovalService (gate_action) — тот же user turn кормит approval-flow.
         # Хост передаёт опциональный колбэк; для стабов/консоли без approvals он None.
         if self._on_user_turn is not None:

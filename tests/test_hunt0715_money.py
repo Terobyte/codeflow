@@ -1,4 +1,4 @@
-# -*- coding: utf-8-sig -*-
+﻿# -*- coding: utf-8-sig -*-
 """Red tests proving B-CASC-5, B-DISP-8, B-DISP-9 from docs/bugs.md ("Hunt 2026-07-15
 (вечер) -- Фаза 0: auth + money"). One test per bug ID. Each test is written so the
 CORRECT (documented) behavior is the pass condition -- these are expected to FAIL against
@@ -214,7 +214,6 @@ def _build_api_host(tmp_path, llm):
 # ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="B-DISP-8 доказан, не починен — см. bugs.md, Hunt 2026-07-15 (вечер)")
 async def test_b_disp_8_empty_provider_response_not_silently_ok(tmp_path):
     webrtc_server = _webrtc_or_skip()
 
@@ -257,7 +256,6 @@ async def test_b_disp_8_empty_provider_response_not_silently_ok(tmp_path):
 # ---------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="B-DISP-9 доказан, не починен — см. bugs.md, Hunt 2026-07-15 (вечер)")
 async def test_b_disp_9_late_pass_failure_after_committed_tool_call_lies_about_state(tmp_path):
     webrtc_server = _webrtc_or_skip()
 

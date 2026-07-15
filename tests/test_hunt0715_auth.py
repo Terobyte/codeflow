@@ -38,7 +38,6 @@ def _confirm_flow(tmp_path, max_rereadbacks=2, confirm_timeout_s=30.0):
     return flow, store, clock, journal
 
 
-@pytest.mark.xfail(strict=True, reason="B-BRIDGE-6 доказан, не починен — см. bugs.md, Hunt 2026-07-15 (вечер)")
 def test_b_bridge_6_confirm_flow_not_thread_scoped(tmp_path):
     """B-BRIDGE-6 (CRIT): ConfirmFlow has no `thread_id` anywhere in its API — `_staged` and
     `_last_user_turn_transcript` are single process-wide fields (confirm.py:103-106, 152-158).
@@ -116,19 +115,22 @@ def _propose(host):
     return t
 
 
-@pytest.mark.xfail(strict=True, reason="B-BRIDGE-7 доказан, не починен — см. bugs.md, Hunt 2026-07-15 (вечер)")
 async def test_b_bridge_7_revise_stage_lies_about_active_task(tmp_path):
-    """B-BRIDGE-7 (MAJOR): gate_action's `revise` branch (app.py:395-413) calls
+    """B-BRIDGE-7 (MAJOR): gate_action's `revise` branch (app.py:395-413) used to call
     `set_stage(thread_id, "collect")` unconditionally — no `store.has_active_task()` check,
-    unlike the launch branches right below it (app.py:421). The registry flags this
-    design-tension (maybe revise should keep the run alive and only fix the bookkeeping, maybe
-    it should cancel the run outright — the owner hasn't decided), so this test does NOT
-    assert revise must cancel anything. It asserts the one thing that is unambiguously a lie
-    no matter which fix is chosen: the thread must never simultaneously claim
-    stage == "collect" (UI-4's own rule — collect means Kora is not running) while
-    `store.has_active_task()` is True. Either fix (block revise while busy, or actually cancel
-    the run) makes this combination impossible; today's code produces it on a routine
-    sequence: launch, then revise before completion.
+    unlike the launch branches right below it (app.py:421). The registry flagged a genuine
+    design-tension the OWNER had to resolve — revise could keep the run alive and only fix the
+    bookkeeping (block while busy), or it could actually cancel the run outright — so this test
+    does NOT pin which of the two the fix picks, and deliberately does NOT assert anything
+    about what `revise` *returns*: an unconditional `result.get("ok") is True` would itself
+    outlaw the "block" branch, since a legitimately blocked revise answers
+    `{"error": "busy"}` and has no `ok` key at all. It asserts only the one INVARIANT that is
+    unambiguously a lie no matter which fix is chosen: the thread must never simultaneously
+    claim stage == "collect" (UI-4's own rule — collect means Kora is not running) while
+    `store.has_active_task()` is True. Both legal fixes make this combination impossible
+    (block: stage never moves off "code" while busy; cancel: the run stops being active
+    before/as stage moves to "collect"); the pre-fix code violated it on a routine sequence:
+    launch, then revise before completion.
     """
     host = _gate_host(tmp_path)
     t = _propose(host)
@@ -138,12 +140,12 @@ async def test_b_bridge_7_revise_stage_lies_about_active_task(tmp_path):
     assert launch.get("stage") == "code"
     assert host.store.has_active_task() is True  # sanity: the run is genuinely active
 
-    result = await host.gate_action(t.id, "revise", user_initiated=True)
-    assert result.get("ok") is True  # revise "succeeds" per the current contract
+    await host.gate_action(t.id, "revise", user_initiated=True)
 
     th = host.threads.get(t.id)
-    # The lie: UI now shows stage "collect" ("сбор" — rules say Kora is not running) while the
-    # store underneath still has the FakeRunner's task RUNNING.
+    # The invariant, independent of which fix `revise` implements: the thread must never claim
+    # stage "collect" ("сбор" — rules say Kora is not running) while the store underneath still
+    # has an active task RUNNING.
     assert not (th.stage == "collect" and host.store.has_active_task())
 
 
@@ -159,7 +161,6 @@ def _approval_digest(request_text="сделай X", action="send_to_kora", model
     return gate_digest(request_text, action, model, fast, stage)
 
 
-@pytest.mark.xfail(strict=True, reason="B-BRIDGE-8 доказан, не починен — см. bugs.md, Hunt 2026-07-15 (вечер)")
 def test_b_bridge_8_deny_is_indistinguishable_from_unclear():
     """B-BRIDGE-8 (MINOR): ApprovalService.consume() folds `deny` and `unclear` into the same
     `None` (approvals.py:140-144) — there is no "rejected" transition at all. Sibling
@@ -242,15 +243,29 @@ def _sequential_client_factory(gen_funcs):
     return factory
 
 
-@pytest.mark.xfail(strict=True, reason="B-BRIDGE-9 доказан, не починен — см. bugs.md, Hunt 2026-07-15 (вечер)")
 async def test_b_bridge_9_gate_decision_read_side_has_no_identity_guard(tmp_path):
     """B-BRIDGE-9 (MAJOR): `_run_root`/`_run_gate_mode` are plain KoraRunner instance fields,
-    shared by every run. The WRITE side (the `finally` in `_run`, kora.py:512-517) is guarded
+    shared by every run. The WRITE side (the `finally` in `_run`, kora.py:513-518) is guarded
     by task identity (`if self._run_owner == task_id`) so a superseded run's teardown cannot
-    clobber its successor's snapshot. The READ side — `_gate_decision` (kora.py:642-762),
-    reached from the PreToolUse hook that is the whole containment boundary — has NO such
-    guard: it takes no `task_id` at all and simply trusts whatever the fields hold at the
-    moment it runs.
+    clobber its successor's snapshot. The READ side — `_gate_decision` (kora.py:648-782),
+    reached from the PreToolUse hook that is the whole containment boundary — used to have NO
+    such guard at all: it took no `task_id` and simply trusted whatever the fields held at the
+    moment it ran.
+
+    Fixed shape: `_gate_decision(tool_name, tool_input, task_id=None)` now fail-closes any call
+    that carries the identity of a run which no longer owns the snapshot (`task_id=None` stays
+    exempt — that is a bare unit-call of the predicate, not a real tool dispatch). A REAL tool
+    call always carries its own run's identity: `_build_options` binds it once per run via
+    `functools.partial(self._pretool_hook, task_id=task_id)`, and `_pretool_hook` forwards it
+    into `_gate_decision`. So the correct assertion here is NOT "a call with no task_id is still
+    judged by task A's docs_only rules" — an identity-less call structurally cannot know whose
+    call it is, and no fix could make it resolve to a particular run's rules. The correct
+    assertion is: a call carrying task A's identity, made AFTER task B's launch overwrote the
+    shared snapshot, must be denied outright as `superseded_run` — never silently evaluated
+    under task B's `full`/`root_b` rules (that would wrongly ALLOW it), and never resurrected
+    under task A's OWN stale `docs_only`/`root_a` rules either (a superseded run has no rules
+    left, period — the write may or may not have been legal for the task that no longer owns
+    the run, and that question no longer matters).
 
     Reproduced with the exact sequence the ledger names as reachable by "an ordinary pair of
     actions" (tools.py:309-318 request_cancel → kora.py:467-472 fire-and-forget cancel opens
@@ -259,7 +274,7 @@ async def test_b_bridge_9_gate_decision_read_side_has_no_identity_guard(tmp_path
     interleaving is forced with explicit `asyncio.Event` synchronization — not a scheduling
     race — so the outcome is deterministic: task A's run is driven up to (and parked at) its
     first fully-snapshotted, in-flight point, then task B genuinely launches and reaches the
-    same point, and ONLY THEN is a tool-call belonging to task A evaluated again.
+    same point, and ONLY THEN is a tool-call carrying task A's identity evaluated again.
     """
     reached_a = asyncio.Event()
     release_a = asyncio.Event()
@@ -291,10 +306,11 @@ async def test_b_bridge_9_gate_decision_read_side_has_no_identity_guard(tmp_path
     assert runner._run_root == root_a
     assert runner._current_gate_mode() == "docs_only"
 
-    # Sanity: the decision an in-flight PreToolUse hook for task A is entitled to, RIGHT NOW —
-    # a mutating write outside docs/ is denied because task A is docs_only.
+    # Sanity: the decision an in-flight PreToolUse hook for task A is entitled to, RIGHT NOW,
+    # carrying task A's OWN identity — a mutating write outside docs/ is denied because task A
+    # is docs_only.
     allowed_before, _, category_before = runner._gate_decision(
-        "Write", {"file_path": str(root_a / "src" / "main.py")}
+        "Write", {"file_path": str(root_a / "src" / "main.py")}, task_id="taskA",
     )
     assert allowed_before is False
     assert category_before == "docs_only_violation"
@@ -314,19 +330,31 @@ async def test_b_bridge_9_gate_decision_read_side_has_no_identity_guard(tmp_path
     assert runner._run_root == root_b
     assert runner._current_gate_mode() == "full"
 
-    # The exact same tool call that was correctly denied for task A a moment ago — standing in
-    # for task A's in-flight PreToolUse hook still resolving its containment decision for a
-    # tool call dispatched under task A — is evaluated again here.
+    # The exact same call, still carrying task A's identity, made again NOW — standing in for
+    # task A's in-flight PreToolUse hook still resolving its containment decision for a tool
+    # call dispatched under task A.
     allowed_after, _, category_after = runner._gate_decision(
-        "Write", {"file_path": str(root_a / "src" / "main.py")}
+        "Write", {"file_path": str(root_a / "src" / "main.py")}, task_id="taskA",
     )
 
-    # CORRECT/documented behavior: a decision for task A's tool call must still be governed by
-    # task A's OWN gate_mode (docs_only) — task B's launch must not be able to change what
-    # task A is allowed to do. actual (bug): `_gate_decision` has no task_id/identity check, so
-    # it reads task B's gate_mode ("full") instead and the SAME write flips to allowed.
+    # CORRECT/documented behavior: a run that lost ownership of the snapshot has no rules left
+    # to be judged by — neither task B's ("full"/root_b, which would wrongly ALLOW the write)
+    # nor a silent fallback to its own stale ("docs_only"/root_a) rules. It must be denied as
+    # superseded, full stop. actual (bug, pre-fix): `_gate_decision` had no task_id/identity
+    # check at all, so it read task B's gate_mode ("full") for a path outside task B's root and
+    # ALLOWED the write outright.
     assert allowed_after is False
-    assert category_after == "docs_only_violation"
+    assert category_after == "superseded_run"
+
+    # The real containment boundary is the PreToolUse hook, not the bare predicate — prove the
+    # SAME denial through it end-to-end, exactly as a real tool dispatch would reach it.
+    hook_result = await runner._pretool_hook(
+        {"tool_name": "Write", "tool_input": {"file_path": str(root_a / "src" / "main.py")}},
+        None, None, task_id="taskA",
+    )
+    hook_out = hook_result["hookSpecificOutput"]
+    assert hook_out["permissionDecision"] == "deny"
+    assert hook_out["permissionDecisionReason"] == "superseded_run"
 
     # Cleanup: release both parked runs so nothing is left dangling after the test.
     release_a.set()
