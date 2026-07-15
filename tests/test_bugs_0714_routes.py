@@ -102,7 +102,8 @@ def test_B51_string_false_confirm_must_not_be_treated_as_confirmed():
             self.threads = MagicMock()
             self.threads.get.return_value = _DummyThread()  # non-None -> route proceeds
 
-        async def gate_action(self, thread_id, action, model=None, confirm=False, fast=False):
+        async def gate_action(self, thread_id, action, model=None, confirm=False, fast=False,
+                              user_initiated=True):
             captured["confirm"] = confirm
             captured["fast"] = fast
             return {"ok": True, "stage": "spec_plan"}

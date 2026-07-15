@@ -677,6 +677,9 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             # строгий JSON-bool — строка "false" не должна проходить confirmation-гейт (B51)
             confirm=data.get("confirm") is True,
             fast=data.get("fast") is True,
+            # С3 (Ф0.3): HTTP-клик несёт подтверждение живого пользователя — ApprovalService
+            # выключен на этом пути (клик = второй ключ). Голосовой tool-путь идёт с False.
+            user_initiated=True,
         )
         error = result.get("error")
         if error:

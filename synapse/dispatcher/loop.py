@@ -82,6 +82,7 @@ class DispatcherTurnLoop:
         stage_block_for: Callable[[str], str] | None = None,
         on_compact: Callable[[str], None] | None = None,
         owner_thread_for: Callable[[str], str | None] | None = None,
+        on_user_turn: Callable[[str, str, float], None] | None = None,
     ) -> None:
         self._llm = llm
         self._handlers = handlers
@@ -96,6 +97,8 @@ class DispatcherTurnLoop:
         self._stage_block_for = stage_block_for
         # UI-5 (S10): колбэк на факт компакта истории треда (лента пишет event «контекст сжат»).
         self._on_compact = on_compact
+        # С3: fan-out user turn на ApprovalService (опционально — стабы/консоль без approvals).
+        self._on_user_turn = on_user_turn
         # Резолвер «id треда-владельца задачи» — скоуп терминальной задачи к её треду в
         # [СОСТОЯНИЕ] (иначе завершённая задача течёт во все треды, see should_hide_task).
         self._owner_thread_for = owner_thread_for
@@ -158,6 +161,10 @@ class DispatcherTurnLoop:
 
         # R3: MUST run before the LLM call — half (a) of Р-16's double-key confirm check.
         self._confirm_flow.note_user_turn(transcript, now)
+        # С3: fan-out на ApprovalService (gate_action) — тот же user turn кормит approval-flow.
+        # Хост передаёт опциональный колбэк; для стабов/консоли без approvals он None.
+        if self._on_user_turn is not None:
+            self._on_user_turn(thread_id, transcript, now)
 
         had_active_task = self._store.has_active_task()
         history = self._history_for(thread_id)

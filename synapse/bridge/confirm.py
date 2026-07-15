@@ -9,11 +9,11 @@ affirm-check must agree, disagreement is a reject.
 from __future__ import annotations
 
 import itertools
-import re
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Iterable, Protocol
 
+from synapse.bridge.affirm import _classify_response
 from synapse.bridge.state import TaskStatus, TaskStore
 from synapse.clock import Clock
 from synapse.journal import AlertKind, TurnJournal
@@ -23,26 +23,6 @@ _task_id_counter = itertools.count(1)
 
 def _new_task_id(now: float) -> str:
     return f"task-{int(now * 1000)}-{next(_task_id_counter)}"
-
-
-_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
-
-
-def _normalize(text: str) -> str:
-    return _PUNCT_RE.sub("", text.lower()).strip()
-
-
-def _words(text: str) -> set[str]:
-    return set(_normalize(text).split())
-
-
-def _classify_response(text: str, affirm_words: frozenset[str], deny_words: frozenset[str]) -> str:
-    words = _words(text)
-    if words & deny_words:
-        return "deny"
-    if words & affirm_words:
-        return "affirm"
-    return "unclear"
 
 
 class DestructiveClassifier(Protocol):

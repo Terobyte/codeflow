@@ -33,6 +33,7 @@ from pipecat.services.fish.tts import FishAudioTTSService
 from pathlib import Path
 
 from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
+from synapse.bridge.approvals import ApprovalService, gate_digest
 from synapse.bridge.kora import KoraRunner
 from synapse.bridge.runspec import RunSpec
 from synapse.bridge.state import Liveness, SpeakLedger, TaskStore
@@ -110,6 +111,7 @@ class SynapseHost:
         handlers: ToolHandlers,
         breaker: CircuitBreaker,
         cost_cap: CostCap,
+        approvals: ApprovalService | None = None,
         kora_runner: KoraRunner | None = None,
         kora_log: deque | None = None,
         threads: Any = None,
@@ -132,6 +134,8 @@ class SynapseHost:
         self.handlers = handlers
         self.breaker = breaker
         self.cost_cap = cost_cap
+        # С3: двухключевой контракт gate_action. None в стабах (тесты, не-гейт-сценарии).
+        self.approvals = approvals
         # The real Kora producer (M1 slice 1), held on the host so its single in-flight task
         # survives WebRTC reconnects like the rest of the long-lived state. None when disabled.
         self.kora_runner = kora_runner
@@ -337,10 +341,15 @@ class SynapseHost:
 
     async def gate_action(self, thread_id: str, action: str,
                           model: str | None = None, confirm: bool = False,
-                          fast: bool = False) -> dict:
+                          fast: bool = False, user_initiated: bool = True) -> dict:
         """Единая хост-функция гейта (UI-4): её зовёт и POST /api/threads/{id}/gate, и голосовой
         инструмент диспетчера gate_action. СТРОГИЙ порядок: тред → per-thread lock → валидация
-        модели → busy-чек ДО set_stage → ветвление. Возвращает dict с ok/error."""
+        модели → busy-чек ДО set_stage → ветвление. Возвращает dict с ok/error.
+
+        С3 (Ф0.3): user_initiated различает каналы. HTTP-клик (user_initiated=True) несёт
+        подтверждение живого пользователя — ApprovalService не требуется. Голосовой tool-путь
+        (user_initiated=False): confirm=true из tool call больше не власть — запуск требует
+        двухключевого approval (readback → user turn → affirm + совпадение digest со стадией)."""
         th = self.threads.get(thread_id) if self.threads is not None else None
         if th is None:
             return {"error": "unknown_thread"}
@@ -366,6 +375,9 @@ class SynapseHost:
                 # plan. Reset the outcome so write_code refuses (stale_plan) until a fresh spec_plan
                 # completes for the new request.
                 self.threads.set_outcome(thread_id, None)
+                # С3: revise меняет стадию на collect — pending approval (если был staged) инвалидируется.
+                if self.approvals is not None:
+                    self.approvals.invalidate(thread_id)
                 self.threads.append_feed(thread_id,
                                          {"ts": self.clock.now(), "kind": "event", "text": "правки → сбор"})
                 return {"ok": True, "stage": "collect"}
@@ -378,8 +390,19 @@ class SynapseHost:
                     # busy-чек ДО set_stage: запуск-действия не должны двигать стадию на занятом синглтоне
                     if self.kora_runner is not None and self.store.has_active_task():
                         return {"error": "busy"}
+                    # С3 (Ф0.3): голосовой путь (user_initiated=False) — двухключевой approval.
+                    # confirm=true из tool call не читается как власть; HTTP-клик (user_initiated=True)
+                    # несёт подтверждение сам, ApprovalService в этом случае выключен. digest несёт И
+                    # стадию: любое движение стадии между stage() и consume() инвалидирует pending.
+                    if not user_initiated and self.approvals is not None:
+                        digest = gate_digest(th.request_text, action, model, fast, th.stage)
+                        approval = self.approvals.consume(thread_id, action, digest, self.clock.now())
+                        if approval is None:
+                            readback = self.approvals.stage(thread_id, action, digest, self.clock.now())
+                            return {"error": "confirm_required", "readback": readback}
                     if action == "send_to_kora":
-                        if not confirm:
+                        # user_initiated-путь: confirm=true из клика всё ещё нужен (belt+suspenders).
+                        if user_initiated and not confirm:
                             return {"error": "confirm_required"}
                         request_text = th.request_text
                         if not request_text:
@@ -401,7 +424,7 @@ class SynapseHost:
                             return {"error": "illegal_stage"}
                         return {"ok": True, "stage": target_stage}
                     if action == "write_code":
-                        if not confirm:
+                        if user_initiated and not confirm:
                             return {"error": "confirm_required"}
                         # план-файл должен существовать И последняя SPEC_PLAN — completed (иначе stale_plan:
                         # устаревший файл от провалившейся попытки не должен пускать CODE)
@@ -501,6 +524,10 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         store, clock, classifier, journal,
         cfg.affirm_words, cfg.deny_words, cfg.max_rereadbacks, cfg.confirm_timeout_s,
     )
+    # С3 (Ф0.3): ApprovalService — двухключевой контракт gate_action. confirm=true из tool call
+    # больше не власть: голосовой запуск требует readback → user turn → affirm + совпадение digest.
+    # TTL = тот же confirm_timeout_s (единый бюджет подтверждения для обоих сервисов).
+    approvals = ApprovalService(clock, cfg.confirm_timeout_s, cfg.affirm_words, cfg.deny_words)
 
     arbiter_policy = ArbiterPolicy()
 
@@ -600,6 +627,10 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             threads.set_stage(th.id, "propose")
         except ValueError:
             return {"outcome": "illegal_stage"}
+        # С3 (Ф0.3): смена СВОДА инвалидирует pending approval этого треда (digest несёт
+        # request_text — он бы и сам не совпал, но явный invalidate чистит pending сразу, не
+        # дожидаясь consume). НЕ внутри ThreadStore — обратная зависимость threads→bridge запрещена.
+        approvals.invalidate(th.id)
         threads.append_feed(th.id, {
             "ts": clock.now(), "kind": "gate_card", "stage": "propose", "action": "send_to_kora",
         })
@@ -620,16 +651,24 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         return _propose_for(tid, text)
 
     async def _gate_for(thread_id: str | None, action: str, *, model: str | None = None,
-                        confirm: bool = False, fast: bool = False) -> dict:
+                        confirm: bool = False, fast: bool = False,
+                        user_initiated: bool = False) -> dict:
         if thread_id is None:
             return {"outcome": "no_active_thread"}
-        return await _h["host"].gate_action(thread_id, action, model=model, confirm=confirm, fast=fast)
+        return await _h["host"].gate_action(
+            thread_id, action, model=model, confirm=confirm, fast=fast,
+            user_initiated=user_initiated,
+        )
 
     async def _voice_gate(action: str, **kwargs: Any) -> dict:
-        return await _gate_for(voice_thread["id"], action, **kwargs)
+        # С3: голосовой tool-путь — user_initiated=False → двухключевой approval (confirm=true из
+        # tool call больше не власть). readback возвращается в результата, Кора озвучит его.
+        return await _gate_for(voice_thread["id"], action, user_initiated=False, **kwargs)
 
     async def _http_gate(action: str, **kwargs: Any) -> dict:
-        return await _gate_for(current_http_thread["id"], action, **kwargs)
+        # С3: HTTP tool-путь — user_initiated=False (это тоже LLM-канал, не клик). Реальный
+        # HTTP-клик идёт через POST /api/threads/{id}/gate с user_initiated=True.
+        return await _gate_for(current_http_thread["id"], action, user_initiated=False, **kwargs)
 
     def _project_bound(project_id: str) -> dict:
         return {"outcome": "project_bound", "project_id": project_id}
@@ -748,6 +787,10 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             owner_thread_for=lambda task_id: (
                 th.id if (th := threads.thread_for_task(task_id)) else None
             ),
+            on_user_turn=(
+                lambda tid, tr, now: approvals.note_user_turn(tid, tr, now)
+                if approvals is not None else None
+            ),
         )
 
     # breaker needs only the tier COUNT, not the service instances themselves -- those are
@@ -771,6 +814,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         handlers=handlers,
         breaker=breaker,
         cost_cap=cost_cap,
+        approvals=approvals,
         kora_runner=kora_runner,
         kora_log=kora_log,
         threads=threads,
@@ -876,6 +920,10 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
             host.handlers.begin_turn(record.turn_id)
             # R3: every user turn must reach confirm_flow.note_user_turn() before the LLM runs.
             host.confirm_flow.note_user_turn(transcript, host.clock.now())
+            # С3: fan-out на ApprovalService — тот же user turn кормит и confirm-flow, и
+            # approval-flow (gate_action). Ключится по голосовому треду.
+            if host.approvals is not None:
+                host.approvals.note_user_turn(host.voice_thread["id"], transcript, host.clock.now())
             # UI-4: voice uses pipecat's own live context, not DispatcherTurnLoop. Refresh the
             # single system item in place before the user aggregator starts generation, keeping
             # its accumulated assistant/tool tail intact.

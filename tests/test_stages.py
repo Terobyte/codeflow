@@ -573,9 +573,10 @@ def _http_gate_host(tmp_path, gate_result):
     threads = ThreadStore(FakeClock(1_000_000.0), tmp_path / "threads")
     calls = []
 
-    async def gate_action(thread_id, action, *, model=None, confirm=False, fast=False):
+    async def gate_action(thread_id, action, *, model=None, confirm=False, fast=False,
+                          user_initiated=True):
         calls.append({"thread_id": thread_id, "action": action, "model": model,
-                      "confirm": confirm, "fast": fast})
+                      "confirm": confirm, "fast": fast, "user_initiated": user_initiated})
         return gate_result
 
     host = SimpleNamespace(
@@ -624,7 +625,7 @@ async def test_thread_gate_api_enforces_csrf_proxies_arguments_and_returns_fresh
     assert response.status_code == 200
     assert json.loads(response.body)["stage"] == "propose"
     assert calls == [{"thread_id": thread.id, "action": "send_to_kora", "model": "claude-opus-4-8",
-                      "confirm": True, "fast": True}]
+                      "confirm": True, "fast": True, "user_initiated": True}]
 
 
 @pytest.mark.parametrize(("gate_result", "status"), [
@@ -670,8 +671,9 @@ async def test_gate_action_tool_proxies_host_function_and_none_thread_is_explici
     host = _gate_host(tmp_path)
     calls = []
 
-    async def fake_gate(thread_id, action, *, model=None, confirm=False, fast=False):
-        calls.append((thread_id, action, model, confirm, fast))
+    async def fake_gate(thread_id, action, *, model=None, confirm=False, fast=False,
+                        user_initiated=True):
+        calls.append((thread_id, action, model, confirm, fast, user_initiated))
         return {"ok": True, "stage": "spec_plan"}
 
     host.gate_action = fake_gate
@@ -683,7 +685,7 @@ async def test_gate_action_tool_proxies_host_function_and_none_thread_is_explici
         "send_to_kora", model="claude-sonnet-5", confirm=True, fast=True
     )
     assert result == {"ok": True, "stage": "spec_plan"}
-    assert calls == [(thread.id, "send_to_kora", "claude-sonnet-5", True, True)]
+    assert calls == [(thread.id, "send_to_kora", "claude-sonnet-5", True, True, False)]
 
 
 async def test_bind_project_casefold_unknown_ambiguous_and_guard(tmp_path):
