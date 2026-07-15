@@ -46,6 +46,22 @@ def test_consume_without_intervening_user_turn_returns_none():
     assert svc.consume("th", "send_to_kora", _digest(), now=2.0) is None
 
 
+def test_affirmative_turn_before_readback_cannot_be_reused_for_approval():
+    """An affirmative turn must be *after* stage(), not merely present in the thread.
+
+    The dispatcher records the user's transcript before the LLM gets to call
+    gate_action.  Without a per-thread turn sequence (or equivalent stage
+    watermark), a user saying ``да`` for an earlier operation can be replayed by
+    the model after it stages a fresh approval in the same turn.
+    """
+    svc = _service()
+    # This is the current user turn; stage() happens later during the LLM pass.
+    svc.note_user_turn("th", "да, делай", now=1.0)
+    svc.stage("th", "send_to_kora", _digest(), now=2.0)
+
+    assert svc.consume("th", "send_to_kora", _digest(), now=3.0) is None
+
+
 def test_happy_path_affirm_consumes_once():
     """readback → юзер «да» → consume отдаёт approval, повторный consume → None (одноразов)."""
     svc = _service()

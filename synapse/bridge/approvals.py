@@ -49,6 +49,7 @@ class _Pending:
     thread_id: str
     action: str
     digest: str
+    staged_turn_seq: int
     issued_at: float
     expires_at: float
 
@@ -86,13 +87,18 @@ class ApprovalService:
         # per-thread: один pending на тред (одна активная задача — синглтон).
         self._pending: dict[str, _Pending] = {}
         # последний user-транскрипт (та же точка входа, что ConfirmFlow.note_user_turn).
-        self._last_user_turn: dict[str, str] = {}
+        self._last_user_turn: dict[str, tuple[int, str]] = {}
+        # Monotonic per-thread watermark.  stage() snapshots it; consume() accepts only a
+        # transcript from a strictly newer turn.  Timestamps are not enough: FakeClock and real
+        # clocks may legitimately give stage/user events the same value.
+        self._user_turn_seq: dict[str, int] = {}
 
     def stage(self, thread_id: str, action: str, digest: str, now: float) -> str:
         """Запомнить pending, вернуть readback-текст для озвучки.Pending ждёт user turn + affirm."""
         aid = _new_approval_id(now)
         self._pending[thread_id] = _Pending(
             approval_id=aid, thread_id=thread_id, action=action, digest=digest,
+            staged_turn_seq=self._user_turn_seq.get(thread_id, 0),
             issued_at=now, expires_at=now + self._ttl_s,
         )
         return (f"Запускаю выполнение. Подтверди: «да», или отклони: «нет». "
@@ -101,7 +107,9 @@ class ApprovalService:
     def note_user_turn(self, thread_id: str, transcript: str, now: float) -> None:
         """Та же точка входа, что ConfirmFlow.note_user_turn — хост делает один fan-out
         на оба сервиса. Ключится по thread_id: ответ из треда Б не подтверждает pending треда А."""
-        self._last_user_turn[thread_id] = transcript
+        seq = self._user_turn_seq.get(thread_id, 0) + 1
+        self._user_turn_seq[thread_id] = seq
+        self._last_user_turn[thread_id] = (seq, transcript)
 
     def invalidate(self, thread_id: str) -> None:
         """Явная инвалидация с call site-ов app.py (смена СВОДА: set_request, revise-ветка).
@@ -123,8 +131,11 @@ class ApprovalService:
             self._pending.pop(thread_id, None)
             return None
         # (a) intervening user turn
-        transcript = self._last_user_turn.get(thread_id, "")
-        if not transcript:
+        noted = self._last_user_turn.get(thread_id)
+        if noted is None:
+            return None
+        turn_seq, transcript = noted
+        if turn_seq <= pending.staged_turn_seq:
             return None
         # (b) affirm-проверка транскрипта
         response = classify_affirm(transcript, self._affirm_words, self._deny_words)

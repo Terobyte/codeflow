@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from synapse.cascade.services import CostCap
+from synapse.clock import Clock
 from synapse.dispatcher.tools import ToolCall
 
 _API_URL = "https://api.anthropic.com/v1/messages"
@@ -95,3 +97,44 @@ class AnthropicLLMClient:
                 calls.append(ToolCall(name=block["name"], arguments=block.get("input") or {},
                                       id=block.get("id", "")))
         return "".join(text_parts), calls
+
+
+class CostCapBlocked(RuntimeError):
+    """Ф0.4: дневной лимит платных запросов исчерпан — запрос НЕ уходит в paid tier."""
+
+
+class ProviderUnavailable(RuntimeError):
+    """CR-7: провайдер-сбой (httpx-транспорт) нормализован в один тип для fallback-а."""
+
+
+class GuardedLLMClient:
+    """Обёртка текстового канала (С4): request-time блокировка cost cap ДО сетевого вызова
+    (Ф0.4) + нормализация провайдер-сбоев в ProviderUnavailable для детерминированного
+    fallback-а в роуте (CR-7). Считает КАЖДЫЙ complete — tool-пассы и компакт-вызовы тоже
+    платные. Тот же cost_cap-синглтон, что у голосового каскада: один дневной лимит на оба
+    канала, а не два раздельных.
+
+    Полиморфен с LLMClient (loop.py) — implements complete(). loop/роут не видят разницы
+    между AnthropicLLMClient и GuardedLLMClient; fallback ловит типы исключений в роуте."""
+
+    def __init__(self, inner: AnthropicLLMClient, cost_cap: CostCap, clock: Clock) -> None:
+        self._inner = inner
+        self._cost_cap = cost_cap
+        self._clock = clock
+
+    async def complete(self, messages: list[dict[str, Any]], tools: list[Any]) -> tuple[str, list[ToolCall]]:
+        now = self._clock.now()
+        # Reserve synchronously BEFORE the network await.  A separate tripped-check followed by
+        # a post-response increment lets every concurrent request pass the check and overshoot.
+        # CostCap.record_paid_attempt is the atomic check+reservation seam and also handles the
+        # daily reset.  Provider failures remain attempts: the paid slot was consumed when the
+        # request was admitted, not retroactively after a successful response.
+        if not self._cost_cap.record_paid_attempt(now):
+            raise CostCapBlocked()
+        try:
+            out = await self._inner.complete(messages, tools)
+        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            # CR-7: нормализуем любой провайдер-сбой в один тип → роут даёт детерминированную
+            # реплику вместо 500 без ответа.
+            raise ProviderUnavailable(str(exc)) from exc
+        return out

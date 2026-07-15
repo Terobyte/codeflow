@@ -780,12 +780,21 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         http_bridge.on_task_committed = _http_task_committed
     http_handlers = ToolHandlers(http_bridge, journal)
 
+    # С4 (Ф0.4): cost_cap строится ВЫШЕ text_loop — GuardedLLMClient берёт тот же синглтон,
+    # что голосовой каскад: один дневной лимит на оба канала. cap не зависит от середины build_host.
+    cost_cap = CostCap(cfg.max_paid_calls_per_day, cfg.rpd_reset_hour_utc)
+
     text_loop = None
     if cfg.anthropic_api_key:
-        from synapse.dispatcher.llm_client import AnthropicLLMClient
+        from synapse.dispatcher.llm_client import AnthropicLLMClient, GuardedLLMClient
         from synapse.dispatcher.loop import DispatcherTurnLoop
+        # GuardedLLMClient: request-time блокировка cost cap ДО сетевого вызова + нормализация
+        # провайдер-сбоев в ProviderUnavailable (ловится в роуте → детерминированная реплика).
+        guarded = GuardedLLMClient(
+            AnthropicLLMClient(cfg.anthropic_api_key, cfg.tier2_model), cost_cap, clock,
+        )
         text_loop = DispatcherTurnLoop(
-            AnthropicLLMClient(cfg.anthropic_api_key, cfg.tier2_model),
+            guarded,
             http_handlers, confirm_flow, store, journal, clock, cfg,
             thread_feed_reader=threads.read_feed,
             stage_block_for=_stage_block_for,
@@ -805,7 +814,6 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # discarded immediately after counting.
     _tier_probe, _ = build_tier_services(cfg)
     breaker = CircuitBreaker(len(_tier_probe), cfg.rpm_mute_s, cfg.rpd_reset_hour_utc)
-    cost_cap = CostCap(cfg.max_paid_calls_per_day, cfg.rpd_reset_hour_utc)
 
     host = SynapseHost(
         clock=clock,
