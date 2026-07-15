@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#090b24">
+  <meta name="description" content="CodeFlow redesign prototype — 1:1 functional mirror of the production client, Night Atlas / Hero Drive themes">
+  <title>CodeFlow — Night Atlas</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="ambient" aria-hidden="true">
+    <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+  </div>
+
+  <div class="app-shell" id="shell">
+    <aside class="sidebar" id="sidebar" aria-label="Workspace navigation">
+      <div class="brand-row">
+        <a class="brand" href="#/" aria-label="CodeFlow home">
+          <span class="brand-mark"><span></span></span>
+          <span><b>CodeFlow</b><small id="brand-theme">Night Atlas</small></span>
+        </a>
+        <button class="icon-button close-sidebar" id="close-sidebar" type="button" aria-label="Close navigation">×</button>
+      </div>
+
+      <button class="new-task" id="new-task" type="button"><span>＋</span> New task</button>
+
+      <nav class="side-scroll" aria-label="Projects and threads">
+        <div class="nav-label"><span>Projects</span><button id="add-project" type="button" aria-label="Add project">＋</button></div>
+        <ul class="project-tree" id="project-tree"></ul>
+        <div class="nav-label" id="loose-h" hidden><span>No project</span></div>
+        <ul class="thread-list loose" id="loose-list"></ul>
+      </nav>
+
+      <div class="disp-row">
+        <span class="disp-label">Flow · realtime</span>
+        <button class="switch" id="disp-toggle" type="button" role="switch" aria-checked="true" aria-label="Flow realtime"></button>
+      </div>
+
+      <a class="kora-card" id="kora-card" href="#/activity">
+        <span class="kora-dot" id="kora-dot"></span>
+        <span class="kora-text">
+          <b>Code</b>
+          <small id="kora-sub" aria-live="polite">idle</small>
+        </span>
+        <span class="kora-chevron" aria-hidden="true">›</span>
+      </a>
+
+      <a class="settings-row" id="settings-link" href="#/settings/ai">
+        <span class="settings-gear" aria-hidden="true">⚙</span>
+        <b>Settings</b>
+        <span class="kora-chevron" aria-hidden="true">›</span>
+      </a>
+    </aside>
+
+    <div class="scrim" id="scrim"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-button menu-button" id="menu-button" type="button" aria-label="Open navigation">☰</button>
+        <button class="view-title" id="view-title" type="button" title="Rename thread">CodeFlow</button>
+        <span class="thread-badge" id="thread-badge" role="status" aria-live="polite" hidden></span>
+        <span class="stage-chip" id="stage-chip" hidden></span>
+        <div class="thread-tabs" id="thread-tabs" role="tablist" hidden>
+          <button id="tab-chat" type="button" role="tab" aria-selected="true">Chat</button>
+          <button id="tab-diff" type="button" role="tab" aria-selected="false">Diff</button>
+        </div>
+        <div class="top-actions">
+          <button class="icon-button mode-toggle" id="theme-toggle" type="button" aria-label="Switch to Hero Drive mode" title="Switch theme"><span id="theme-toggle-icon">⚡</span><b id="theme-toggle-label">Hero Drive</b></button>
+        </div>
+      </header>
+
+      <p class="conn-status" id="conn-status" role="status" aria-live="assertive" hidden></p>
+
+      <section class="view" id="view-home" aria-labelledby="home-title">
+        <div class="home-wrap">
+          <section class="hero-panel">
+            <div class="hero-copy">
+              <span class="eyebrow">LOCAL CODING AGENT</span>
+              <h1 id="home-title">Build with<br><em>clarity.</em></h1>
+              <p>Describe a task or turn on the mic — a thread is created for you. Flow clarifies the request, then Code plans, implements, and tests it in your workspace.</p>
+              <div class="hero-actions">
+                <button class="primary-button" id="hero-new" type="button"><span>✦</span> Start a task</button>
+              </div>
+            </div>
+            <div class="orbit-scene" aria-label="Code agent illustration">
+              <div class="orbit orbit-one"></div>
+              <div class="orbit orbit-two"></div>
+              <div class="moon-glow"></div>
+              <img class="code-asset hero-code" src="assets/code-night-atlas.svg" alt="Code, a moon-shaped coding guide holding a glowing code star">
+              <img class="hero-drive-asset" src="assets/codeflow-hero-drive.svg" alt="Code driving a 1960s endurance racing car with Flow as the dashboard voice navigator">
+              <span class="spark s1">✦</span><span class="spark s2">·</span><span class="spark s3">✧</span>
+            </div>
+          </section>
+
+          <div class="section-heading" id="recent-h"><div><span class="eyebrow">RECENT WORK</span><h2>Recent</h2></div></div>
+          <ul class="recent-list" id="home-recent"></ul>
+        </div>
+      </section>
+
+      <section class="view" id="view-thread" aria-labelledby="thread-title" hidden>
+        <div class="thread-wrap">
+          <div class="radio-bar" id="radio-bar" hidden></div>
+          <div class="thread-header">
+            <div class="thread-title-block">
+              <span class="eyebrow">TASK</span>
+              <h1 id="thread-title" title="Rename thread">Thread</h1>
+              <p><span class="folder-chip" id="thread-folder">No project</span><span id="thread-ago"></span></p>
+            </div>
+          </div>
+          <div class="stage-rail" id="stage-rail" aria-label="Task stage"></div>
+          <ol class="feed-list" id="feed-list"></ol>
+          <p class="typing" id="typing" aria-live="polite" hidden>thinking<span class="dots"><span>.</span><span>.</span><span>.</span></span></p>
+        </div>
+      </section>
+
+      <section class="view" id="view-diff" hidden>
+        <div class="thread-wrap" id="diff-wrap"></div>
+      </section>
+
+      <section class="view" id="view-activity" aria-labelledby="activity-title" hidden>
+        <div class="activity-wrap">
+          <div class="activity-page-head">
+            <span class="eyebrow">LIVE ACTIVITY</span>
+            <h1 id="activity-title">Code activity</h1>
+            <p>What Code is doing in your local workspace.</p>
+          </div>
+          <div class="activity-layout">
+            <section class="agent-stage">
+              <div class="agent-sky">
+                <span class="sky-label"><i></i> <span id="sky-status">IDLE</span></span>
+                <div class="activity-orbit">
+                  <img class="code-asset activity-code" src="assets/code-night-atlas.svg" alt="Code working in the local workspace">
+                  <img class="activity-drive-asset" src="assets/codeflow-hero-drive.svg" alt="Code driving with Flow as the dashboard voice navigator">
+                  <span class="orbit-particle p1"></span><span class="orbit-particle p2"></span><span class="orbit-particle p3"></span>
+                </div>
+                <h2 id="sky-title">Code is idle</h2>
+                <p id="sky-detail">No task running</p>
+              </div>
+            </section>
+            <section class="journal-card">
+              <header><span class="eyebrow">ACTIVITY LOG</span><h2>Tool activity</h2></header>
+              <ol class="journal-list" id="activity-list"></ol>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-settings" aria-labelledby="settings-title" hidden>
+        <div class="settings-wrap">
+          <div class="settings-head">
+            <span class="eyebrow">WORKSPACE</span>
+            <h1 id="settings-title">Settings</h1>
+            <p>Appearance applies instantly on this device. AI settings are shared — saving bumps the store revision.</p>
+          </div>
+          <div id="settings-body"></div>
+        </div>
+      </section>
+
+      <footer class="composer" id="composer">
+        <button class="proj-chip" id="proj-chip" type="button" title="Active project" hidden></button>
+        <button class="mic-btn" id="mic-btn" type="button" data-state="idle" aria-label="Microphone">
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+        </button>
+        <textarea id="msg-input" rows="1" placeholder="Say or type a task…" autocomplete="off" enterkeyhint="send"></textarea>
+        <button class="send" id="msg-send" type="button" aria-label="Send">↑</button>
+      </footer>
+    </main>
+  </div>
+
+  <div class="modal-layer" id="live-overlay" aria-hidden="true">
+    <div class="call-sheet" role="dialog" aria-modal="true" aria-label="Voice session">
+      <span class="call-eyebrow"><i></i> LIVE WITH FLOW</span>
+      <div class="voice-orb"><div class="code-orb"><span class="orb-eye left"></span><span class="orb-eye right"></span><span class="orb-smile"></span></div><i></i><i></i></div>
+      <h2 id="live-status">Flow is listening…</h2>
+      <div class="wave" id="live-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="call-actions">
+        <button id="live-mute" type="button" aria-pressed="false"><span>⌁</span><small>Mute</small></button>
+        <button class="end-call" id="live-end" type="button"><span>×</span><small>End — back to chat</small></button>
+      </div>
+      <p class="call-note">Realtime with Flow · the conversation is saved to chat</p>
+    </div>
+  </div>
+
+  <div class="modal-layer" id="picker" aria-hidden="true">
+    <div class="picker-panel" role="dialog" aria-modal="true" aria-label="Choose project folder">
+      <span class="eyebrow">NEW PROJECT — CHOOSE FOLDER</span>
+      <p class="picker-path" id="picker-path"></p>
+      <p class="picker-error" id="picker-error" role="status" aria-live="assertive"></p>
+      <ul class="picker-dirs" id="picker-dirs"></ul>
+      <div class="picker-actions">
+        <button class="primary-button" id="picker-choose" type="button">Choose this folder</button>
+        <button class="ghost-button" id="picker-cancel" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
