@@ -763,7 +763,10 @@ async def test_stage_block_is_before_state_and_absent_for_code_done(tmp_path):
             assert "СТАДИЯ " not in system
 
 
-def test_voice_system_prompt_refreshes_for_stage_and_stays_base_without_thread(tmp_path):
+def test_voice_system_prompt_refreshes_for_stage_and_carries_state(tmp_path):
+    """С1 (Ф0.1): голосовой system message теперь собирается через ту же фабрику, что HTTP —
+    значит несёт `[СОСТОЯНИЕ]` (симметрия каналов). Раньше голос вообще не видел состояния;
+    этот тест кодировал ту дыру (ожидал голый build_system_prompt без [СОСТОЯНИЕ])."""
     from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
     from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
     from synapse.pipeline.app import build_host, build_session_pipeline
@@ -781,9 +784,16 @@ def test_voice_system_prompt_refreshes_for_stage_and_stays_base_without_thread(t
     handler = stt._event_handlers["on_end_of_turn"].handlers[0]
     import asyncio
     asyncio.run(handler(stt, "без треда"))
-    assert context.get_messages()[0] == {"role": "system", "content": build_system_prompt(cfg)}
+    voice_content = context.get_messages()[0]["content"]
+    # базовый промпт остаётся основой system-сообщения …
+    assert build_system_prompt(cfg) in voice_content
+    # … но теперь к нему пришит `[СОСТОЯНИЕ]` (раньше — отсутствовало, дыра Ф0.1).
+    assert "[СОСТОЯНИЕ]" in voice_content
+    assert "Активной задачи нет." in voice_content  # нет активной задачи → этот блок
     host.journal.end_turn()
     thread = host.threads.create("голос")
     host.voice_thread["id"] = thread.id
     asyncio.run(handler(stt, "в сборе"))
     assert STAGE_RULES_COLLECT in context.get_messages()[0]["content"]
+    # stage-правила И [СОСТОЯНИЕ] — оба присутствуют (parity с HTTP).
+    assert "[СОСТОЯНИЕ]" in context.get_messages()[0]["content"]

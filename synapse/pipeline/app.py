@@ -45,7 +45,7 @@ from synapse.dispatcher.tools import ALL_SCHEMAS, KoraBridge, ToolHandlers, regi
 from synapse.journal import AlertKind, TurnJournal
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
 from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook, make_guarded_assistant_aggregator
-from synapse.prompt import STAGE_RULES_COLLECT, STAGE_RULES_PROPOSE, build_system_prompt
+from synapse.prompt import STAGE_RULES_COLLECT, STAGE_RULES_PROPOSE
 from synapse.threads import ThreadStore
 
 logger = logging.getLogger(__name__)
@@ -784,6 +784,17 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # Kept on the long-lived host so the independently constructed voice session can refresh
     # its system prompt from the same stage resolver as the HTTP DispatcherTurnLoop.
     host.stage_block_for = _stage_block_for
+    # С1: голосовой путь собирает контекст хода через ту же фабрику, что HTTP DispatcherTurnLoop.
+    # Резолвер owner_thread_for — тот же, что у text_loop (скоуп терминальной задачи к треду).
+    # `task_dictionary` де-факто пустой (см. Parking lot в спеке) — передаём как есть, честно.
+    from synapse.dispatcher.turn_context import build_turn_context
+    _owner_thread_for = lambda task_id: (
+        th.id if (th := threads.thread_for_task(task_id)) else None
+    )
+    host.turn_context_for = lambda tid: build_turn_context(
+        cfg=cfg, store=store, clock=clock, thread_id=tid,
+        stage_block_for=_stage_block_for, owner_thread_for=_owner_thread_for,
+    )
     _h["host"] = host  # fills the on_speak holder -- must precede any runtime SPEAK
     return host
 
@@ -865,9 +876,10 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
             # UI-4: voice uses pipecat's own live context, not DispatcherTurnLoop. Refresh the
             # single system item in place before the user aggregator starts generation, keeping
             # its accumulated assistant/tool tail intact.
-            voice_system = build_system_prompt(
-                host.cfg, stage_block=host.stage_block_for(host.voice_thread["id"])
-            )
+            # С1: голос собирает system_message через ту же фабрику turn_context_for, что HTTP —
+            # теперь [СОСТОЯНИЕ] (с awaiting_answer, hide-скоупом) виден и голосу. Раньше голос
+            # вообще не видел состояния, роутинг answer_kora держался на догадке модели.
+            voice_system = host.turn_context_for(host.voice_thread["id"]).system_message
             context.set_messages([
                 {"role": "system", "content": voice_system},
                 *(m for m in context.get_messages() if m.get("role") != "system"),

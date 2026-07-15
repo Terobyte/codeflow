@@ -13,12 +13,12 @@ from collections import OrderedDict
 from typing import Any, Callable, Protocol
 
 from synapse.bridge.confirm import ConfirmFlow
-from synapse.bridge.state import TaskStore, should_hide_task
+from synapse.bridge.state import TaskStore
 from synapse.clock import Clock
 from synapse.config import SynapseConfig
 from synapse.dispatcher.tools import ALL_SCHEMAS, ToolCall, ToolHandlers
+from synapse.dispatcher.turn_context import build_turn_context
 from synapse.journal import TurnJournal, TurnRecord
-from synapse.prompt import build_system_prompt
 
 # B5: the authoritative set of dispatchable tool names — dispatch never resolves anything else.
 _VALID_TOOL_NAMES = frozenset(s.name for s in ALL_SCHEMAS)
@@ -231,11 +231,17 @@ class DispatcherTurnLoop:
     async def _complete(
         self, history: list[dict[str, Any]], thread_id: str
     ) -> tuple[str, list[ToolCall]]:
-        state_block = self._render_state(self._clock.now(), thread_id)
-        stage_block = self._stage_block_for(thread_id) if self._stage_block_for is not None else ""
-        system_prompt = build_system_prompt(self._cfg, self._task_dictionary, stage_block=stage_block)
+        # С1: единая фабрика контекста хода (раньше — инлайн сборка system_prompt+state_block).
+        # Голос теперь собирает через ту же фабрику, поэтому [СОСТОЯНИЕ] симметричен между
+        # каналами; `_render_state` умер (тело переехало в build_turn_context).
+        ctx = build_turn_context(
+            cfg=self._cfg, store=self._store, clock=self._clock, thread_id=thread_id,
+            task_dictionary=self._task_dictionary,
+            stage_block_for=self._stage_block_for,
+            owner_thread_for=self._owner_thread_for,
+        )
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt + "\n\n" + state_block},
+            {"role": "system", "content": ctx.system_message},
             *history,
         ]
         return await self._llm.complete(messages, ALL_SCHEMAS)
@@ -259,15 +265,16 @@ class DispatcherTurnLoop:
         return result
 
     def _render_state(self, now: float, thread_id: str | None = None) -> str:
-        # Терминальную задачу чужого треда прячем из [СОСТОЯНИЕ] (глобальный синглтон иначе
-        # течёт: диспетчер в новом треде повторял «задача выполнена» о задаче другого треда).
-        hide = False
-        task = self._store.task
-        if task is not None and self._owner_thread_for is not None:
-            hide = should_hide_task(task, thread_id, self._owner_thread_for(task.id))
-        return self._store.render_state(
-            now, self._cfg.stale_after_s, self._cfg.unreachable_after_s, hide_task=hide
+        # С1: метод оставлен для обратной совместимости (его зовут существующие тесты и,
+        # возможно, внешние вызовы), но сборка делегирована в build_turn_context. Параметр now
+        # принят, но игнорируется — snapshot времени снимается clock-ом фабрики (единственный
+        # источник правды, как и в голосовом пути). Терминальная задача чужого треда прячется.
+        ctx = build_turn_context(
+            cfg=self._cfg, store=self._store, clock=self._clock, thread_id=thread_id,
+            stage_block_for=self._stage_block_for,
+            owner_thread_for=self._owner_thread_for,
         )
+        return ctx.state_block
 
     # --- UI-5 (S10): компакт длинной истории -------------------------------------------
 
