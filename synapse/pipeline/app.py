@@ -149,8 +149,20 @@ class SynapseHost:
         self.projects = projects
         self.text_loop = text_loop
         self.turn_lock = turn_lock or asyncio.Lock()
+        # CR-5: busy-check (store.has_active_task) и launch (_launch_run) атомарны на ХОСТЕ.
+        # Пер-thread гейт-локи сериализуют треды, но стор — глобальный синглтон «одна активная
+        # задача». Раньше между has_active_task и _launch_run не было ни одного await, и
+        # корректность держалась на этой конвенции; появись await — два треда запустили бы
+        # две Коры. Лок превращает конвенцию в структурный инвариант. Внутри сегодня ни одного
+        # await (_launch_run синхронный), лок дёшев; обратного порядка захвата (launch→thread)
+        # нет — deadlock невозможен.
+        self._launch_lock = asyncio.Lock()
         self.current_http_thread = current_http_thread if current_http_thread is not None else {"id": None}
         # M1 slice 2 (the one NON-long-lived field, see class docstring): the currently live
+        # per-connection PipelineTask, or None when no client is connected.
+        self._output_task: Any = None
+        # UI-4: per-thread гейт-локи — single-flight двух конкурентных гейт-вызовов на один тред.
+        self._gate_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def current_http_thread(self) -> dict:
@@ -158,16 +170,15 @@ class SynapseHost:
 
     @current_http_thread.setter
     def current_http_thread(self, value: dict | None) -> None:
+        # CR-1: setter НЕ инициализирует _output_task/_gate_locks — иначе любое повторное
+        # `host.current_http_thread = …` молча отвязывает живой PipelineTask (тихий дроп SPEAK,
+        # класс B17) и сбрасывает все per-thread гейт-локи. Их инициализация живёт в __init__.
         if isinstance(value, TaskLocalThreadDict):
             self._current_http_thread = value
-        else:
-            self._current_http_thread = TaskLocalThreadDict()
-            if isinstance(value, dict) and "id" in value:
-                self._current_http_thread["id"] = value["id"]
-        # per-connection PipelineTask, or None when no client is connected.
-        self._output_task: Any = None
-        # UI-4: per-thread гейт-локи — single-flight двух конкурентных гейт-вызовов на один тред.
-        self._gate_locks: dict[str, asyncio.Lock] = {}
+            return
+        self._current_http_thread = TaskLocalThreadDict()
+        if isinstance(value, dict) and "id" in value:
+            self._current_http_thread["id"] = value["id"]
 
     def bind_output(self, task: Any) -> None:
         """Point the SPEAK injector at this connection's live output task. SYNCHRONOUS and
@@ -342,11 +353,8 @@ class SynapseHost:
             # валидация модели — только когда она передана (revise её не несёт)
             if model is not None and model not in _KORA_MODELS:
                 return {"error": "invalid_model"}
-            # busy-чек ДО set_stage: запуск-действия не должны двигать стадию на занятом синглтоне
-            is_run = action in ("send_to_kora", "write_code")
-            if is_run and self.kora_runner is not None and self.store.has_active_task():
-                return {"error": "busy"}
             if action == "revise":
+                # revise не запускает ран — launch_lock не нужен.
                 try:
                     self.threads.set_stage(thread_id, "collect")
                 except ValueError:
@@ -361,51 +369,60 @@ class SynapseHost:
                 self.threads.append_feed(thread_id,
                                          {"ts": self.clock.now(), "kind": "event", "text": "правки → сбор"})
                 return {"ok": True, "stage": "collect"}
-            if action == "send_to_kora":
-                if not confirm:
-                    return {"error": "confirm_required"}
-                request_text = th.request_text
-                if not request_text:
-                    return {"error": "no_request"}
-                if fast:
-                    target_stage, gate_mode, text = "code", "full", request_text
-                else:
-                    target_stage = "spec_plan"
-                    gate_mode = "docs_only"
-                    text = (f"Подготовь спеку и план по запросу ниже. План запиши в файл "
-                            f"docs/plans/{thread_id}.md (создай директории). Запрос: {request_text}")
-                # B06: _launch_run's first act is set_stage, which raises ValueError on an illegal
-                # transition (e.g. send_to_kora straight from `collect`). Guard it like `revise`
-                # does — an unhandled ValueError escapes gate_action as a 500 / voice-path crash.
-                # set_stage runs BEFORE any store mutation, so a caught raise leaves no partial state.
-                try:
-                    self._launch_run(th, target_stage, gate_mode, text, model)
-                except ValueError:
-                    return {"error": "illegal_stage"}
-                return {"ok": True, "stage": target_stage}
-            if action == "write_code":
-                if not confirm:
-                    return {"error": "confirm_required"}
-                # план-файл должен существовать И последняя SPEC_PLAN — completed (иначе stale_plan:
-                # устаревший файл от провалившейся попытки не должен пускать CODE)
-                # B18: root может быть None (projectless тред + kora_workspace_dir не задан) — это
-                # ЛЕГАЛЬНЫЙ сигнал «дефолт-воркспейс» (RunSpec его так и трактует). Раньше `Path(None)`
-                # тут кидал TypeError МИМО ValueError-гарда ниже → неперехваченный 500 / краш хода.
-                # Резолвим план-путь против того же дефолт-воркспейса, что и рантайм Коры
-                # (зеркало kora.py:485 `kora_workspace_dir or ~/synapse-kora-workspace`).
-                root = self._resolve_root_for(th) or os.path.expanduser("~/synapse-kora-workspace")
-                plan_path = Path(root) / "docs" / "plans" / f"{thread_id}.md"
-                if not plan_path.exists():
-                    return {"error": "no_plan_file"}
-                if th.last_outcome != "completed":
-                    return {"error": "stale_plan"}
-                text = (f"Реализуй по плану docs/plans/{thread_id}.md. "
-                        f"Исходный запрос: {th.request_text}")
-                try:  # B06: same illegal-transition guard as send_to_kora above.
-                    self._launch_run(th, "code", "full", text, model)
-                except ValueError:
-                    return {"error": "illegal_stage"}
-                return {"ok": True, "stage": "code"}
+            # CR-5: launch-действия (send_to_kora/write_code) под ХОСТОВЫМ launch_lock — busy-check
+            # и _launch_run атомарны на синглтоне-сторе. per-thread lock выше сериализует тред, но
+            # два РАЗНЫХ треда проходят разные per-thread локи; без launch_lock между
+            # has_active_task() и _launch_run мог бы вклиниться await и запустить вторую Кору.
+            if action in ("send_to_kora", "write_code"):
+                async with self._launch_lock:
+                    # busy-чек ДО set_stage: запуск-действия не должны двигать стадию на занятом синглтоне
+                    if self.kora_runner is not None and self.store.has_active_task():
+                        return {"error": "busy"}
+                    if action == "send_to_kora":
+                        if not confirm:
+                            return {"error": "confirm_required"}
+                        request_text = th.request_text
+                        if not request_text:
+                            return {"error": "no_request"}
+                        if fast:
+                            target_stage, gate_mode, text = "code", "full", request_text
+                        else:
+                            target_stage = "spec_plan"
+                            gate_mode = "docs_only"
+                            text = (f"Подготовь спеку и план по запросу ниже. План запиши в файл "
+                                    f"docs/plans/{thread_id}.md (создай директории). Запрос: {request_text}")
+                        # B06: _launch_run's first act is set_stage, which raises ValueError on an illegal
+                        # transition (e.g. send_to_kora straight from `collect`). Guard it like `revise`
+                        # does — an unhandled ValueError escapes gate_action as a 500 / voice-path crash.
+                        # set_stage runs BEFORE any store mutation, so a caught raise leaves no partial state.
+                        try:
+                            self._launch_run(th, target_stage, gate_mode, text, model)
+                        except ValueError:
+                            return {"error": "illegal_stage"}
+                        return {"ok": True, "stage": target_stage}
+                    if action == "write_code":
+                        if not confirm:
+                            return {"error": "confirm_required"}
+                        # план-файл должен существовать И последняя SPEC_PLAN — completed (иначе stale_plan:
+                        # устаревший файл от провалившейся попытки не должен пускать CODE)
+                        # B18: root может быть None (projectless тред + kora_workspace_dir не задан) — это
+                        # ЛЕГАЛЬНЫЙ сигнал «дефолт-воркспейс» (RunSpec его так и трактует). Раньше `Path(None)`
+                        # тут кидал TypeError МИМО ValueError-гарда ниже → неперехваченный 500 / краш хода.
+                        # Резолвим план-путь против того же дефолт-воркспейса, что и рантайм Коры
+                        # (зеркало kora.py:485 `kora_workspace_dir or ~/synapse-kora-workspace`).
+                        root = self._resolve_root_for(th) or os.path.expanduser("~/synapse-kora-workspace")
+                        plan_path = Path(root) / "docs" / "plans" / f"{thread_id}.md"
+                        if not plan_path.exists():
+                            return {"error": "no_plan_file"}
+                        if th.last_outcome != "completed":
+                            return {"error": "stale_plan"}
+                        text = (f"Реализуй по плану docs/plans/{thread_id}.md. "
+                                f"Исходный запрос: {th.request_text}")
+                        try:  # B06: same illegal-transition guard as send_to_kora above.
+                            self._launch_run(th, "code", "full", text, model)
+                        except ValueError:
+                            return {"error": "illegal_stage"}
+                        return {"ok": True, "stage": "code"}
             return {"error": "unknown_action"}
 
     def _launch_run(self, th, stage: str, gate_mode: str, text: str, model: str | None) -> None:
@@ -623,6 +640,13 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         return th.id if th is not None else None
 
     def _voice_answer(text: str) -> bool:
+        # CR-4: асимметрия с _http_answer НАМЕРЕННАЯ. Голос — канал дома: вопрос Коры прозвучал
+        # вслух, voice_thread["id"] может быть None после реконнекта (привязка ещё не воскресла),
+        # и строгий гвард `awaiting is None or voice_thread["id"] != awaiting` сломал бы доставку
+        # ответа — ответ Коре падал бы в no_pending_question. Здесь гвард мягче: блокируется
+        # только ЯВНЫЙ чужой тред (voice_thread стоит в другом треде, awaiting — в этом); None и
+        # неопределённость пропускаются. Якорь-тест: voice_thread=None + awaiting → доставляется;
+        # HTTP-ответ из чужого треда → no_pending_question.
         if kora_runner is None:
             return False
         awaiting = _awaiting_thread_id()
