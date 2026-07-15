@@ -39,9 +39,12 @@ def test_index_is_spa_shell():
         "view-home", "view-thread", "feed-list", "typing",
         "mic-btn", "msg-input", "msg-send", "proj-chip", 'data-state="idle"', "bot-audio",
         "manifest.webmanifest", "apple-touch-icon", "app.js", "style.css",
-        'lang="ru"', "viewport-fit=cover", "picker-dirs", "picker-choose",
+        'lang="en"', "viewport-fit=cover", "picker-dirs", "picker-choose",
     ):
         assert token in body, f"index.html missing {token!r}"
+    # UI на английском (Кора=Code, Диспетчер=Flow, вместе CodeFlow): русские подписи в шелле
+    # ушли. Держим якорь на самой заметной паре — вернувшийся русский тут падает сразу.
+    assert "Кора" not in body and "Диспетчер" not in body
     assert "reconnect.js" not in body  # вотчдог живёт в app.js (UI v3)
     assert "kora-dot" not in body
     assert "status-widget.js" not in body  # светофор нативный, не инжект-виджет
@@ -186,8 +189,12 @@ def test_stage_ui_is_xss_safe_and_has_gate_controls():
     app = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
     index = (CLIENT_DIR / "index.html").read_text(encoding="utf-8")
     for token in (
-        "gate_card", "/gate", "СБОР", "ЗАПРОС", "СПЕКА·ПЛАН", "КОД", "ГОТОВО",
-        "точно", 'el("select"', "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5",
+        # Подписи стадий — как записи карты STAGES, а не голыми словами: токен "Code"
+        # прошёл бы вхолостую (он внутри encodeURIComponent), проверка стала бы декорацией.
+        "gate_card", "/gate", 'collect: "Collect"', 'propose: "Propose"',
+        'spec_plan: "Plan"', 'code: "Coding"', 'done: "Done"',
+        # двухтаповый гвард опасного действия: подпись второго тапа
+        "really write code?", 'el("select"', "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5",
         "renderStageChip", "#/activity", "pollActivity", "resizeMessageInput", "thread_stage",
     ):
         assert token in app, f"stage UI missing {token!r}"

@@ -1,8 +1,8 @@
 {
   "name": "CodeFlow",
   "short_name": "CodeFlow",
-  "description": "Голосовой агент-программист: пиши код на своей машине голосом или текстом.",
-  "lang": "ru",
+  "description": "Voice coding agent: write code on your own machine by voice or text.",
+  "lang": "en",
   "dir": "ltr",
   "id": "/client/",
   "start_url": "/client/",

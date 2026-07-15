@@ -87,10 +87,10 @@ function el(tag, cls, text) {
 }
 function relTime(ts) {
   const d = Date.now() / 1000 - ts;
-  if (d < 60) return "только что";
-  if (d < 3600) return Math.floor(d / 60) + " мин";
-  if (d < 86400) return Math.floor(d / 3600) + " ч";
-  return Math.floor(d / 86400) + " дн";
+  if (d < 60) return "just now";
+  if (d < 3600) return Math.floor(d / 60) + " min";
+  if (d < 86400) return Math.floor(d / 3600) + " h";
+  return Math.floor(d / 86400) + " d";
 }
 
 // ---------- роутер ----------
@@ -117,18 +117,22 @@ let feedNotFound = null;        // B55: id треда, чей фид ответ�
 let listsLoaded = false;        // первая успешная загрузка списков состоялась (B-CORE-9)
 let listsSeq = 0;               // B-UX-5: секвенс-токен — устаревший ответ не затирает свежие данные
 let lastActiveThread = "";      // дедуп POST /api/active-thread (B-CORE-13)
-const LOAD_ERR = "нет связи с сервером — тяну снова…";
+const LOAD_ERR = "no connection to the server — retrying…";
 
 // единый форматтер исхода (B-CORE-14): бейдж и карточка треда больше не расходятся в значках
 const OUTCOME = {
-  failed: { icon: "✖", text: "✖ ошибка", bad: true },
-  cancelled: { icon: "⏹", text: "⏹ отменено", bad: false },
-  completed: { icon: "✓", text: "✓ готово", bad: false },
+  failed: { icon: "✖", text: "✖ failed", bad: true },
+  cancelled: { icon: "⏹", text: "⏹ cancelled", bad: false },
+  completed: { icon: "✓", text: "✓ done", bad: false },
 };
 function outcomeLabel(outcome) { return OUTCOME[outcome] || null; }
 
+// Подписи пилюли стадии. Только текст: цвет/пульс/точка красятся по классу stage-<id> из
+// thread.stage (см. style.css), поэтому подпись меняется свободно. Держим 1:1 с id стадии
+// FSM (threads.py::_STAGE_TRANSITIONS) — что видно в UI, то же ищется в логах и тестах.
+// code → "Coding": агент зовётся Code, пилюля не должна читаться как его имя.
 const STAGES = {
-  collect: "СБОР", propose: "ЗАПРОС", spec_plan: "СПЕКА·ПЛАН", code: "КОД", done: "ГОТОВО",
+  collect: "Collect", propose: "Propose", spec_plan: "Plan", code: "Coding", done: "Done",
 };
 
 // B45: пока открыт inline-редактор rename, узел #view-title ЗАКОННО снят из DOM
@@ -147,7 +151,7 @@ function feedKey(e) { return (e.id || "") + "|" + (e.ts || 0) + "|" + (e.kind ||
 // узкий экран: длинный плейсхолдер макета не влезает в композер-пилюлю рядом с чипом
 const narrowMq = window.matchMedia("(max-width: 480px)");
 function taskPlaceholder() {
-  return narrowMq.matches ? "Задача…" : "Скажите или напишите задачу…";
+  return narrowMq.matches ? "Task…" : "Say or type a task…";
 }
 
 // ---------- активный проект: дом рожает треды-ветки в нём ----------
@@ -177,7 +181,7 @@ function applyDispToggleUI() {
   $("disp-toggle").setAttribute("aria-checked", String(dispOn));
   // R2: НИКОГДА не ставим disabled — визуальный dim не блокирует hang-up, когда client!=null.
   $("mic-btn").classList.toggle("disp-off", !dispOn);
-  $("mic-btn").title = dispOn ? "микрофон" : "Диспетчер выключен — только Кора, доступен чат";
+  $("mic-btn").title = dispOn ? "Microphone" : "Flow is off — Code only, chat available";
 }
 $("disp-toggle").addEventListener("click", () => {
   dispOn = !dispOn;
@@ -210,8 +214,8 @@ function render() {
     const t = threads.find((x) => x.id === r.id);
     // B54/B55: тред не в списке ПОСЛЕ успешной загрузки списков = его реально нет (архив/
     // мусорный id) — честный title вместо generic-заглушки; до первой загрузки не паникуем.
-    setViewTitle(t ? t.title : (listsLoaded ? "тред не найден" : "тред"));
-    $("msg-input").placeholder = "Сообщение…";
+    setViewTitle(t ? t.title : (listsLoaded ? "thread not found" : "thread"));
+    $("msg-input").placeholder = "Message…";
     renderBadge(t);
     renderStageChip(t);
     if (feedThread !== r.id) {
@@ -223,7 +227,7 @@ function render() {
     }
     pollFeed();
   } else if (r.view === "activity") {
-    setViewTitle("Активность Коры");
+    setViewTitle("Code activity");
     $("msg-input").placeholder = taskPlaceholder();
     $("thread-badge").hidden = true;
     renderStageChip(null);
@@ -301,36 +305,36 @@ function threadCard(t, cur, showProj) {
   wrap.appendChild(a);
   const ar = el("button", "tc-archive");
   ar.type = "button";
-  ar.textContent = "архив";
-  ar.title = "Архивировать тред";
+  ar.textContent = "archive";
+  ar.title = "Archive thread";
   ar.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); archiveThread(t); });
   wrap.appendChild(ar);
   return wrap;
 }
 
 async function archiveThread(t) {
-  if (!window.confirm("Архивировать тред «" + t.title + "»?")) return;
+  if (!window.confirm("Archive thread “" + t.title + "”?")) return;
   try {
     const res = await postJSON(`/api/threads/${encodeURIComponent(t.id)}/archive`, {});
     if (res.ok) {
       // B54: архивировали ОТКРЫТЫЙ тред — уходим на дом ДО перезагрузки списков,
       // иначе вью молча деградирует в пустую страницу без единого фидбека.
       if (route().view === "thread" && route().id === t.id) location.hash = "#/";
-      setConn("тред «" + t.title + "» в архиве");
+      setConn("thread “" + t.title + "” archived");
       await loadLists();
-    } else setConn("не архивировать");
-  } catch { setConn("сеть недоступна"); }
+    } else setConn("could not archive");
+  } catch { setConn("network unavailable"); }
 }
 
 async function deleteProject(p) {
-  if (!window.confirm("Удалить проект «" + p.name + "»? Треды останутся, но потеряют привязку.")) return;
+  if (!window.confirm("Delete project “" + p.name + "”? Threads remain but lose their link.")) return;
   try {
     const res = await deleteJSON(`/api/projects/${encodeURIComponent(p.id)}`);
     if (res.ok) {
       if (activeProject === p.id) setActiveProject(null);
       await loadLists();
-    } else setConn("не удалить проект");
-  } catch { setConn("сеть недоступна"); }
+    } else setConn("could not delete project");
+  } catch { setConn("network unavailable"); }
 }
 
 function renderSidebar() {
@@ -350,7 +354,7 @@ function renderSidebar() {
     const del = el("button", "pr-delete");
     del.type = "button";
     del.textContent = "×";
-    del.title = "Удалить проект (треды останутся)";
+    del.title = "Delete project (threads remain)";
     del.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); deleteProject(p); });
     li.appendChild(del);
     const branch = el("ul", "branch");
@@ -379,7 +383,7 @@ function renderChip(r) {
   const chip = $("proj-chip");
   if (r.view !== "home") { chip.hidden = true; return; }
   const proj = projects.find((p) => p.id === activeProject);
-  chip.textContent = proj ? "📁 " + proj.name : "без проекта";
+  chip.textContent = proj ? "📁 " + proj.name : "no project";
   chip.classList.toggle("has-proj", !!proj);
   chip.hidden = false;
 }
@@ -432,7 +436,7 @@ async function loadLists() {
 function playButton(role) {
   const btn = el("button", "play-btn");
   btn.type = "button";
-  btn.title = "TTS · голос " + (role === "disp" ? "диспетчера" : "Коры");
+  btn.title = "TTS · " + (role === "disp" ? "Flow" : "Code") + " voice";
   btn.appendChild(iconSvg(ICON_PLAY));
   btn.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -458,7 +462,7 @@ function addEntry(e) {
       av.appendChild(strokeIcon(role === "disp" ? AV_DISP : AV_KORA));
       li.appendChild(av);
       const col = el("div", "msg-col");
-      col.appendChild(el("span", "msg-who", role === "disp" ? "Диспетчер" : "Кора"));
+      col.appendChild(el("span", "msg-who", role === "disp" ? "Flow" : "Code"));
       const body = el("div", "msg-body");
       body.appendChild(el("p", "msg-text", e.text || ""));
       col.appendChild(body);
@@ -469,13 +473,13 @@ function addEntry(e) {
     // PF8: thinking остаётся светлым collapsible, отдельно от тёмной tool-карточки.
     const det = document.createElement("details");
     det.className = "think-card";
-    det.appendChild(el("summary", "", "🧠 размышления"));
+    det.appendChild(el("summary", "", "🧠 thinking"));
     if (e.text) det.appendChild(el("pre", "", e.text));
     li.appendChild(det);
   } else if (e.kind === "tool_use" || e.kind === "tool_result") {
     const det = document.createElement("details");
     det.className = "tool-card";
-    det.appendChild(el("summary", "", e.kind === "tool_use" ? "🔧 инструмент" : "· результат инструмента"));
+    det.appendChild(el("summary", "", e.kind === "tool_use" ? "🔧 tool" : "· tool result"));
     if (e.text) det.appendChild(el("pre", "", e.text));
     li.appendChild(det);
   } else if (e.kind === "result") {
@@ -507,16 +511,16 @@ function renderGateCard(li, entry) {
   const stage = entry.stage || "";
   const live = !!thread && thread.stage === stage;
   li.classList.add("gate-card");
-  li.appendChild(el("p", "gate-title", stage === "propose" ? "Запрос готов" :
-    stage === "spec_plan" ? "План готов" : stage === "code" ? "Правки или запуск" : "Запуск Коры"));
+  li.appendChild(el("p", "gate-title", stage === "propose" ? "Request ready" :
+    stage === "spec_plan" ? "Plan ready" : stage === "code" ? "Revise or run" : "Run Code"));
   if (entry.action === "run_started") {
-    li.appendChild(el("p", "gate-note", "Кора запущена" + (entry.model ? " · " + entry.model : "")));
+    li.appendChild(el("p", "gate-note", "Code started" + (entry.model ? " · " + entry.model : "")));
     return;
   }
   const select = el("select", "gate-model");
-  select.setAttribute("aria-label", "Модель Коры");
+  select.setAttribute("aria-label", "Code model");
   const preferred = entry.model || (thread && thread.last_model) || "";
-  const automatic = el("option", "", "модель по умолчанию");
+  const automatic = el("option", "", "default model");
   automatic.value = "";
   select.appendChild(automatic);
   KORA_MODELS.forEach((model) => {
@@ -530,14 +534,14 @@ function renderGateCard(li, entry) {
   const actions = el("div", "gate-actions");
   const buttons = [];
   if (stage === "propose") {
-    buttons.push(gateButton("Отправить Коре", "send_to_kora", { confirm: true }));
-    buttons.push(gateButton("Сразу писать код", "send_to_kora", { fast: true, dangerous: true }));
-    buttons.push(gateButton("Правки", "revise"));
+    buttons.push(gateButton("Send to Code", "send_to_kora", { confirm: true }));
+    buttons.push(gateButton("Write code now", "send_to_kora", { fast: true, dangerous: true }));
+    buttons.push(gateButton("Revise", "revise"));
   } else if (stage === "spec_plan") {
-    buttons.push(gateButton("Пиши код", "write_code", { dangerous: true }));
-    buttons.push(gateButton("Правки", "revise"));
+    buttons.push(gateButton("Write code", "write_code", { dangerous: true }));
+    buttons.push(gateButton("Revise", "revise"));
   } else if (stage === "code") {
-    buttons.push(gateButton("Правки", "revise"));
+    buttons.push(gateButton("Revise", "revise"));
   }
   const note = el("p", "gate-note");
   // B52/B53: consumed — карточка потрачена ТОЛЬКО на успехе (сервер выпустит свежий gate_card
@@ -549,31 +553,31 @@ function renderGateCard(li, entry) {
       if (!live || button.disabled) return;
       if (opts.dangerous && !button.dataset.confirmed) {
         button.dataset.confirmed = "true";
-        button.textContent = "точно пишем код?";
-        note.textContent = "Второй тап запустит запись кода в проект.";
+        button.textContent = "really write code?";
+        note.textContent = "A second tap starts writing code into the project.";
         return;
       }
       const payload = { action, model: select.value || null, confirm: !!opts.confirm || !!opts.dangerous };
       if (opts.fast) payload.fast = true;
       actions.querySelectorAll("button").forEach((b) => { b.disabled = true; });
-      note.textContent = "запускаю…";
+      note.textContent = "starting…";
       try {
         const response = await postJSON(`/api/threads/${encodeURIComponent(current.id)}/gate`, payload);
         if (response.status === 409) {
-          note.textContent = "Кора занята — попробуй ещё раз"; // B52: ретрай разрешён
+          note.textContent = "Code is busy — try again"; // B52: ретрай разрешён
           return;
         }
         if (!response.ok) {
           const body = await response.json().catch(() => ({}));
-          note.textContent = "⛔ " + (body.error || "не удалось запустить");
+          note.textContent = "⛔ " + (body.error || "could not start");
           return;
         }
         // B53: успех — кнопки ОСТАЮТСЯ disabled (защита от дубля), note подтверждает.
         consumed = true;
-        note.textContent = "готово ✓ — стадия обновлена";
+        note.textContent = "done ✓ — stage updated";
         await Promise.all([loadLists(), pollFeed()]);
       } catch {
-        note.textContent = "⛔ сеть недоступна";
+        note.textContent = "⛔ network unavailable";
       } finally {
         if (!consumed) {
           actions.querySelectorAll("button").forEach((b) => { b.disabled = false; });
@@ -582,7 +586,7 @@ function renderGateCard(li, entry) {
     });
     actions.appendChild(button);
   });
-  if (!live) note.textContent = "стадия изменилась — карточка больше не активна";
+  if (!live) note.textContent = "stage changed — this card is no longer active";
   li.appendChild(actions);
   li.appendChild(note);
 }
@@ -607,7 +611,7 @@ async function pollFeed() {
       // ошибки по-прежнему тихий ретрай следующим тиком.
       if (err && err.status === 404 && route().id === r.id && feedThread === r.id) {
         feedNotFound = r.id;
-        addEntry({ kind: "event", text: "тред не найден или удалён" });
+        addEntry({ kind: "event", text: "thread not found or deleted" });
       }
       return;
     }
@@ -637,19 +641,19 @@ function setKora(color, sub, threadId = null) {
   const card = $("kora-card");
   const activeThread = typeof threadId === "string" && threadId;
   card.href = activeThread ? "#/thread/" + encodeURIComponent(threadId) : "#/activity";
-  card.title = activeThread ? "Открыть активный тред" : "Открыть активность Коры";
+  card.title = activeThread ? "Open active thread" : "Open Code activity";
 }
 async function pollStatus() {
   let data;
   try { data = await getJSON("./kora-status"); }
-  catch { setKora("#888", "нет связи"); return; }
+  catch { setKora("#888", "no connection"); return; }
   const context = data.thread_id
-    ? (data.thread_title || "тред") + (data.thread_stage && STAGES[data.thread_stage]
+    ? (data.thread_title || "thread") + (data.thread_stage && STAGES[data.thread_stage]
       ? " · " + STAGES[data.thread_stage] : "")
     : (data.task_text || "");
   // task_text живёт и ПОСЛЕ завершения задачи — «работает» только при running.
-  const sub = data.awaiting_answer ? "ждёт ответа в " + context
-    : data.task_status === "running" ? "работает в " + context : "свободна";
+  const sub = data.awaiting_answer ? "waiting for an answer in " + context
+    : data.task_status === "running" ? "working in " + context : "idle";
   setKora(COLORS[data.color] || "#888", sub, data.thread_id || null);
 }
 
@@ -663,10 +667,10 @@ async function pollActivity() {
   list.replaceChildren();
   data.entries.forEach((entry) => {
     const item = el("li", "activity-entry");
-    item.textContent = (entry.kind || entry.type || "событие") + ": " + (entry.text || entry.detail || "");
+    item.textContent = (entry.kind || entry.type || "event") + ": " + (entry.text || entry.detail || "");
     list.appendChild(item);
   });
-  if (!data.entries.length) list.appendChild(el("li", "activity-entry", "пока нет событий"));
+  if (!data.entries.length) list.appendChild(el("li", "activity-entry", "no events yet"));
 }
 
 // ---------- композер: текст ----------
@@ -697,7 +701,7 @@ async function sendMessage() {
       // Дом: первое сообщение создаёт тред-ветку активного проекта (Ж1 + иерархия)
       const tRes = await postJSON("/api/threads",
                                   { title: text.slice(0, 60), project_id: activeProject });
-      if (!tRes.ok) { setConn("не удалось создать тред"); return; } // текст остаётся в поле
+      if (!tRes.ok) { setConn("could not create thread"); return; } // текст остаётся в поле
       id = (await tRes.json()).id;
       location.hash = "#/thread/" + encodeURIComponent(id); // render() переключит вью без reload
     }
@@ -705,7 +709,7 @@ async function sendMessage() {
     const res = await postJSON(`/api/threads/${encodeURIComponent(id)}/message`, { text });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
-      setConn("⛔ " + (d.error || "ошибка " + res.status));
+      setConn("⛔ " + (d.error || "error " + res.status));
       return; // текст остаётся — можно переотправить, не перепечатывая
     }
     setConn("");
@@ -713,7 +717,7 @@ async function sendMessage() {
     resizeMessageInput();
     await Promise.all([pollFeed(), loadLists()]);
   } catch {
-    setConn("сеть недоступна"); // текст остаётся в поле
+    setConn("network unavailable"); // текст остаётся в поле
   } finally {
     $("typing").hidden = true;
     $("msg-send").disabled = false;
@@ -755,12 +759,12 @@ async function commitRename(input, titleEl, oldTitle, cur) {
         await loadLists();
       } else {
         titleEl.textContent = oldTitle;
-        setConn("не переименовать");
+        setConn("could not rename");
       }
     }
   } catch {
     titleEl.textContent = oldTitle;
-    setConn("сеть недоступна");
+    setConn("network unavailable");
   } finally {
     renaming = false;
   }
@@ -809,15 +813,15 @@ function syncLiveOverlay(state) {
   const show = state === "on" && liveRequested;
   $("live-overlay").hidden = !show;
   $("shell").classList.toggle("live-open", show);
-  if (show) setLiveStatus("Диспетчер слушает…", false);
+  if (show) setLiveStatus("Flow is listening…", false);
   syncScrollLock();
 }
 
 function setMicState(state, msg) {
   $("mic-btn").dataset.state = state;
   if (state === "error") setConn("⛔ " + msg);
-  else setConn(state === "connecting" ? "подключаю голос…"
-    : state === "on" ? "🎙 говори — я слушаю" : "");
+  else setConn(state === "connecting" ? "connecting voice…"
+    : state === "on" ? "🎙 speak — I'm listening" : "");
   // R1: idle/error всегда закрывают live — обрыв звонка больше не морозит «слушает…».
   if (state === "idle" || state === "error") liveRequested = false;
   syncLiveOverlay(state);
@@ -825,14 +829,14 @@ function setMicState(state, msg) {
 
 function withTimeout(promise, ms) {
   return Promise.race([promise, new Promise((_, rej) =>
-    setTimeout(() => rej(new Error("таймаут — проверь разрешение микрофона")), ms))]);
+    setTimeout(() => rej(new Error("timeout — check microphone permission")), ms))]);
 }
 
 async function connectVoice() {
   // Явная диагностика вместо вечного зависания getUserMedia (Ж2): запрещённый микрофон
   // и таймаут дают видимую ошибку. permissions.query нет в старом Safari → пропускаем.
   const perm = await navigator.permissions.query({ name: "microphone" }).catch(() => null);
-  if (perm && perm.state === "denied") throw new Error("микрофон запрещён для этого сайта");
+  if (perm && perm.state === "denied") throw new Error("microphone is blocked for this site");
   // Identity-guard (урок слайса 3): колбэки действуют только пока `me` — текущий клиент,
   // иначе поздний onDisconnected СТАРОЙ сессии глушил бы новую после авто-реконнекта.
   const me = new PipecatClient({
@@ -850,15 +854,15 @@ async function connectVoice() {
         }
       },
       // Live-overlay: «Диспетчер отвечает» + wave-бары, пока бот говорит.
-      onBotStartedSpeaking: () => { if (client === me) setLiveStatus("Диспетчер отвечает", true); },
-      onBotStoppedSpeaking: () => { if (client === me) setLiveStatus("Диспетчер слушает…", false); },
+      onBotStartedSpeaking: () => { if (client === me) setLiveStatus("Flow is replying", true); },
+      onBotStoppedSpeaking: () => { if (client === me) setLiveStatus("Flow is listening…", false); },
       onError: (e) => {
         // B-CORE-5: не только логируем — гасим кнопку и обнуляем client, иначе UI застревал
         // («слушаю» + «⛔ ошибка»), а следующий тап шёл в ветку «отключить» мёртвого клиента.
         console.error("voice error:", e);
         if (client === me) {
           client = null;
-          setMicState("error", "соединение прервано");
+          setMicState("error", "connection dropped");
           abandonVoice(me);
         }
       },
@@ -922,7 +926,7 @@ $("mic-btn").addEventListener("click", async () => {
     console.error("voice connect failed:", err);
     try { client && client.disconnect(); } catch { /* уже мёртв */ }
     client = null;
-    setMicState("error", err && err.message ? err.message : "не удалось подключиться");
+    setMicState("error", err && err.message ? err.message : "could not connect");
   } finally {
     connecting = false;
   }
@@ -932,7 +936,7 @@ let liveMuted = false;
 $("live-mute").addEventListener("click", () => {
   liveMuted = !liveMuted;
   if (liveMuteFn) liveMuteFn(!liveMuted);
-  $("live-mute").textContent = liveMuted ? "Включить микрофон" : "Заглушить";
+  $("live-mute").textContent = liveMuted ? "Unmute" : "Mute";
   $("live-mute").setAttribute("aria-pressed", String(liveMuted));
   $("live-mute").classList.toggle("muted", liveMuted);
 });
@@ -974,14 +978,14 @@ async function probeSession() {
   client = null;
   setMicState("connecting");
   await c.disconnect().catch(() => {});
-  setConn("связь потеряна — переподключаю…");
+  setConn("connection lost — reconnecting…");
   try {
     await connectVoice();
   } catch (err) {
     console.error("auto-reconnect failed:", err);
     const dead = client; client = null;
     abandonVoice(dead);  // реконнект мог поднять мик — не осиротить его
-    setMicState("error", "связь потеряна — тапни микрофон");
+    setMicState("error", "connection lost — tap the microphone");
     maybeReload();
   } finally {
     connecting = false;
@@ -1079,7 +1083,7 @@ async function browse(path) {
     return li;
   };
   if (data.parent) {
-    pickerDirs.appendChild(pickerRow("‹ назад", () => browse(data.parent)));
+    pickerDirs.appendChild(pickerRow("‹ back", () => browse(data.parent)));
   }
   data.dirs.forEach((name) => {
     pickerDirs.appendChild(pickerRow("📁 " + name, () => browse(data.path + "/" + name)));
@@ -1092,11 +1096,11 @@ $("picker-choose").addEventListener("click", async () => {
   if (!pickerCur) return;
   const res = await postJSON("/api/projects", { name: "", path: pickerCur }).catch(() => null);
   // B-CORE-4: сеть упала (res === null) — это НЕ успех, пикер не закрываем
-  if (res === null) { pickerError.textContent = "⛔ нет связи"; return; }
+  if (res === null) { pickerError.textContent = "⛔ no connection"; return; }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     // B-CORE-11: причину — в отдельный #picker-error, путь в pickerPath не затираем
-    pickerError.textContent = "⛔ " + (data.error || "не удалось добавить");
+    pickerError.textContent = "⛔ " + (data.error || "could not add");
     return;
   }
   closePicker();

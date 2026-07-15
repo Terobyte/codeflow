@@ -343,7 +343,7 @@ li.project:hover .pr-delete, .pr-delete:focus-visible { opacity: 1; }
 /* ---------- лента треда ---------- */
 #feed-list { display: flex; flex-direction: column; gap: 16px; max-width: 760px; margin: 0 auto; }
 #feed-list:empty::before {
-  content: "пока пусто — напиши или скажи, что сделать";
+  content: "Nothing here yet — type or say what to do";
   color: var(--ink-50); text-align: center; padding: 18vh 0; display: block;
 }
 .msg { max-width: 85%; animation: fadeUp .4s ease both; }
