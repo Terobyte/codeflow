@@ -21,6 +21,10 @@ class SynapseConfig:
     deepgram_api_key: str | None = None
     fish_audio_api_key: str | None = None
     fish_reference_id: str | None = None
+    # KV-1a §4.1: собственный голос Коры на Play-пути (REST). Незаданный → резолвится в
+    # fish_reference_id ДО обращения к кэшу (одинаковый реальный звук закономерно делит ключ),
+    # поэтому это не required-секрет: фича деградирует, не ломается.
+    kora_fish_reference_id: str | None = None
     # s2.1-pro-free is free through end of July 2026 (§11.4 M0 assumption); "s2-pro" (paid)
     # is pipecat's own FishAudioTTSService default.
     fish_tts_model: str = "s2.1-pro-free"
@@ -110,6 +114,7 @@ class SynapseConfig:
             deepgram_api_key=e.get("DEEPGRAM_API_KEY") or None,
             fish_audio_api_key=e.get("FISH_AUDIO_API_KEY") or None,
             fish_reference_id=e.get("FISH_REFERENCE_ID") or None,
+            kora_fish_reference_id=e.get("KORA_FISH_REFERENCE_ID") or None,
             kora_workspace_dir=e.get("KORA_WORKSPACE_DIR") or None,
             kora_cli_path=e.get("KORA_CLI_PATH") or None,
         )

@@ -45,15 +45,20 @@ class TTSCache:
         self._model = model
         self._voice = voice
 
-    def key(self, text: str) -> str:
-        raw = f"{self._model}|{self._voice}|{text.strip()}"
+    def key(self, text: str, voice_id: str | None = None) -> str:
+        # KV-1a §4.1: ключ voice-aware — иначе аудио Коры легло бы под ключ диспетчера и
+        # следующий дисп-Play того же текста вернул бы голос Коры. voice_id=None →
+        # конструкторный голос, и тогда строка ключа побайтово та же, что до KV-1a
+        # (старые кэш-WAV не осиротели, массового ре-синтеза нет).
+        voice = self._voice if voice_id is None else voice_id
+        raw = f"{self._model}|{voice}|{text.strip()}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
-    def wav_path(self, text: str) -> Path:
-        return self.root / f"{self.key(text)}.wav"
+    def wav_path(self, text: str, voice_id: str | None = None) -> Path:
+        return self.root / f"{self.key(text, voice_id)}.wav"
 
-    def get(self, text: str) -> bytes | None:
-        p = self.wav_path(text)
+    def get(self, text: str, voice_id: str | None = None) -> bytes | None:
+        p = self.wav_path(text, voice_id)
         return p.read_bytes() if p.exists() else None
 
     def _atomic_write(self, path: Path, data: bytes) -> None:
@@ -70,22 +75,24 @@ class TTSCache:
                 except OSError:
                     pass
 
-    def put_wav(self, text: str, wav: bytes) -> None:
-        p = self.wav_path(text)
+    def put_wav(self, text: str, wav: bytes, voice_id: str | None = None) -> None:
+        p = self.wav_path(text, voice_id)
         if p.exists():
             return  # идемпотентно: реалтайм-повтор той же фразы не переписывает файл
         self._atomic_write(p, wav)
 
-    def put_pcm(self, text: str, pcm: bytes, sample_rate: int, num_channels: int) -> None:
+    def put_pcm(self, text: str, pcm: bytes, sample_rate: int, num_channels: int,
+                voice_id: str | None = None) -> None:
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(num_channels)
             w.setsampwidth(2)
             w.setframerate(sample_rate)
             w.writeframes(pcm)
-        self.put_wav(text, buf.getvalue())
+        self.put_wav(text, buf.getvalue(), voice_id)
 
-    def assemble(self, text: str, splitter: Callable[[str], list[str]]) -> bytes | None:
+    def assemble(self, text: str, splitter: Callable[[str], list[str]],
+                 voice_id: str | None = None) -> bytes | None:
         """Сборка полного WAV из посентенсовых кусков в кэше (тот же splitter, что арбитр,
         инвариант join==text). Любой промах / разнобой в (nchannels,sampwidth,framerate) →
         None (честный fallback на REST-синтез). Один сегмент → None (нечего собирать)."""
@@ -95,7 +102,7 @@ class TTSCache:
         params: tuple[int, int, int] | None = None
         chunks: list[bytes] = []
         for s in sentences:
-            p = self.wav_path(s)
+            p = self.wav_path(s, voice_id)
             if not p.exists():
                 return None
             with wave.open(str(p), "rb") as w:
@@ -115,7 +122,7 @@ class TTSCache:
             w.setframerate(framerate)
             w.writeframes(b"".join(chunks))
         result = buf.getvalue()
-        self.put_wav(text, result)
+        self.put_wav(text, result, voice_id)
         return result
 
     # --- санитайз-кэш: ключ по ИСХОДНОМУ тексту (без model|voice), иначе недетерминизм

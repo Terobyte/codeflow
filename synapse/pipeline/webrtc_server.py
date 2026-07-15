@@ -719,11 +719,21 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         text = str(data.get("text") or "").strip()[:4000]
         if not text:
             return JSONResponse({"error": "empty text"}, status_code=400)
+        # KV-1a §4.1: роли только disp|kora, неизвестная → 400 (раньше молча становилась disp).
+        # Пустая/отсутствующая по-прежнему disp — это контракт сегодняшнего клиента.
         role = data.get("role") or "disp"
+        if role not in ("disp", "kora"):
+            return JSONResponse({"error": "bad role"}, status_code=400)
         cache = getattr(host, "tts_cache", None)
         if cache is None:
             return JSONResponse({"error": "unavailable"}, status_code=503)
         cfg = host.cfg
+        # KV-1a §4.1: voice_id резолвится ДО lookup и идёт во ВСЕ ступени (кэш → сборка →
+        # синтез → put). Иначе аудио Коры село бы под дисп-ключ. Незаданный голос Коры
+        # резолвится в дисп-id здесь же — одинаковый звук закономерно делит один ключ.
+        voice_id = cfg.fish_reference_id or ""
+        if role == "kora":
+            voice_id = cfg.kora_fish_reference_id or voice_id
         if role == "kora" and not speakable(text, max_chars=cfg.kora_speak_max_chars):
             # KV-2 §4.2: speakify — только для НЕразговорного текста. Чистый по форматному
             # фильтру идёт в TTS как есть: минус платный Gemini-вызов и его задержка. Кэш
@@ -737,10 +747,12 @@ def build_web_app(host: SynapseHost) -> FastAPI:
                 await asyncio.to_thread(cache.put_speak_text, text, spoken)
         else:
             spoken = text
-        wav = await asyncio.to_thread(cache.get, spoken)
+        wav = await asyncio.to_thread(cache.get, spoken, voice_id)
         source = "cache"
         if wav is None:
-            wav = await asyncio.to_thread(cache.assemble, spoken, default_sentence_splitter)
+            wav = await asyncio.to_thread(
+                cache.assemble, spoken, default_sentence_splitter, voice_id
+            )
             source = "assembled"
         if wav is None:
             if not cfg.fish_audio_api_key:
@@ -748,12 +760,12 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             try:
                 wav = await fish_rest_tts(
                     spoken, api_key=cfg.fish_audio_api_key, model=cfg.fish_tts_model,
-                    voice=cfg.fish_reference_id or "", timeout_s=30.0,
+                    voice=voice_id, timeout_s=30.0,
                 )
             except Exception as exc:
                 logger.warning("api_tts: REST synth failed (%s)", exc)
                 return JSONResponse({"error": "tts_failed"}, status_code=502)
-            await asyncio.to_thread(cache.put_wav, spoken, wav)
+            await asyncio.to_thread(cache.put_wav, spoken, wav, voice_id)
             source = "synth"
         return Response(content=wav, media_type="audio/wav",
                         headers={"x-tts-source": source, "cache-control": "no-store"})
