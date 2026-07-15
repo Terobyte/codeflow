@@ -333,17 +333,41 @@ class SynapseHost:
             return
         if gate_mode is None and th.request_text is not None:
             return  # B46: несвязанная прямая задача не касается гейт-стейта треда
-        self.threads.set_outcome(thread_id, outcome)
-        if outcome != "completed":
+        # Backward-compatible/manual callback path: older persisted threads and unit-level
+        # integrations may report an outcome without a recorded task id. There is no run
+        # generation to compare in that case, but outcome+optional transition are still written
+        # atomically. Every real gate launch below records its task id via begin_run().
+        if not th.task_ids:
+            self.threads.finish_run(
+                thread_id,
+                outcome,
+                expected_stage=th.stage,
+                completed_stage="done" if outcome == "completed" and th.stage == "code" else None,
+            )
             return
-        target = "done" if gate_mode is not None and th.stage == "code" else None
-        if gate_mode is None and th.stage == "collect":
-            target = "done"  # B47: чистый direct-dispatch тред покидает «СБОР»
-        if target is not None:
-            try:
-                self.threads.set_stage(thread_id, target)
-            except ValueError:
-                pass  # гонка: стадия уже сменилась — молчаливый no-op
+        if gate_mode is None:
+            # Direct dispatch never sets a stage at launch, so the stage cannot serve as this
+            # run's generation token — guard against the CURRENT stage, like the task_id-less
+            # branch above. Hardcoding "collect" here silently dropped every outcome after the
+            # first: the first completion moves the thread collect→done, "done" is terminal
+            # (_STAGE_TRANSITIONS), and the CAS then never matched again, freezing last_outcome
+            # (and the UI badge that renders it) on task #1 forever.
+            # The outcome write is unconditional and only the B47 collect→done transition is
+            # stage-gated — the two have different preconditions and must not share one guard.
+            self.threads.finish_run(
+                thread_id,
+                outcome,
+                expected_stage=th.stage,
+                completed_stage="done" if outcome == "completed" and th.stage == "collect" else None,
+            )
+            return
+        expected_stage = "spec_plan" if gate_mode == "docs_only" else "code"
+        self.threads.finish_run(
+            thread_id,
+            outcome,
+            expected_stage=expected_stage,
+            completed_stage="done" if expected_stage == "code" else None,
+        )
 
     async def gate_action(self, thread_id: str, action: str,
                           model: str | None = None, confirm: bool = False,
@@ -455,8 +479,7 @@ class SynapseHost:
             return {"error": "unknown_action"}
 
     def _launch_run(self, th, stage: str, gate_mode: str, text: str, model: str | None) -> None:
-        """Общий хвост запуска стадийного рана: set_stage → task_id → store.start_task →
-        append_task → set_last_model → kora_runner.start → gate_card в ленту."""
+        """Cross-store launch saga with compensation until the runner accepts the start."""
         from synapse.bridge.state import TaskStatus
         # B11: gate-minted IDs live in their OWN `gate-` namespace, DISJOINT from confirm's
         # `task-…` IDs. The two mint sites are independent itertools.count(1) generators with the
@@ -465,20 +488,39 @@ class SynapseHost:
         # overwrote → a task's live log misrouted into another (possibly cross-project) thread.
         # Distinct prefixes make cross-module collision structurally impossible.
         task_id = f"gate-{int(self.clock.now() * 1000)}-{next(_GATE_TASK_SEQ)}"
-        self.threads.set_stage(th.id, stage)
-        self.store.start_task(task_id, text, TaskStatus.RUNNING, self.clock.now())
-        self.threads.append_task(th.id, task_id)
-        if model is not None:
-            self.threads.set_last_model(th.id, model)
+        thread_checkpoint = self.threads.begin_run(th.id, stage, task_id, model)
+        task_checkpoint = None
         root = self._resolve_root_for(th)
-        self.kora_runner.start(
-            task_id, text,
-            RunSpec(thread_id=th.id, project_root=root, gate_mode=gate_mode, model=model),
-        )
-        self.threads.append_feed(th.id, {
-            "ts": self.clock.now(), "kind": "gate_card",
-            "stage": stage, "action": "run_started", "model": model,
-        })
+        try:
+            task_checkpoint = self.store.begin_task(
+                task_id, text, TaskStatus.RUNNING, self.clock.now()
+            )
+            self.kora_runner.start(
+                task_id, text,
+                RunSpec(thread_id=th.id, project_root=root, gate_mode=gate_mode, model=model),
+            )
+        except Exception:
+            # Conditional rollback tokens prevent a failed predecessor from clobbering a
+            # successor if a custom runner violates the normal synchronous start contract.
+            if task_checkpoint is not None:
+                try:
+                    self.store.rollback_task_start(task_checkpoint)
+                except Exception:  # noqa: BLE001 — preserve the launch exception
+                    logger.exception("failed to roll back TaskStore after rejected Kora start")
+            try:
+                self.threads.rollback_run(thread_checkpoint)
+            except Exception:  # noqa: BLE001 — preserve the launch exception
+                logger.exception("failed to roll back ThreadStore after rejected Kora start")
+            raise
+        # Feed is display-only and happens after the commit point. A feed I/O failure must not
+        # report launch failure after Kora has already accepted and started the run.
+        try:
+            self.threads.append_feed(th.id, {
+                "ts": self.clock.now(), "kind": "gate_card",
+                "stage": stage, "action": "run_started", "model": model,
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception("run started but gate-card feed append failed")
 
 
 _GATE_TASK_SEQ = itertools.count(1)

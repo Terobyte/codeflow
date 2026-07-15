@@ -85,6 +85,10 @@ class CircuitBreaker:
     def _next_rpd_reset(self, now: float) -> float:
         current = datetime.fromtimestamp(now, tz=timezone.utc)
         reset_today = current.replace(hour=self._rpd_reset_hour_utc, minute=0, second=0, microsecond=0)
-        if current >= reset_today:
+        # B-CASC-4: a failure landing EXACTLY on the reset boundary (current == reset_today) means
+        # today's quota just reset — the tier should unmute now (within the same day), not be muted
+        # for a full 24h until tomorrow. Strict `>` rolls to tomorrow only for a failure AFTER the
+        # reset hour has passed; AT the boundary we return reset_today (unmute now).
+        if current > reset_today:
             reset_today += timedelta(days=1)
         return reset_today.timestamp()

@@ -9,6 +9,7 @@ is known).
 from __future__ import annotations
 
 import json
+import threading
 from collections import OrderedDict
 from typing import Any, Callable, Protocol
 
@@ -56,11 +57,16 @@ def history_from_feed(entries: list[dict]) -> list[dict[str, Any]]:
     R5: очищенная командой «clear» история не должна воскресать из feed-архива)."""
     entries = list(entries)
     for i in range(len(entries) - 1, -1, -1):
-        if entries[i].get("kind") == "clear":
+        if isinstance(entries[i], dict) and entries[i].get("kind") == "clear":
             entries = entries[i + 1:]
             break
     hist: list[dict[str, Any]] = []
     for e in entries:
+        # B-DISP-6: a corrupted feed (a bare string/None/list, or a future schema drift) must not
+        # crash rehydration with AttributeError — skip non-dict entries instead. The clear-search
+        # above guards the same way so a malformed entry never masquerades as the clear marker.
+        if not isinstance(e, dict):
+            continue
         kind = e.get("kind")
         if kind in ("user", "assistant"):
             _append_coalesced(hist, kind, str(e.get("text", "")))
@@ -103,6 +109,12 @@ class DispatcherTurnLoop:
         # [СОСТОЯНИЕ] (иначе завершённая задача течёт во все треды, see should_hide_task).
         self._owner_thread_for = owner_thread_for
         self._histories: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+        # Async turns normally share one event loop, but HTTP/voice adapters can call the
+        # synchronous history surfaces from different threads. The lock is deliberately held
+        # only for in-memory commits, never across an LLM await.
+        self._history_locks: dict[str, threading.RLock] = {}
+        self._history_locks_guard = threading.Lock()
+        self._history_index_lock = threading.RLock()
         # Gate v2 C6 (sec-6): пер-тред поколение истории. clear_history инкрементит его; ход,
         # начатый ДО clear, при коммите видит несовпадение и НЕ воскрешает очищенную историю.
         self._generations: dict[str, int] = {}
@@ -110,41 +122,53 @@ class DispatcherTurnLoop:
     # Делегат на модульную функцию — общая точка с регидрацией (B44 вынес логику наверх).
     _append_coalesced = staticmethod(_append_coalesced)
 
+    def _history_lock_for(self, thread_id: str) -> threading.RLock:
+        with self._history_locks_guard:
+            return self._history_locks.setdefault(thread_id, threading.RLock())
+
     def _history_for(self, thread_id: str) -> list[dict[str, Any]]:
         """Пер-тред контекст (спека §4, находка A): история LLM ключуется по треду.
         Холодный тред регидрируется из персиста через history_from_feed (единая точка
         «feed → history» с войс-каналом, B44)."""
-        hist = self._histories.get(thread_id)
-        if hist is None:
-            hist = []
-            if self._thread_feed_reader is not None:
-                hist = history_from_feed(list(self._thread_feed_reader(thread_id)))
-            self._histories[thread_id] = hist
-            while len(self._histories) > _MAX_CACHED_THREADS:
-                self._histories.popitem(last=False)
-        else:
-            self._histories.move_to_end(thread_id)
-        return hist
+        with self._history_lock_for(thread_id):
+            with self._history_index_lock:
+                hist = self._histories.get(thread_id)
+            if hist is None:
+                hist = []
+                if self._thread_feed_reader is not None:
+                    hist = history_from_feed(list(self._thread_feed_reader(thread_id)))
+                with self._history_index_lock:
+                    self._histories[thread_id] = hist
+                    while len(self._histories) > _MAX_CACHED_THREADS:
+                        self._histories.popitem(last=False)
+            else:
+                with self._history_index_lock:
+                    self._histories.move_to_end(thread_id)
+            return hist
 
     def note_external_turn(self, thread_id: str, role: str, text: str) -> None:
         """Gate v2 D4' (sec-5): реплика, прошедшая МИМО ingest_user_turn (войс-путь пишет её в
         feed напрямую), доливается в ТЁПЛУЮ LLM-историю треда, чтобы кэшированный тред увидел
         разговор без рестарта. Кэш-мисс — no-op: холодная регидрация подхватит её из feed сама
         (writer уже положил запись в ленту до вызова)."""
-        hist = self._histories.get(thread_id)
-        if hist is None:
-            return
-        self._append_coalesced(hist, role, text)
+        with self._history_lock_for(thread_id):
+            with self._history_index_lock:
+                hist = self._histories.get(thread_id)
+            if hist is None:
+                return
+            self._append_coalesced(hist, role, text)
 
     def clear_history(self, thread_id: str) -> None:
         """Gate v2 C1': команда «clear» — LLM-история треда чистится IN-PLACE (живая ссылка,
         дисциплина _maybe_compact) + поколение инкрементится (C6). Feed-файл НЕ трогается
         (лента = архив); clear-маркер в ленту пишет РОУТ (канонический слой записи —
         webrtc_server, как у user/assistant)."""
-        hist = self._histories.get(thread_id)
-        if hist is not None:
-            hist[:] = []
-        self._generations[thread_id] = self._generations.get(thread_id, 0) + 1
+        with self._history_lock_for(thread_id):
+            with self._history_index_lock:
+                hist = self._histories.get(thread_id)
+            if hist is not None:
+                hist[:] = []
+            self._generations[thread_id] = self._generations.get(thread_id, 0) + 1
 
     async def force_compact(self, thread_id: str) -> None:
         """Gate v2 C1': команда «compact» — немедленный компакт истории треда, минуя порог
@@ -229,10 +253,11 @@ class DispatcherTurnLoop:
         # Gate v2 C6 (B20-стиль: правда на момент коммита, не до-await снимок): «clear»,
         # прилетевший во время нашего await, инкрементит поколение — поздний коммит этой
         # (user, assistant)-пары молча воскресил бы только что очищенную историю. Скип, не ошибка.
-        if self._generations.get(thread_id, 0) == generation:
-            history.append({"role": "user", "content": transcript})
-            if text:
-                history.append({"role": "assistant", "content": text})
+        with self._history_lock_for(thread_id):
+            if self._generations.get(thread_id, 0) == generation:
+                history.append({"role": "user", "content": transcript})
+                if text:
+                    history.append({"role": "assistant", "content": text})
         return record, text
 
     async def _complete(
@@ -337,11 +362,13 @@ class DispatcherTurnLoop:
         # заменяем РОВНО её и сохраняем всё, что теперь идёт следом (исходный хвост + чужие
         # коммиты). Если параллельный ход уже сам пересобрал/сжал список (голова не совпала) —
         # no-op, а не затирание его результата.
-        if history[:len(older)] == older:
-            history[:len(older)] = [{"role": "user", "content": f"[КОМПАКТ] {summary}"}]
-        if self._on_compact is not None:
+        compacted = False
+        with self._history_lock_for(thread_id):
+            if history[:len(older)] == older:
+                history[:len(older)] = [{"role": "user", "content": f"[КОМПАКТ] {summary}"}]
+                compacted = True
+        if compacted and self._on_compact is not None:
             try:
                 self._on_compact(thread_id)
             except Exception:  # noqa: BLE001 — колбэк ленты не валит ход
                 pass
-

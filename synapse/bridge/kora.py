@@ -480,7 +480,15 @@ class KoraRunner:
         fut = self._pending_answer
         if fut is not None and not fut.done():
             self._store.clear_awaiting()
-            fut.set_result(text)
+            # B-BRIDGE-2: the parked future can be cancelled between the `not fut.done()` check and
+            # `set_result` (a superseding task cancels `self._active`, which propagates into the
+            # parked future). set_result on a cancelled/done future raises InvalidStateError and
+            # would mark a legitimate answer as a failed turn. Catch it and return False so the
+            # caller reports no_pending_question and the user can retry.
+            try:
+                fut.set_result(text)
+            except asyncio.InvalidStateError:
+                return False
             return True
         return False
 

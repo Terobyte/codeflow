@@ -12,6 +12,8 @@ dataclass and a small ledger with a single consumer didn't earn three files).
 from __future__ import annotations
 
 import json
+import copy
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -76,6 +78,22 @@ class TaskState:
     started_ts: float | None = None
     last_event_ts: float | None = None
     events: list[KoraEvent] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TaskStartCheckpoint:
+    """Rollback token for the host's cross-store run-start saga.
+
+    A gate launch replaces the global task slot before the external runner is started.  If
+    that last step fails, restoring only ``None`` would discard the previous terminal task
+    (and its liveness history).  The token therefore carries the complete pre-launch state
+    and is accepted only while the task it belongs to still owns the slot.
+    """
+
+    started_task_id: str
+    task: TaskState | None
+    last_event_ts: float | None
+    staged: dict[str, Any] | None
 
 
 def _fmt_ts(ts: float | None) -> str:
@@ -163,6 +181,10 @@ class TaskStore:
 
     def __init__(self, clock: Clock, journal_dir: str | Path | None = None) -> None:
         self._clock = clock
+        # TaskStore is called by the ASGI loop, Kora callbacks and a few synchronous adapters.
+        # Serialize the complete mutate+snapshot+rename critical section: locking only the
+        # rename still allows one writer to snapshot another writer's half-applied mutation.
+        self._lock = threading.RLock()
         self._task: TaskState | None = None
         self._last_event_ts: float | None = None
         self._staged: dict[str, Any] | None = None
@@ -207,9 +229,59 @@ class TaskStore:
 
     def start_task(self, task_id: str, text: str, status: TaskStatus, now: float) -> TaskState:
         """Creates the (only) active TaskState — used by ConfirmFlow on commit/staged."""
-        self._task = TaskState(id=task_id, text=text, status=status, started_ts=now, last_event_ts=None, events=[])
-        self._persist()
-        return self._task
+        with self._lock:
+            self._start_task_unlocked(task_id, text, status, now)
+            self._persist_unlocked()
+            return self._task
+
+    def begin_task(
+        self, task_id: str, text: str, status: TaskStatus, now: float
+    ) -> TaskStartCheckpoint:
+        """Replace the task slot and return a conditional rollback token.
+
+        This is intentionally narrower than a general transaction API: it exists for the
+        host's launch saga, where TaskStore and ThreadStore must be compensated if the runner
+        rejects the launch.  Ordinary confirm-flow callers continue to use ``start_task``.
+        """
+        with self._lock:
+            checkpoint = TaskStartCheckpoint(
+                started_task_id=task_id,
+                task=copy.deepcopy(self._task),
+                last_event_ts=self._last_event_ts,
+                staged=copy.deepcopy(self._staged),
+            )
+            self._start_task_unlocked(task_id, text, status, now)
+            try:
+                self._persist_unlocked()
+            except Exception:
+                self._restore_checkpoint_unlocked(checkpoint)
+                raise
+            return checkpoint
+
+    def rollback_task_start(self, checkpoint: TaskStartCheckpoint) -> bool:
+        """Restore a failed launch iff its task still owns the global slot."""
+        with self._lock:
+            if self._task is None or self._task.id != checkpoint.started_task_id:
+                return False
+            self._restore_checkpoint_unlocked(checkpoint)
+            self._persist_unlocked()
+            return True
+
+    def _start_task_unlocked(
+        self, task_id: str, text: str, status: TaskStatus, now: float
+    ) -> None:
+        self._task = TaskState(
+            id=task_id, text=text, status=status, started_ts=now,
+            last_event_ts=None, events=[],
+        )
+        # Liveness belongs to the task occupying the slot. Carrying the previous task's
+        # heartbeat into a new run can immediately classify the new run as unreachable.
+        self._last_event_ts = None
+
+    def _restore_checkpoint_unlocked(self, checkpoint: TaskStartCheckpoint) -> None:
+        self._task = copy.deepcopy(checkpoint.task)
+        self._last_event_ts = checkpoint.last_event_ts
+        self._staged = copy.deepcopy(checkpoint.staged)
 
     def stage_task(self, task_id: str, text: str, staged: dict[str, Any], now: float) -> TaskState:
         """B12: atomically create a PENDING_CONFIRMATION task AND its staged blob in ONE persist.
@@ -217,64 +289,73 @@ class TaskStore:
         crash between them left a PENDING_CONFIRMATION task with staged=null on disk — wedging the
         flow forever (has_active_task() blocks every submit while confirm() rejects). One persist
         closes the window; `_load` reconciles any state.json still carrying the old two-write scar."""
-        self._task = TaskState(
-            id=task_id, text=text, status=TaskStatus.PENDING_CONFIRMATION,
-            started_ts=now, last_event_ts=None, events=[],
-        )
-        self._staged = staged
-        self._persist()
-        return self._task
+        with self._lock:
+            self._task = TaskState(
+                id=task_id, text=text, status=TaskStatus.PENDING_CONFIRMATION,
+                started_ts=now, last_event_ts=None, events=[],
+            )
+            self._last_event_ts = None
+            self._staged = staged
+            self._persist_unlocked()
+            return self._task
 
     def set_task_status(self, status: TaskStatus) -> None:
-        if self._task is None:
-            return
-        if self._task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-            # Terminal statuses are set only by Kora events (apply_event); a later
-            # set_task_status (e.g. confirm-flow RUNNING) must not resurrect a finished task (Bug 6).
-            return
-        self._task.status = status
-        self._persist()
+        with self._lock:
+            if self._task is None:
+                return
+            if self._task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                # Terminal statuses are set only by Kora events (apply_event); a later
+                # set_task_status (e.g. confirm-flow RUNNING) must not resurrect a finished task (Bug 6).
+                return
+            self._task.status = status
+            self._persist_unlocked()
 
     def clear_task(self) -> None:
         """Drops the current task entirely — used when a staged (never-sent-to-Kora)
         confirmation is abandoned (deny/timeout/rereadback-exhausted): there is nothing to
         remember, it never became Kora's problem."""
-        self._task = None
-        self._persist()
+        with self._lock:
+            self._task = None
+            self._last_event_ts = None
+            self._persist_unlocked()
 
     def request_cancel(self) -> bool:
-        if self._task is None or self._task.status not in (TaskStatus.RUNNING, TaskStatus.PENDING_CONFIRMATION):
-            return False
-        self._task.status = TaskStatus.CANCEL_REQUESTED
-        self._persist()
-        return True
+        with self._lock:
+            if self._task is None or self._task.status not in (TaskStatus.RUNNING, TaskStatus.PENDING_CONFIRMATION):
+                return False
+            self._task.status = TaskStatus.CANCEL_REQUESTED
+            self._persist_unlocked()
+            return True
 
     def set_staged(self, staged: dict[str, Any] | None) -> None:
-        self._staged = staged
-        self._persist()
+        with self._lock:
+            self._staged = staged
+            self._persist_unlocked()
 
     def heartbeat(self, now: float) -> None:
-        self._last_event_ts = now
-        self._persist()
+        with self._lock:
+            self._last_event_ts = now
+            self._persist_unlocked()
 
     def apply_event(self, event: KoraEvent) -> None:
-        self._last_event_ts = event.ts
-        if self._task is not None:
-            new_status = self._EVENT_STATUS.get(event.type)
-            already_terminal = self._task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-            terminal_event = new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-            # B14: once the task is terminal, a REPEAT terminal signal (a second ResultMessage /
-            # a task_failed after task_completed — the SDK stream loop has no break) must be a
-            # true no-op for the record. The B3 guard below already protects `.status`, but the
-            # append was OUTSIDE it, so the duplicate terminal event still grew `task.events`
-            # (rendered as a phantom extra line in snapshot/render_state). Skip the append too.
-            if not (already_terminal and terminal_event):
-                self._task.events.append(event)
-                self._task.last_event_ts = event.ts
-                # B3: never overwrite a terminal status (COMPLETED→FAILED or resurrect to RUNNING).
-                if new_status is not None and not already_terminal:
-                    self._task.status = new_status
-        self._persist()
+        with self._lock:
+            self._last_event_ts = event.ts
+            if self._task is not None:
+                new_status = self._EVENT_STATUS.get(event.type)
+                already_terminal = self._task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                terminal_event = new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                # B14: once the task is terminal, a REPEAT terminal signal (a second ResultMessage /
+                # a task_failed after task_completed — the SDK stream loop has no break) must be a
+                # true no-op for the record. The B3 guard below already protects `.status`, but the
+                # append was OUTSIDE it, so the duplicate terminal event still grew `task.events`
+                # (rendered as a phantom extra line in snapshot/render_state). Skip the append too.
+                if not (already_terminal and terminal_event):
+                    self._task.events.append(event)
+                    self._task.last_event_ts = event.ts
+                    # B3: never overwrite a terminal status (COMPLETED→FAILED or resurrect to RUNNING).
+                    if new_status is not None and not already_terminal:
+                        self._task.status = new_status
+            self._persist_unlocked()
 
     def liveness(self, now: float, stale_after_s: float, unreachable_after_s: float) -> Liveness:
         # E5 (MAJOR-R1): while parked on a user answer, Kora is ALIVE — blocked on the human, not
@@ -373,7 +454,7 @@ class TaskStore:
             return CANON_PHRASE_STALE_KORA
         # E5 (MAJOR-R1): deterministic truth on the cost-cap hard-stop path — a parked question
         # is not a stalled task. Checked before the generic status phrases below.
-        if self._awaiting_answer:
+        if self._awaiting_answer and self._task is not None and self._task.status == TaskStatus.RUNNING:
             return "Кора ждёт твоего ответа на свой вопрос."
         if self._task is None:
             return "Активных задач нет."
@@ -403,6 +484,10 @@ class TaskStore:
         return f"С возвращением. Задача «{text}»: {suffix}"
 
     def _persist(self) -> None:
+        with self._lock:
+            self._persist_unlocked()
+
+    def _persist_unlocked(self) -> None:
         if self._state_path is None:
             return
         data = {
@@ -445,6 +530,12 @@ class TaskStore:
         # PENDING_CONFIRMATION/CANCEL_REQUESTED не трогаем — их чинит обычный флоу.
         if self._task is not None and self._task.status == TaskStatus.RUNNING:
             self._task.status = TaskStatus.FAILED
+            # `_last_event_ts` deliberately keeps the pre-crash value: it measures when KORA last
+            # spoke, and this reconcile event is the server writing a note to itself, not a signal
+            # from a runner that no longer exists. Refreshing it to boot time would age the zombie
+            # to 0 and report OK — the exact lie this block exists to stop (and R6,
+            # test_persistence_roundtrip_restart_reports_stale_immediately, pins it).
+            boot_ts = self._clock.now()
             self._task.events.append(
                 KoraEvent(
                     id=f"boot-reconcile-{self._task.id}",
@@ -452,7 +543,7 @@ class TaskStore:
                     cls=EventClass.NARRATABLE,
                     payload={"reason": "сервер перезапускался"},
                     speak_text=None,
-                    ts=self._clock.now(),
+                    ts=boot_ts,
                 )
             )
             self._persist()

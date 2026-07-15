@@ -206,3 +206,62 @@ def test_p2_benchmark_validators_are_strict():
     
     # t10: Reply with one word
     assert not task_map["t10"].validator("The answer is green.")
+
+
+# --- New Findings Reproduction (from bugs.md / user report) ---
+
+def test_validate_project_path_case_insensitivity_crit():
+    """CRIT: validate_project_path must reject secret directories regardless of letter casing."""
+    from synapse.projects import validate_project_path, ProjectValidationError
+
+    # ~/.ssh is forbidden, so ~/.SSH or ~/.Ssh must also be forbidden.
+    # We pass require_exists=False so it only validates the path constraint.
+    with pytest.raises(ProjectValidationError, match="секретные директории запрещены"):
+        validate_project_path("~/.SSH", require_exists=False)
+    with pytest.raises(ProjectValidationError, match="секретные директории запрещены"):
+        validate_project_path("~/.Ssh", require_exists=False)
+
+
+def test_render_state_template_awaiting_answer_gated_on_running_major():
+    """MAJOR: render_state_template must not claim Kora is awaiting an answer if the task is CANCEL_REQUESTED."""
+    from synapse.bridge.state import TaskStore, TaskStatus
+
+    store = TaskStore(FakeClock())
+    # Start a running task
+    store.start_task("t1", "test task", TaskStatus.RUNNING, 0.0)
+    store.set_awaiting()
+
+    # Precondition: should report awaiting when running
+    assert store.render_state_template(0.0, 120, 300) == "Кора ждёт твоего ответа на свой вопрос."
+
+    # Request cancel -> status changes to CANCEL_REQUESTED
+    store.request_cancel()
+    assert store.task.status == TaskStatus.CANCEL_REQUESTED
+
+    # After cancel requested, it should NOT report awaiting, but rather report cancel status
+    phrase = store.render_state_template(0.0, 120, 300)
+    assert phrase != "Кора ждёт твоего ответа на свой вопрос.", (
+        "MAJOR: render_state_template claims Kora is awaiting answer even after cancellation requested"
+    )
+    assert phrase == "Запрос на отмену передан Коре."
+
+
+@pytest.mark.asyncio
+async def test_end_turn_clears_dedup_latch_major(tmp_path):
+    """MAJOR: end_turn must remove the turn's dedup slot from the dedup map."""
+    host = _api_host(tmp_path)
+    handlers = host.text_loop._handlers
+
+    # Begin turn and make a tool call to populate dedup
+    handlers.begin_turn("turn-test-1")
+    await handlers.submit_task("создай файл")
+    assert "turn-test-1" in handlers._dedup
+    assert "submit_task" in handlers._dedup["turn-test-1"]
+
+    # End turn
+    handlers.end_turn()
+
+    # The dedup map must no longer contain the ended turn's slot
+    assert "turn-test-1" not in handlers._dedup, (
+        "MAJOR: end_turn did not clear/pop the ended turn's dedup slot from self._dedup"
+    )

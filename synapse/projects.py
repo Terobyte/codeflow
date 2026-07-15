@@ -43,8 +43,16 @@ def validate_project_path(raw: str, *, require_exists: bool = True) -> Path:
     for root in _SYSTEM_ROOTS:
         if str(p).startswith(root + "/") or str(p) == root or rp.is_relative_to(root):
             raise ProjectValidationError("системные пути запрещены")
+    # Security boundaries must follow the host filesystem's practical semantics. macOS is
+    # normally case-insensitive, while Path.is_relative_to is lexical and case-sensitive:
+    # with require_exists=False, ~/.SSH used to bypass the ~/.ssh denylist. Compare components
+    # with casefold so both persisted and newly supplied spellings hit the same boundary.
+    rp_parts = tuple(part.casefold() for part in rp.parts)
+    home_parts = tuple(part.casefold() for part in home.parts)
+    relative_parts = rp_parts[len(home_parts):] if rp_parts[:len(home_parts)] == home_parts else ()
     for sub in _FORBIDDEN_HOME_SUBDIRS:
-        if rp.is_relative_to(home / sub):
+        forbidden_parts = tuple(part.casefold() for part in Path(sub).parts)
+        if relative_parts[:len(forbidden_parts)] == forbidden_parts:
             raise ProjectValidationError("секретные директории запрещены")
     if require_exists and not rp.is_dir():
         raise ProjectValidationError("директория не существует")

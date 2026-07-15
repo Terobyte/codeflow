@@ -174,3 +174,13 @@ class TurnJournal:
     def close(self) -> None:
         self._closed = True
         self._file.close()
+
+    # B-CORE-1: the journal holds an open fd for its whole lifetime. The explicit close() call
+    # sites (console.py, webrtc shutdown) only cover the happy path — an exception in setup or a
+    # forgotten caller leaks the fd. Supporting `with TurnJournal(...) as journal:` makes the fd
+    # RAII-safe on every path; existing close() callers keep working unchanged.
+    def __enter__(self) -> "TurnJournal":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()

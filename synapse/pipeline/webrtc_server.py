@@ -47,12 +47,17 @@ def _browse_dir(raw: str | None, home: Path) -> dict | None:
     не 403 — UI всегда получает валидную страницу. Скрытые директории не показываются
     (заодно прячет .ssh/.config; первая линия защиты — validate_project_path при add)."""
     base = home.resolve()
-    # B50: null-байт в пути даёт ValueError (из Path/resolve) — падаем на home, как любой
-    # другой неразрешимый путь, а не 500.
+    # B50 / B-PIPE-6: отличаем VALIDATION-ошибку от RESOLUTION-ошибки. ValueError из Path/resolve
+    # (null-байт в пути — `Path("/etc\x00/passwd")`) — это битый ВВОД: возврат None → роут отдаёт
+    # 400, не маскирует провал валидации успешным листингом home. OSError/RuntimeError (путь не
+    # существует / нет прав / symlink-цикл) — это неразрешимый путь, легитимно падаем на home, как
+    # и задумано (UI всегда получает валидную страницу).
     try:
         p = Path(raw).expanduser() if raw else base
         rp = p.resolve()
-    except (OSError, RuntimeError, ValueError):
+    except ValueError:
+        return None  # null-byte / malformed input → 400, not a silent home fallback
+    except (OSError, RuntimeError):
         rp = base
     if not rp.is_relative_to(base) or not rp.is_dir():
         rp = base
@@ -569,6 +574,10 @@ def build_web_app(host: SynapseHost) -> FastAPI:
         async def _git(*args):
             # R-3: wait_for отменяет await, но НЕ убивает git — при зависании на сетевом FS
             # процесс-зомби. На таймаут: kill + wait, вернуть код 124.
+            # B-CORE-5: только TimeoutError оставлял subprocess живым при ЛЮБОМ другом исключении
+            # во время communicate() (CancelledError от отмены HTTP-запроса, RuntimeError) — процесс
+            # не убивался и оставался зомби до конца процесса. Любое исключение из wait_for теперь
+            # убивает proc + дожидается, таймаут по-прежнему возвращает код 124.
             proc = await asyncio.create_subprocess_exec(
                 "git", "-C", root, *args,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -579,6 +588,13 @@ def build_web_app(host: SynapseHost) -> FastAPI:
                 proc.kill()
                 await proc.wait()
                 return 124, ""
+            except BaseException:
+                # B-CORE-5: CancelledError (HTTP-запрос отменён) — это BaseException, не Exception;
+                # старый код ловил только TimeoutError, и при отмене запроса git-процесс оставался
+                # зомби. Kill (без wait — cancellation уже активен, await мог бы заменить
+                # оригинальное исключение) и re-raise, сохраняя семантику отмены.
+                proc.kill()
+                raise
             return proc.returncode, out.decode(errors="replace")
 
         rc, out = await _git("rev-parse", "--is-inside-work-tree")

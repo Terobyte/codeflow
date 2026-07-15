@@ -71,15 +71,32 @@ class CostCap:
 
     def _day_bucket(self, now: float) -> int:
         # Number of whole days since epoch, with the boundary shifted to rpd_reset_hour_utc so it
-        # matches the breaker's RPD reset semantics.
-        return int((now - self._reset_hour * 3600) // 86400)
+        # matches the breaker's RPD reset semantics. B-CASC-1: clip at 0 — for `now` before the
+        # reset hour on epoch day the raw value goes negative (e.g. reset_hour=8, now=7h → -1),
+        # and a negative bucket makes the `bucket > _reset_day` advance trigger a premature reset
+        # within the same calendar day (0 > -1). The rolling semantics only depend on RELATIVE
+        # bucket differences, and any real-world `now` is far past epoch, so flooring at 0 keeps
+        # the rolling logic correct everywhere it matters without a negative-bucket edge.
+        return max(0, int((now - self._reset_hour * 3600) // 86400))
 
     def maybe_reset(self, now: float) -> bool:
         """B30: a "per day" cap must recover when the reset hour rolls over — otherwise one trip
         hard-blocks the cascade for the whole process lifetime. Establishes the day on first call;
-        resets count+trip when the day-bucket advances. Returns True iff it reset."""
+        resets count+trip when the day-bucket advances. Returns True iff it reset.
+
+        The None-path only ANCHORS the day — it must never also clear count/trip. B-CASC-3 argued
+        that a restart could leave `_count`/`_tripped` carried over while `_reset_day` was None, and
+        cleared them here to avoid a day-long hard block. That state is unreachable: `CostCap` is
+        never rehydrated (the sole construction site, `pipeline/app.py:819`, always starts at
+        count=0/tripped=False), so nothing survives a restart to recover from. What IS reachable is
+        `record_paid_attempt()` called without `now` (a sanctioned path — see
+        `tests/test_host_singleton.py:76`), which counts the attempt while leaving `_reset_day` None.
+        Clearing here would then wipe a legitimate same-day trip on the next `maybe_reset` tick —
+        and `monitor_forever` ticks it every heartbeat — letting paid calls past the daily cap."""
         bucket = self._day_bucket(now)
         if self._reset_day is None:
+            # Anchor the day to the first `now` we see. Any count already recorded belongs to THIS
+            # bucket, so it is deliberately preserved; only a bucket ADVANCE below may clear it.
             self._reset_day = bucket
             return False
         if bucket > self._reset_day:

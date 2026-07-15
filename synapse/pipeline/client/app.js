@@ -1099,6 +1099,21 @@ async function probeSession() {
 setInterval(probeSession, 5000);
 
 // ---------- drawer (мобайл) + модалки: Escape + scroll-lock (B-CORE-6) ----------
+const FOCUSABLE = "a[href], button:not([disabled]), textarea:not([disabled]), " +
+  "input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])";
+function trapFocus(event, container) {
+  if (event.key !== "Tab") return;
+  const nodes = Array.from(container.querySelectorAll(FOCUSABLE))
+    .filter((node) => !node.hidden && node.getClientRects().length > 0);
+  if (nodes.length === 0) { event.preventDefault(); container.focus(); return; }
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !container.contains(document.activeElement))) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !container.contains(document.activeElement))) {
+    event.preventDefault(); first.focus();
+  }
+}
 function syncScrollLock() {
   // фон не скроллится, пока открыт drawer, пикер или live-overlay (PF5+R4: тот же модальный
   // стек, iOS scroll-chaining за модалкой)
@@ -1111,9 +1126,14 @@ function syncScrollLock() {
 // (мобайл И drawer закрыт), иначе десктопный сайдбар стал бы inert (closeDrawer зовётся на каждый render).
 const drawerMq = window.matchMedia("(max-width: 768px)");
 function syncDrawerA11y() {
-  const off = drawerMq.matches && !$("shell").classList.contains("drawer-open");
+  const open = drawerMq.matches && $("shell").classList.contains("drawer-open");
+  const off = drawerMq.matches && !open;
   $("sidebar").inert = off;
   $("sidebar").setAttribute("aria-hidden", off ? "true" : "false");
+  // B-UX-10: открытый drawer — модальный: фон не доступен ни Tab, ни AT.
+  $("main").inert = open;
+  if (open) $("main").setAttribute("aria-hidden", "true");
+  else $("main").removeAttribute("aria-hidden");
 }
 function openDrawer() {
   $("shell").classList.add("drawer-open"); $("backdrop").hidden = false; syncScrollLock();
@@ -1124,7 +1144,12 @@ function closeDrawer() {
   $("shell").classList.remove("drawer-open"); $("backdrop").hidden = true; syncScrollLock();
   syncDrawerA11y();
 }
-drawerMq.addEventListener("change", syncDrawerA11y);
+drawerMq.addEventListener("change", () => {
+  if (drawerMq.matches) syncDrawerA11y();
+  else closeDrawer();
+});
+// Не ждём первого сетевого render: закрытый mobile-sidebar сразу вне tab-порядка.
+syncDrawerA11y();
 $("menu-btn").addEventListener("click", openDrawer);
 $("side-close").addEventListener("click", closeDrawer);
 $("backdrop").addEventListener("click", closeDrawer);
@@ -1135,6 +1160,13 @@ $("new-thread").addEventListener("click", () => {
   requestAnimationFrame(() => $("msg-input").focus());
 });
 document.addEventListener("keydown", (e) => {
+  // Удерживаем Tab в верхней модалке. inert изолирует фон, trap замыкает цикл.
+  if (e.key === "Tab") {
+    if (!picker.hidden) { trapFocus(e, $("picker-panel")); return; }
+    if (drawerMq.matches && $("shell").classList.contains("drawer-open")) {
+      trapFocus(e, $("sidebar")); return;
+    }
+  }
   if (e.key !== "Escape") return; // Escape закрывает верхнюю открытую модалку (B-CORE-6)
   // PF5+R4: live-overlay — верх модального стека; Escape = «Завершить — в чат».
   if (!$("live-overlay").hidden) { disconnectVoice(); return; }
@@ -1152,13 +1184,20 @@ let latestBrowse = 0; // B-CORE-12: игнорируем ответ не от п
 let pickerPrevFocus = null; // B-UX-8: куда вернуть фокус после закрытия модалки-пикера
 
 function openPicker() {
-  // B-UX-8: aria-modal-диалог обязан переместить фокус внутрь себя и вернуть его при закрытии.
+  // B-UX-8: aria-modal-диалог перемещает/удерживает фокус, изолирует фон и
+  // возвращает фокус при закрытии.
   pickerPrevFocus = document.activeElement;
+  $("shell").inert = true;
+  $("shell").setAttribute("aria-hidden", "true");
   picker.hidden = false; pickerError.textContent = ""; syncScrollLock(); browse(null);
   $("picker-choose").focus();
 }
 function closePicker() {
-  picker.hidden = true; syncScrollLock();
+  picker.hidden = true;
+  $("shell").inert = false;
+  $("shell").removeAttribute("aria-hidden");
+  syncDrawerA11y();
+  syncScrollLock();
   if (pickerPrevFocus && pickerPrevFocus.focus) pickerPrevFocus.focus();
   pickerPrevFocus = null;
 }

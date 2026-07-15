@@ -214,19 +214,41 @@ class ToolHandlers:
             self._dedup.pop(oldest_key, None)
 
     def end_turn(self) -> None:
-        """С2 (Ф0.2): сброс _last_turn_id на конце хода. Раньше глобальный fallback жил вечно —
+        """С2 (Ф0.2): закрыть текущий dedup-slot и сбросить turn-id. Раньше глобальный fallback жил вечно —
         поздний tool-хвост (трейлинг tool-call pipecat-потока после конца хода) приписывался
         ЧУЖому ходу: _last_turn_id указывал на последний begin, а ContextVar в трейлинг-таске
         уже не несла своего id → добирался fallback. После end_turn fallback None, и поздний
         хвост получает честный turn_id="" (record_tool_call / _guarded уже это поддерживают).
         Полный OperationContext через command handler — Фаза 1; здесь минимум, убирающий
         misattribution. Хост зовёт это рядом с journal.end_turn()."""
-        self._last_turn_id = None
+        turn_id = self._current_turn_id
+        self._current_turn_id = None
+        if turn_id is not None:
+            self._dedup.pop(turn_id, None)
+        # Keep one empty tombstone so voice-path diagnostics can distinguish "a turn was
+        # opened and closed" from "begin_turn was never wired". _guarded never reads or writes
+        # this slot; anonymous callbacks always execute, so it cannot create a cross-turn hit.
+        self._dedup["<anonymous>"] = {}
+        # Do not erase another concurrently-started turn's fallback.
+        if self._last_turn_id == turn_id:
+            self._last_turn_id = None
 
     async def _guarded(
         self, name: str, args: dict[str, Any], fn: Callable[[], Any]
     ) -> tuple[dict[str, Any], bool]:
         turn_id = self._current_turn_id or ""
+        # Dedup is valid only inside an attributable operation. A shared anonymous slot turns
+        # two late callbacks from different turns into the same mutation and silently drops the
+        # latter. With no turn id, prefer executing the handler; downstream mutation contracts
+        # are idempotent/busy-guarded, while a false dedup hit cannot be recovered.
+        if not turn_id:
+            result = await fn()
+            # Retain the last call only for diagnostics/cleanup assertions. This entry is never
+            # consulted for a hit: every anonymous callback executes independently.
+            self._dedup.setdefault("<anonymous>", {})[name] = _DedupEntry(
+                turn_id="", result=result, args=args
+            )
+            return result, False
         turn_dedup = self._dedup.setdefault(turn_id, {})
         entry = turn_dedup.get(name)
         # B14: a dedup hit requires SAME turn AND SAME args

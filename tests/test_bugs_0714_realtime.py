@@ -366,3 +366,61 @@ async def test_B47_direct_dispatch_commit_never_advances_stage(tmp_path):
         "_on_task_committed/_run_finished never call set_stage for the direct-dispatch path, "
         "only the gated code->done transition does)"
     )
+
+
+class _FakeFailingClient(_FakeCompletingClient):
+    """Same shape, terminal message reports an error -- drives a run to TaskStatus.FAILED."""
+
+    def receive_response(self):
+        async def gen():
+            yield ResultMessage(is_error=True)
+
+        return gen()
+
+
+async def test_second_direct_dispatch_outcome_is_not_dropped(tmp_path):
+    """B47's collect->done move must not freeze last_outcome on the FIRST task forever.
+
+    The direct-dispatch outcome write is unconditional; only the collect->done transition is
+    stage-gated. Guarding both on `expected_stage="collect"` couples them to one precondition:
+    task #1 completes and moves the thread to "done", "done" is terminal (_STAGE_TRANSITIONS
+    has no outgoing edge), so every later CAS silently no-ops and last_outcome -- rendered as
+    the UI outcome badge (client/app.js:327,338,353) -- reports task #1's result for the rest
+    of the thread's life, even when a later task fails.
+    """
+    from synapse.bridge.state import TaskStatus
+    from synapse.clock import FakeClock
+    from synapse.config import SynapseConfig
+    from synapse.pipeline.app import build_host
+
+    cfg = SynapseConfig(
+        google_api_key="fake", openrouter_api_key="fake", anthropic_api_key="fake",
+        deepgram_api_key="fake", fish_audio_api_key="fake", fish_reference_id="fake",
+        journal_dir=str(tmp_path / "j"), kora_workspace_dir=str(tmp_path / "ws"),
+    )
+    host = build_host(cfg, clock=FakeClock(0.0))
+    assert host.kora_runner is not None
+
+    host.kora_runner._client_factory = _FakeCompletingClient
+    host.handlers.begin_turn("t1")
+    assert (await host.handlers.submit_task(text="первая задача"))["outcome"] == "committed"
+    await host.kora_runner._active
+
+    tid = host.voice_thread["id"]
+    assert host.threads.get(tid).last_outcome == "completed"  # setup sanity
+    assert host.threads.get(tid).stage == "done"  # setup sanity: B47 moved it out of collect
+
+    # Second task on the SAME thread -- the voice channel keeps reusing voice_thread and never
+    # resets the stage, so this is the ordinary case, not a contrived one.
+    host.kora_runner._client_factory = _FakeFailingClient
+    host.handlers.begin_turn("t2")
+    assert (await host.handlers.submit_task(text="вторая задача"))["outcome"] == "committed"
+    await host.kora_runner._active
+
+    assert host.voice_thread["id"] == tid  # setup sanity: same thread, as the channel intends
+    assert host.store.task.status == TaskStatus.FAILED  # setup sanity: task 2 really failed
+    assert host.threads.get(tid).last_outcome == "failed", (
+        "the second direct-dispatch task's outcome was dropped: last_outcome still reports "
+        f"{host.threads.get(tid).last_outcome!r} from task #1. finish_run is a compare-and-set "
+        "on expected_stage, and the thread already sits at 'done' -- so the CAS never matches."
+    )

@@ -187,6 +187,10 @@ def test_b_ux_8_picker_dialog_focus_management():
         or ".focus(" in close_body
         or "releaseFocus" in close_body
     ), "B-UX-8: closePicker does not restore focus after dialog closes"
+    assert "trapFocus" in js, "B-UX-8: picker moves focus but does not trap Tab inside the dialog"
+    assert '$("shell").inert = true' in open_body, (
+        "B-UX-8: aria-modal picker does not isolate background content"
+    )
 
 
 def test_b_ux_9_status_widget_keyboard_accessible():
@@ -207,17 +211,94 @@ def test_b_ux_10_drawer_focus_trap_and_inert():
     js = read_client_file("app.js")
     open_body = extract_block_after_pattern(js, r"function openDrawer")
     close_body = extract_block_after_pattern(js, r"function closeDrawer")
+    sync_body = extract_block_after_pattern(js, r"function syncDrawerA11y") or ""
     css = read_client_file("style.css")
     assert open_body and close_body, "Could not extract drawer open/close"
     js_ok = (
-        "inert" in js
-        or "aria-hidden" in js
-        or "trapFocus" in js
-        or "focusTrap" in js
-        or "tabindex" in js
-        or "tabIndex" in js
+        "inert" in open_body
+        or "inert" in close_body
+        or "inert" in sync_body
+        or "aria-hidden" in open_body
+        or "aria-hidden" in close_body
+        or "aria-hidden" in sync_body
     )
-    css_ok = "#sidebar[hidden]" in css or "visibility: hidden" in css or "inert" in css
+    css_ok = "inert" in css or "visibility: hidden" in css
     assert js_ok or css_ok, (
         "B-UX-10: drawer hidden only via transform — off-canvas controls stay in tab order"
+    )
+    assert '$("main").inert = open' in sync_body, (
+        "B-UX-10: open drawer does not isolate the backdrop-covered main content"
+    )
+    assert "trapFocus" in js, "B-UX-10: open drawer does not trap Tab inside the sidebar"
+
+
+# ============================================================================================
+# B45, B52-B55 Tests (from docs/bugs.md Hunt 2026-07-14 hands-on browser hunt)
+# ============================================================================================
+
+def test_b45_rename_title_node_restored_first():
+    """B45: commitRename must replace input with titleEl before any potential throw,
+    and setViewTitle must guard against null node."""
+    js = read_client_file("app.js")
+    commit_body = extract_block_after_pattern(js, r"async function commitRename")
+    set_title_body = extract_block_after_pattern(js, r"function setViewTitle")
+    assert commit_body and set_title_body, "Could not extract commitRename or setViewTitle"
+
+    # Verify commitRename does input.replaceWith(titleEl) early (before try or reading input value)
+    assert _index_before(commit_body, "replaceWith(titleEl)", "try {"), (
+        "B45: commitRename does not restore titleEl to DOM before try block"
+    )
+    # Verify setViewTitle guards against null $("view-title")
+    assert "if (n)" in set_title_body or "if (!n)" in set_title_body or "n &&" in set_title_body, (
+        "B45: setViewTitle does not guard against null view-title node"
+    )
+
+
+def test_b52_gate_card_re_enabled_on_409():
+    """B52: gate-card buttons must be re-enabled on 409 busy response."""
+    js = read_client_file("app.js")
+    render_gate_body = extract_block_after_pattern(js, r"function renderGateCard")
+    assert render_gate_body, "Could not extract renderGateCard"
+
+    # We should have a check for 409 status that sets busy message but leaves consumed=false
+    # so that buttons are re-enabled in finally.
+    assert "409" in render_gate_body, "B52: renderGateCard has no status 409 check"
+    assert "consumed" in render_gate_body and "consumed = false" in render_gate_body, (
+        "B52: consumed flag is not properly managed"
+    )
+
+
+def test_b53_successful_gate_action_keeps_buttons_disabled():
+    """B53: successful gate action sets consumed=true so buttons stay disabled and no duplicate submissions can happen."""
+    js = read_client_file("app.js")
+    render_gate_body = extract_block_after_pattern(js, r"function renderGateCard")
+    assert render_gate_body, "Could not extract renderGateCard"
+
+    assert "consumed = true" in render_gate_body, "B53: renderGateCard does not set consumed = true on success"
+    assert "!consumed" in render_gate_body or "if (consumed)" in render_gate_body or "if (!consumed)" in render_gate_body, (
+        "B53: finally block does not guard button re-enabling with consumed flag"
+    )
+
+
+def test_b54_archive_opened_thread_redirects_home():
+    """B54: archiving the currently active thread must redirect to home (hash = '#/')."""
+    js = read_client_file("app.js")
+    archive_body = extract_block_after_pattern(js, r"async function archiveThread")
+    assert archive_body, "Could not extract archiveThread"
+
+    assert "location.hash = \"#/\"" in archive_body or "location.hash = '#/'" in archive_body, (
+        "B54: archiveThread does not redirect to home when active thread is archived"
+    )
+
+
+def test_b55_garbage_thread_route_stops_polling_and_shows_error():
+    """B55: a 404 thread route must stop polling feedNotFound and add not found entry."""
+    js = read_client_file("app.js")
+    poll_body = extract_block_after_pattern(js, r"async function pollFeed")
+    assert poll_body, "Could not extract pollFeed"
+
+    assert "feedNotFound" in poll_body, "B55: pollFeed does not check or set feedNotFound"
+    assert "404" in poll_body, "B55: pollFeed does not handle 404 status"
+    assert "thread not found" in poll_body or "not found or deleted" in poll_body, (
+        "B55: pollFeed does not append not found event message"
     )
