@@ -123,6 +123,27 @@ async def test_b_casc_5_sticky_failover_tier_escapes_cost_cap(tmp_path):
     )
 
 
+async def test_cost_counting_switcher_keeps_synapse_clock_after_pipecat_clock_attach(tmp_path):
+    """Pipecat owns FrameProcessor._clock; billing must not reuse that attribute name."""
+    from pipecat.frames.frames import LLMFullResponseEndFrame
+
+    from synapse.pipeline.app import build_host, build_session_pipeline
+
+    host = build_host(_fake_cfg(tmp_path))
+    session = build_session_pipeline(host)
+    switcher = session.llm_switcher
+
+    # Live PipelineTask startup replaces FrameProcessor._clock with Pipecat's media clock,
+    # whose API is get_time(), not Synapse Clock.now().  Simulate that ownership boundary.
+    switcher._clock = object()
+    end = LLMFullResponseEndFrame()
+    end.processor = switcher.services[0]
+
+    await switcher.push_frame(end)
+
+    assert host.cost_cap.count == 1
+
+
 # ---------------------------------------------------------------------------------------
 # Shared fixture for B-DISP-8 / B-DISP-9: a manual (non-build_host) host stand-in -- same
 # shape as tests/test_findings_reproduction.py's `_api_host` -- wiring a REAL

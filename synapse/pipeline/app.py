@@ -626,7 +626,11 @@ class _CostCountingLLMSwitcher(LLMSwitcher):
         super().__init__(services, strategy_type=strategy_type)
         self._cost_cap = cost_cap
         self._labels = labels
-        self._clock = clock
+        # FrameProcessor owns ``_clock`` and replaces it with Pipecat's media clock when the
+        # live pipeline starts.  That clock exposes ``get_time()``, not our ``Clock.now()``.
+        # Keep the billing clock under a private, non-framework name so the second voice turn
+        # cannot crash after Pipecat has attached its clock.
+        self._synapse_clock = clock
 
     async def push_frame(self, frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
@@ -637,7 +641,7 @@ class _CostCountingLLMSwitcher(LLMSwitcher):
             # the condition; the sticky post-failover tier must count too.
             if (idx is not None and self._labels[idx].paid
                     and not self.strategy.advanced_this_generation()):
-                self._cost_cap.record_paid_attempt(self._clock.now())
+                self._cost_cap.record_paid_attempt(self._synapse_clock.now())
         await super().push_frame(frame, direction)
 
 
