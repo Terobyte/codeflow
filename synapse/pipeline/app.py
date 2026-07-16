@@ -1078,6 +1078,22 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
         # голосового. Residual (Parking lot): хвост голосового хода (tool-вызовы в
         # pipecat-потоке) живёт после отпуска лока — полная сериализация = pipecat-хирургия.
         async with host.turn_lock:
+            # ADV-1/ADV-2: первый голосовой ход уже является COLLECT-ходом. Тред обязан
+            # существовать ДО note_user_turn и сборки system message, иначе резолверы стадии
+            # и персоны получают None, а первая реплика уходит в консервативный base prompt.
+            if host.threads is not None:
+                tid = host.voice_thread["id"]
+                if tid is None or host.threads.get(tid) is None:
+                    pid = host.voice_project["id"]
+                    th = host.threads.create(
+                        title="новый тред",
+                        project_id=(
+                            pid
+                            if pid and host.projects is not None and host.projects.get(pid)
+                            else None
+                        ),
+                    )
+                    host.voice_thread["id"] = th.id
             # Close/flush the PREVIOUS voice turn before opening this one.  Doing this after
             # begin_turn closed the brand-new record immediately (before the LLM ran), leaving
             # its eventual answer and tool calls without a journal owner.
@@ -1106,20 +1122,10 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
                 *(m for m in context.get_messages() if m.get("role") != "system"),
             ])
         # Gate v2 D1'/D3': реплики звонка → лента треда (континуитет live→чат). Всё ВНЕ
-        # turn_lock-секции (MINOR lock-скоуп): создание треда и append-ы не держат очередь ходов.
+        # turn_lock-секции (MINOR lock-скоуп): append-ы не держат очередь ходов; сам тред уже
+        # создан выше, до сборки system message первого хода.
         if host.threads is not None:
             tid = host.voice_thread["id"]
-            if tid is None or host.threads.get(tid) is None:
-                # D1' (alt-MAJOR): EAGER-создание треда на первой голосовой реплике — буферов
-                # нет, транскрипты не теряются никогда. Паттерн _on_task_committed: проект из
-                # voice_project, битый/удалённый тихо деградирует в «без проекта».
-                pid = host.voice_project["id"]
-                th = host.threads.create(
-                    title="новый тред",
-                    project_id=pid if pid and host.projects is not None and host.projects.get(pid) else None,
-                )
-                host.voice_thread["id"] = th.id
-                tid = th.id
             host.threads.maybe_autotitle(tid, transcript)
             host.threads.append_feed(tid, {"ts": host.clock.now(), "kind": "user", "text": transcript})
             if host.text_loop is not None:

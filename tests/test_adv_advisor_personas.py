@@ -142,6 +142,33 @@ def test_voice_and_http_persona_parity(tmp_path):
     assert "ПЕРСОНА — продакт" in http.system_message
 
 
+def test_first_voice_turn_gets_collect_advisor_and_default_persona(tmp_path):
+    """Новый voice-тред должен существовать до сборки system message первого хода."""
+    import asyncio
+
+    from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
+    from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
+    from synapse.pipeline.app import build_host, build_session_pipeline
+
+    host = build_host(_fake_cfg(tmp_path))
+    session = build_session_pipeline(host)
+    stt = next(
+        p for p in session.pipeline.processors if isinstance(p, DeepgramFluxSTTService)
+    )
+    context = next(
+        p.context for p in session.pipeline.processors if isinstance(p, LLMUserAggregator)
+    )
+    handler = stt._event_handlers["on_end_of_turn"].handlers[0]
+
+    assert host.voice_thread["id"] is None
+    asyncio.run(handler(stt, "обсуди со мной идею нового приложения"))
+
+    system = context.get_messages()[0]["content"]
+    assert host.voice_thread["id"] is not None
+    assert STAGE_RULES_COLLECT in system
+    assert "ПЕРСОНА — техлид" in system
+
+
 @pytest.mark.asyncio
 async def test_dispatcher_loop_passes_persona_resolver(tmp_path):
     from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
