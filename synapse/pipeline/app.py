@@ -467,12 +467,18 @@ class SynapseHost:
                     # confirm=true из tool call не читается как власть; HTTP-клик (user_initiated=True)
                     # несёт подтверждение сам, ApprovalService в этом случае выключен. digest несёт И
                     # стадию: любое движение стадии между stage() и consume() инвалидирует pending.
-                    if not user_initiated and self.approvals is not None:
+                    approval_id: str | None = None
+                    if not user_initiated:
+                        # Authority checks fail closed if a custom/test host forgot to wire the
+                        # service.  An optional dependency must never turn into self-approval.
+                        if self.approvals is None:
+                            return {"error": "approval_unavailable"}
                         digest = gate_digest(th.request_text, action, model, fast, th.stage)
                         approval = self.approvals.consume(thread_id, action, digest, self.clock.now())
                         if approval is None:
                             readback = self.approvals.stage(thread_id, action, digest, self.clock.now())
                             return {"error": "confirm_required", "readback": readback}
+                        approval_id = approval.approval_id
                     if action == "send_to_kora":
                         # user_initiated-путь: confirm=true из клика всё ещё нужен (belt+suspenders).
                         if user_initiated and not confirm:
@@ -492,7 +498,10 @@ class SynapseHost:
                         # does — an unhandled ValueError escapes gate_action as a 500 / voice-path crash.
                         # set_stage runs BEFORE any store mutation, so a caught raise leaves no partial state.
                         try:
-                            self._launch_run(th, target_stage, gate_mode, text, model)
+                            self._launch_run(
+                                th, target_stage, gate_mode, text, model,
+                                action=action, approval_id=approval_id,
+                            )
                         except ValueError:
                             return {"error": "illegal_stage"}
                         return {"ok": True, "stage": target_stage}
@@ -515,13 +524,26 @@ class SynapseHost:
                         text = (f"Реализуй по плану docs/plans/{thread_id}.md. "
                                 f"Исходный запрос: {th.request_text}")
                         try:  # B06: same illegal-transition guard as send_to_kora above.
-                            self._launch_run(th, "code", "full", text, model)
+                            self._launch_run(
+                                th, "code", "full", text, model,
+                                action=action, approval_id=approval_id,
+                            )
                         except ValueError:
                             return {"error": "illegal_stage"}
                         return {"ok": True, "stage": "code"}
             return {"error": "unknown_action"}
 
-    def _launch_run(self, th, stage: str, gate_mode: str, text: str, model: str | None) -> None:
+    def _launch_run(
+        self,
+        th,
+        stage: str,
+        gate_mode: str,
+        text: str,
+        model: str | None,
+        *,
+        action: str,
+        approval_id: str | None,
+    ) -> None:
         """Cross-store launch saga with compensation until the runner accepts the start."""
         from synapse.bridge.state import TaskStatus
         # B11: gate-minted IDs live in their OWN `gate-` namespace, DISJOINT from confirm's
@@ -561,9 +583,20 @@ class SynapseHost:
             self.threads.append_feed(th.id, {
                 "ts": self.clock.now(), "kind": "gate_card",
                 "stage": stage, "action": "run_started", "model": model,
+                "approval_id": approval_id,
             })
         except Exception:  # noqa: BLE001
             logger.exception("run started but gate-card feed append failed")
+        # Audit is separate from the display-only feed.  It records the one-time approval that
+        # authorized an LLM/tool launch (or null for a direct authenticated UI click).
+        self.journal.record_gate_launch(
+            task_id=task_id,
+            thread_id=th.id,
+            action=action,
+            stage=stage,
+            model=model,
+            approval_id=approval_id,
+        )
 
 
 _GATE_TASK_SEQ = itertools.count(1)
@@ -1036,6 +1069,10 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
         # голосового. Residual (Parking lot): хвост голосового хода (tool-вызовы в
         # pipecat-потоке) живёт после отпуска лока — полная сериализация = pipecat-хирургия.
         async with host.turn_lock:
+            # Close/flush the PREVIOUS voice turn before opening this one.  Doing this after
+            # begin_turn closed the brand-new record immediately (before the LLM ran), leaving
+            # its eventual answer and tool calls without a journal owner.
+            _flush_voice_context()
             record = host.journal.begin_turn(transcript)
             host.handlers.begin_turn(record.turn_id)
             # R3: every user turn must reach confirm_flow.note_user_turn() before the LLM runs.
@@ -1062,8 +1099,6 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
         # Gate v2 D1'/D3': реплики звонка → лента треда (континуитет live→чат). Всё ВНЕ
         # turn_lock-секции (MINOR lock-скоуп): создание треда и append-ы не держат очередь ходов.
         if host.threads is not None:
-            # D3' ПЕРЕД записью текущего transcript: диффом ловится ответ ПРЕДЫДУЩЕГО хода.
-            _flush_voice_context()
             tid = host.voice_thread["id"]
             if tid is None or host.threads.get(tid) is None:
                 # D1' (alt-MAJOR): EAGER-создание треда на первой голосовой реплике — буферов
@@ -1108,7 +1143,17 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     # уже В ленте — флашить их обратно значило бы задублировать каждую реплику на реконнекте.
     _voice_cursor = {"n": len(context.get_messages())}
 
-    def _flush_voice_context() -> None:
+    def _close_voice_turn(llm_output: str = "") -> None:
+        record = host.journal.current
+        if record is None:
+            return
+        if llm_output:
+            record.llm_output = llm_output
+        host.journal.check_grounding(record, host.store.has_active_task())
+        host.journal.end_turn()
+        host.handlers.end_turn()
+
+    def _flush_voice_context(*, close_turn: bool = True) -> str:
         msgs = context.get_messages()
         fresh = msgs[_voice_cursor["n"]:]
         _voice_cursor["n"] = len(msgs)
@@ -1133,13 +1178,9 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
         # наконец получает grounding-проверку, как консольный) + end_turn. Идемпотентность: end_turn
         # no-op когда _current уже None (повторные on_commit / _flush_voice_final после закрытия).
         # committed_text — последний зафлашенный assistant-контент: это и есть llm_output хода.
-        record = host.journal.current
-        if record is not None:
-            if committed_text:
-                record.llm_output = committed_text
-            host.journal.check_grounding(record, host.store.has_active_task())
-            host.journal.end_turn()
-            host.handlers.end_turn()  # С2: сброс _last_turn_id (anti-misattribution)
+        if close_turn:
+            _close_voice_turn(committed_text)
+        return committed_text
     # S1: replicate LLMContextAggregatorPair's own __init__ recipe (user first, then the
     # assistant with a back-reference to it) so the assistant half can be the guarded
     # subclass from make_guarded_assistant_aggregator -- LLMContextAggregatorPair itself
@@ -1158,15 +1199,18 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
     # только на teardown (не на commit-флашах: там недокоммиченный хвост — это ещё живой
     # стриминг) дренируем pending-хвост в ленту, чтобы лента держала ровно то, что юзер слышал.
     def _flush_voice_final() -> None:
-        _flush_voice_context()
+        # Drain both committed context and the already-spoken partial aggregation BEFORE the
+        # journal closes.  Closing first lost the partial tail from llm_output/grounding while
+        # still showing it in the user-visible feed.
+        committed_text = _flush_voice_context(close_turn=False)
         pending = assistant_aggregator.aggregation_string() if assistant_aggregator._aggregation else ""
         assistant_aggregator._aggregation = []  # идемпотентность повторного teardown-вызова
         tid = host.voice_thread["id"]
-        if host.threads is None or tid is None or not pending.strip():
-            return
-        host.threads.append_feed(tid, {"ts": host.clock.now(), "kind": "assistant", "text": pending})
-        if host.text_loop is not None:
-            host.text_loop.note_external_turn(tid, "assistant", pending)
+        if host.threads is not None and tid is not None and pending.strip():
+            host.threads.append_feed(tid, {"ts": host.clock.now(), "kind": "assistant", "text": pending})
+            if host.text_loop is not None:
+                host.text_loop.note_external_turn(tid, "assistant", pending)
+        _close_voice_turn(pending if pending.strip() else committed_text)
 
     # Two GenerationStartHooks, not one, around llm_switcher (research §2.2): a user turn's
     # LLMContextFrame travels DOWNSTREAM out of user_aggregator, but a tool-call's

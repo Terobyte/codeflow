@@ -23,6 +23,7 @@ boilerplate. Keep the two bodies in sync if either changes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import itertools
 import json
@@ -87,6 +88,19 @@ _OUTSIDE_SCAN_MAX_ENTRIES = 2000
 # allowed explicitly BEFORE the egress/non_file fail-closed deny. Everything else non-file stays
 # denied (WebFetch/WebSearch/Task/Skill/unknown); Bash имеет СВОЮ allow-ветку выше (gate v2 A1').
 _SAFE_META_TOOLS = frozenset({"ToolSearch", "TodoWrite"})
+
+# С6 / Ф0.6: the SDK CLI receives only the environment needed to execute itself.  In
+# particular, voice/provider/control-plane credentials loaded into the host process never
+# become readable through Kora's intentionally-open Bash tool.
+_KORA_ENV_ALLOWLIST = (
+    "HOME", "PATH", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM", "USER",
+    "ANTHROPIC_API_KEY",
+)
+_KORA_REAL_CLI_ENV = "SYNAPSE_KORA_REAL_CLI"
+
+# Upper bound for noticing an AskUserQuestion park/unpark transition.  Tests monkeypatch this
+# to keep parking scenarios fast; active deadline precision remains min(tick, remaining).
+_WATCHDOG_TICK_S = 1.0
 
 # Slice-4 secret containment (§2.8, BLOCKER-1): a secret INSIDE the workspace is still a
 # secret — deny it for every file tool BEFORE the in-workspace allow. macOS APFS is
@@ -509,13 +523,20 @@ class KoraRunner:
         self._run_owner, self._run_root = task_id, root
         self._run_model = spec.model or self._cfg.kora_model
         self._run_gate_mode = spec.gate_mode or "full"
+        stream_task = asyncio.create_task(self._stream(task_id, text))
         try:
-            await asyncio.wait_for(self._stream(task_id, text), self._cfg.kora_deadline_s)
+            await self._watch_deadline(stream_task, self._cfg.kora_deadline_s)
         except Exception as exc:  # noqa: BLE001 — includes TimeoutError; CancelledError is a
             # BaseException and is NOT caught here, so a cancel/shutdown propagates while the
             # finally below still terminalizes. Any real error is alerted, never swallowed.
             self._journal.alert(AlertKind.KORA_RUN_FAILED, {"task_id": task_id, "error": repr(exc)})
         finally:
+            # Cancellation/timeout must reach the SDK client's async-with so its CLI subprocess
+            # is torn down.  Always retrieve the child result to avoid orphaned task warnings.
+            if not stream_task.done():
+                stream_task.cancel()
+            with contextlib.suppress(BaseException):
+                await stream_task
             if self._run_owner == task_id:  # identity-guard: не трогать снапшот преемника
                 self._run_owner = None
                 self._run_root = None
@@ -535,6 +556,34 @@ class KoraRunner:
                         TaskStatus.FAILED: "failed",
                     }.get(task.status, "cancelled")
                     self._on_run_finished(spec.thread_id, outcome, spec.gate_mode)
+
+    async def _watch_deadline(self, stream_task: asyncio.Task[None], budget_s: float) -> None:
+        """Spend the run deadline only while Kora is not parked for a human answer.
+
+        The budget uses the event loop's monotonic clock, matching ``asyncio.wait``.  The
+        injected domain clock may be a manually-advanced FakeClock and therefore cannot drive
+        real timeout accounting.
+        """
+        loop = asyncio.get_running_loop()
+        remaining = max(0.0, budget_s)
+        while True:
+            if stream_task.done():
+                stream_task.result()
+                return
+            parked = self._store.awaiting_answer
+            if not parked and remaining <= 0:
+                stream_task.cancel()
+                raise TimeoutError(f"kora deadline {budget_s}s exhausted (awaiting excluded)")
+            started = loop.time()
+            done, _ = await asyncio.wait(
+                {stream_task},
+                timeout=_WATCHDOG_TICK_S if parked else min(_WATCHDOG_TICK_S, remaining),
+            )
+            if done:
+                stream_task.result()
+                return
+            if not parked:
+                remaining -= loop.time() - started
 
     async def _stream(self, task_id: str, text: str) -> None:
         opts = self._build_options(task_id, text)
@@ -591,6 +640,45 @@ class KoraRunner:
         (fail-open корректен для docs_only — это сужение, а не замена)."""
         return self._run_gate_mode if self._run_gate_mode is not None else "full"
 
+    def _worker_env(self) -> dict[str, str]:
+        """Options env for the trusted sanitizer (which performs the actual replacement).
+
+        The installed SDK merges this mapping with ``os.environ``.  The wrapper named by
+        ``_sanitized_cli_path`` therefore performs a final ``execve`` with a clean allowlist.
+        A custom real CLI path is carried in one non-secret control variable and stripped by
+        that wrapper before the real process starts.
+        """
+        env = {key: os.environ[key] for key in _KORA_ENV_ALLOWLIST if key in os.environ}
+        env[_KORA_REAL_CLI_ENV] = self._real_cli_path()
+        return env
+
+    def _real_cli_path(self) -> str:
+        if self._cfg.kora_cli_path:
+            return self._cfg.kora_cli_path
+        import claude_agent_sdk
+
+        bundled = Path(claude_agent_sdk.__file__).resolve().parent / "_bundled" / "claude"
+        if not bundled.is_file():
+            raise RuntimeError(f"bundled Claude CLI not found: {bundled}")
+        return str(bundled)
+
+    @staticmethod
+    def _sanitized_cli_path() -> str:
+        return str(Path(__file__).resolve().parents[2] / "tools" / "kora_cli_sanitized.py")
+
+    def _protected_roots(self) -> tuple[Path, ...]:
+        """Roots Kora may read but must not mutate during this run.
+
+        The journal is unconditional.  The Synapse repository is protected unless the user
+        explicitly selected that repository as the run's project root.
+        """
+        journal_root = Path(self._cfg.journal_dir).resolve()
+        repo_root = Path(__file__).resolve().parents[2]
+        roots = [journal_root]
+        if self._current_root().resolve() != repo_root:
+            roots.append(repo_root)
+        return tuple(roots)
+
     def _system_prompt(self, workspace: Path, task_text: str) -> str:
         # LOAD-BEARING (§2d CASE 1): with setting_sources=[] Kora does not otherwise know its
         # cwd and will invent paths the gate then (correctly) denies — naming the workspace is
@@ -637,6 +725,7 @@ class KoraRunner:
             allowed_tools=[],
             disallowed_tools=[],
             setting_sources=[],
+            env=self._worker_env(),
             # B-BRIDGE-9: хук несёт личность СВОЕГО рана — без неё гейт судил вызов по снапшоту
             # того, кто занял поля последним. task_id известен ровно здесь, в момент сборки.
             hooks={"PreToolUse": [
@@ -644,7 +733,7 @@ class KoraRunner:
                             timeout=None)
             ]},
             model=self._run_model or self._cfg.kora_model,
-            cli_path=self._cfg.kora_cli_path,
+            cli_path=self._sanitized_cli_path(),
             max_turns=self._cfg.kora_max_turns,
             max_budget_usd=self._cfg.kora_max_budget_usd,
             system_prompt=self._system_prompt(workspace, text),
@@ -673,6 +762,7 @@ class KoraRunner:
           outside_workspace   — файловый инструмент вне workspace, не покрытый read/mutate веткой
                                 (defensive fallback; после B24 мутирующие вне ws разрешены);
           docs_only_violation — мутирующий вне docs-дерева ИЛИ Bash при gate_mode=docs_only (A6');
+          protected_path      — mutation targets journal_dir or the protected Synapse repo;
           missing_path        — файловый инструмент без пути (включая pathless Read — только
                                 Glob/Grep/LS умеют дефолт-к-cwd);
           egress              — WebFetch/WebSearch (не-Bash egress);
@@ -708,6 +798,12 @@ class KoraRunner:
                 low = cmd.casefold()
                 if any(tok in low for tok in _BASH_SECRET_TOKENS):
                     return False, "secret_path", "secret_path"
+                # Absolute journal path is a low-false-positive tripwire for the shell escape
+                # that bypasses file-tool policy.  Bash remains an audit control, not a sandbox;
+                # relative-cd and obfuscation remain the documented Phase-0 residual.
+                journal_root = str(Path(self._cfg.journal_dir).resolve()).casefold()
+                if journal_root in low:
+                    return False, "protected_path", "protected_path"
                 # Gate v2 A1': Bash allow; command[:200] уходит в журнал gate_allow (A7'-а).
                 return True, cmd[:200], "allow_egress"
             cat = "egress" if tool_name in _EGRESS_TOOLS else "non_file_tool"
@@ -748,6 +844,10 @@ class KoraRunner:
         # absolute path (home dir / username / secret-file layout disclosure oracle).
         if _is_secret_path(resolved):
             return False, "secret_path", "secret_path"
+        if tool_name in _MUTATING_FILE_TOOLS and any(
+            resolved.is_relative_to(root) for root in self._protected_roots()
+        ):
+            return False, "protected_path", "protected_path"
         if resolved.is_relative_to(ws_resolved):
             # B16: a directory-recursion read tool pointed at a DIR inside the workspace reads
             # every file under it — deny if that subtree holds a readable secret the per-path

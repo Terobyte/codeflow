@@ -7,13 +7,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
 import httpx
 
 BASE = "http://localhost:7861"
-H = {"content-type": "application/json", "origin": "http://localhost:7861"}
+_TOKEN = os.environ.get("SYNAPSE_API_TOKEN", "")
+if not _TOKEN:
+    raise RuntimeError("SYNAPSE_API_TOKEN is required for the authenticated staging smoke")
+H = {
+    "content-type": "application/json",
+    "origin": "http://localhost:7861",
+    "authorization": f"Bearer {_TOKEN}",
+}
 
 
 def show(label: str, r: httpx.Response) -> dict:
@@ -46,7 +54,7 @@ def main() -> int:
     args = ap.parse_args()
 
     fails: list[str] = []
-    client = httpx.Client(timeout=30)
+    client = httpx.Client(timeout=30, headers={"authorization": f"Bearer {_TOKEN}"})
 
     # health
     show("health /api/threads", client.get(f"{BASE}/api/threads"))

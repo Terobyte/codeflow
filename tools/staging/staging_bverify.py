@@ -17,10 +17,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from synapse.config import SynapseConfig
-from synapse.pipeline.app import build_host
+from synapse.pipeline.app import _require_api_token, build_host
 from synapse.pipeline.webrtc_server import build_web_app
 
 cfg = SynapseConfig.from_env()
+_require_api_token(cfg)
 journal = os.environ.get("STAGING_JOURNAL_DIR", "/tmp/synapse-staging-bverify")
 # short liveness windows: stale at 3s, UNREACHABLE at 6s — a COMPLETED task ages past
 # 6s within the test, so B23's "COMPLETED → OK regardless of age" is directly observable.

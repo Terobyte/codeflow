@@ -161,6 +161,34 @@ class TurnJournal:
             fsync=False,
         )
 
+    def record_gate_launch(
+        self,
+        *,
+        task_id: str,
+        thread_id: str,
+        action: str,
+        stage: str,
+        model: str | None,
+        approval_id: str | None,
+    ) -> None:
+        """Persist the deterministic authority fact behind a gate-started Kora run.
+
+        This is a standalone row rather than turn state: launch acceptance is the commit
+        point and must remain auditable even if the surrounding dispatcher turn is later
+        interrupted.  ``approval_id`` is present for LLM/tool initiated launches and null for
+        a direct authenticated UI click.
+        """
+        self._write({
+            "kind": "gate_launch",
+            "ts": self._clock.now(),
+            "task_id": task_id,
+            "thread_id": thread_id,
+            "action": action,
+            "stage": stage,
+            "model": model,
+            "approval_id": approval_id,
+        })
+
     def end_turn(self) -> None:
         if self._current is None:
             return

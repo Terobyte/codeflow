@@ -1,8 +1,14 @@
 # Диспетчер ↔ Кора: спека имплементации Фазы 0
 
-**Статус:** к исполнению. Источник — `docs/dispatcher-kora-ideal-architecture.md`
+**Статус:** реализовано и проверено, 2026-07-15. Источник — `docs/dispatcher-kora-ideal-architecture.md`
 (proposal + находки ревью кода CR-1…CR-10, 2026-07-14). Это НЕ ещё один анализ:
 каждый слайс ниже — призыв к действию с конкретными файлами, эскизами кода и DoD.
+
+Итоговый аудит реализации закрыл С0–С6. Дополнительные acceptance-якоря находятся в
+`tests/test_phase0_completion.py`: они проверяют фактическую очистку окружения CLI-wrapper-ом,
+protected roots, parking-aware deadline/cancel, audit `approval_id` и voice teardown journal.
+С5 fail-closed применяется во всех поставляемых server entrypoint-ах; `build_web_app` сохраняет
+чистую route-builder семантику для изолированных тестов, а middleware остаётся deny-by-default.
 
 > **For agentic workers:** домашний воркфлоу — каждый слайс = отдельный tero-ран
 > (`~/.claude/skills/tero/SKILL.md`). Эскизы кода в спеке — контракты, не готовые

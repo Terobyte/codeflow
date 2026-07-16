@@ -16,10 +16,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from synapse.config import SynapseConfig
-from synapse.pipeline.app import build_host
+from synapse.pipeline.app import _require_api_token, build_host
 from synapse.pipeline.webrtc_server import build_web_app
 
 cfg = SynapseConfig.from_env()
+_require_api_token(cfg)
 journal = os.environ.get("STAGING_JOURNAL_DIR")
 if journal:
     # frozen dataclass → replace; from_env() reads no JOURNAL_DIR env, so this is the only seam.
