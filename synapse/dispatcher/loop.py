@@ -322,9 +322,17 @@ class DispatcherTurnLoop:
                 result = await handler(**call.arguments)
             except TypeError as exc:
                 result = {"error": f"invalid arguments for {call.name}: {exc}"}
+        try:
+            content = json.dumps(result, ensure_ascii=False)
+        except TypeError:
+            # B-CORE-9 (defensive): a tool result carrying a non-JSON-serializable value (Path,
+            # datetime, dataclass, …) must not crash the whole turn. No current handler returns
+            # such a value — all return dict[str, primitives] — so this is a hardening net, not a
+            # live path: coerce unknown types to str so the tool-call still yields a content entry
+            # and the loop continues instead of the TypeError propagating out of the turn.
+            content = json.dumps(result, ensure_ascii=False, default=str)
         history.append(
-            {"role": "tool", "tool_call_id": call.id, "name": call.name,
-             "content": json.dumps(result, ensure_ascii=False)}
+            {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": content}
         )
         return result
 

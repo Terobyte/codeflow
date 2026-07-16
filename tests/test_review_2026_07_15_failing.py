@@ -69,7 +69,6 @@ def test_b_core_7_tts_cache_get_speak_text_must_not_raise_when_file_vanishes(tmp
 # расти с 0 поверх «старого» дня, что неотличимо от корректного поведения ровно до тех пор,
 # пока кто-то не решит, что reset() = чистый лист.
 
-@pytest.mark.xfail(reason="known-red: отчёт охотника, премиса не верифицирована (решение Теро 2026-07-16)", strict=False)
 def test_b_core_8_cost_cap_reset_must_clear_reset_day():
     cap = CostCap(max_paid_calls_per_day=3, rpd_reset_hour_utc=8)
     now = 1_000_000_000.0  # фиксированный «сегодня»
@@ -91,7 +90,7 @@ def test_b_core_8_cost_cap_reset_must_clear_reset_day():
 # чтобы вернуть одному tool-вызову ошибку и продолжить. Воспроизводится duck-typed: handler
 # возвращает непоследовательный dict — _dispatch_tool обязан обернуть сериализацию.
 
-@pytest.mark.xfail(reason="known-red: отчёт охотника, премиса не верифицирована (решение Теро 2026-07-16)", strict=False)
+@pytest.mark.xfail(reason="broken duplicate: sync-calls async _dispatch_tool (never awaited) → fails in its own setup, not on the code. B-CORE-9 FIXED 2026-07-16 (json.dumps default=str net); green proof: test_new_reported_bugs_failing.py::test_b_core_9", strict=False)
 def test_b_core_9_dispatch_tool_must_not_kill_turn_on_non_serializable_result():
     from synapse.dispatcher.loop import DispatcherTurnLoop
     from synapse.dispatcher.tools import ToolCall

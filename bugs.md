@@ -118,13 +118,13 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - expected vs actual: catch all exceptions, kill proc, wait for it, then re-raise · actual: only `TimeoutError` handled.
 - evidence: lines 572-582 show subprocess creation, try/except around wait_for. Only `TimeoutError` caught (lines 578-581 kill and wait). Any other exception (e.g., `CancelledError` if HTTP request cancelled) escapes without cleanup.
 
-### B-CORE-8 — CostCap.reset() does not clear _reset_day — MINOR — reported
+### B-CORE-8 — CostCap.reset() does not clear _reset_day — MINOR — fixed 2026-07-16 (contract hygiene)
 - class: state inconsistency · location: `synapse/cascade/services.py:124` · found-by: H-CORE
 - symptom: CostCap singleton retains the `_reset_day` timezone/bucket anchor after a reset, causing future calculations to be offset or incorrectly bound to a previous day's bucket.
 - trigger: (1) daily attempts recorded, setting `_reset_day`, (2) `reset()` is called (e.g. from tests or administration routes), (3) `_count` and `_tripped` are cleared, but `_reset_day` remains set.
 - expected vs actual: `reset()` should restore a clean state where `_reset_day = None` · actual: `_reset_day` remains intact.
 
-### B-CORE-9 — _dispatch_tool json.dumps raises TypeError on non-serializable tool results — MAJOR — reported
+### B-CORE-9 — _dispatch_tool json.dumps raises TypeError on non-serializable tool results — MAJOR→defensive — fixed 2026-07-16
 - class: exception safety · location: `synapse/dispatcher/loop.py:310` · found-by: H-CORE
 - symptom: a non-serializable tool result (e.g., datetime, Path, custom class) causes `json.dumps` to throw `TypeError`, killing the entire turn instead of returning a per-tool error.
 - trigger: (1) tool returns custom class or non-serializable data, (2) `_dispatch_tool` attempts to serialize result using `json.dumps(result)`, (3) `TypeError` propagates up to `ingest_user_turn`, crashing the turn.
@@ -388,3 +388,17 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 **Ловушка, пойманная при фиксе (не по симптому):** наивный B-CORE-10 («всегда добавлять весь KORA_REQUEST_TRUST_NOTE») сломал бы замороженный `test_prompt_answer_kora_gated_off_by_owed_killswitch` — нота содержит строку `answer_kora(text)`, а тест пинит `"answer_kora" not in prompt` при owed=off. Отсюда split на trust-фрейминг (безусловный, без `answer_kora`) + routing-ноту (owed-gated). Урок: фикс defense-in-depth обязан уважать существующие инварианты промпта, а не просто «добавить фрейминг везде».
 
 **Обе green-shape оговорки закрыты:** B-BRIDGE-11 переписан на `pytest.raises(ReplyFieldError)` (newline + marker), B-BRIDGE-10 — на «второй парк = `is_error`, A остаётся deliverable». Direct-construct `render_state.count==1` из B-BRIDGE-11 выброшен (тестировал disk-tamper форму, которую validator-reject не покрывает — вне скоупа этого бага; disk-порча flow_instruction = территория B-BRIDGE-13).
+
+---
+
+## 🧹 Дочистка 2026-07-16 — B-CORE-8/9 + сверка статусов
+
+Заказ Теро «почини до конца» после сверки реестра. Оба остававшихся живых стенда закрыты; после этого **живых открытых багов в реестре — 0**. Суита: **927 passed / 1 skipped (B-BRIDGE-14 latent) / 11 xfailed / 0 failed / 0 xpassed**.
+
+**B-CORE-8** (MINOR → **fixed**) — `services.py::CostCap.reset()` теперь чистит и `_reset_day` (полный чистый лист = как `__init__`). **Достижимость проверена:** `reset()` не зовётся ни одним прод-путём (grep: только тесты + `ContextGuard.reset` — не тот класс; прод крутит `maybe_reset`/`record_paid_attempt`). Фикс = гигиена контракта, не меняет ни одной достижимой ветки; docstring-предупреждение `maybe_reset` о None-пути не касается `reset()` (тот намеренно чистит count/trip).
+
+**B-CORE-9** (MAJOR → **defensive / fixed**) — `dispatcher/loop.py::_dispatch_tool` оборачивает `json.dumps(result)` в try/except → `default=str` на несериализуемом. **Достижимость проверена и claim сужен:** НИ один реальный ToolHandlers-метод не возвращает несериализуемое (все → `dict[str, primitives]`); стенд мокал `submit_task→Path`, чего в графе вызовов нет. Механизм реален, прод-путь **недостижим** — тот же паттерн «репро ≠ достижимость» (урок B-CASC-3). НО фикс безопасен в отличие от B-CASC-3: try/except **чистый additive net**, happy-path (сериализуемый результат) не трогает вообще → регрессии внести не может. Оставлен как hardening exception-safety на границе сериализации, что кормит LLM-петлю.
+
+**xfail-дочистка** (`test_review_2026_07_15_failing.py`, tracked): `test_b_core_8_*` разсxfailлен — позеленел, стал обычной бронёй (снят стале-маркер «премиса не верифицирована»). `test_b_core_9_*` там — **сломанный дубль**: sync-зовёт async `_dispatch_tool` (никогда не awaited) → падает в своём сетапе, не на коде; xfail оставлен, reason исправлен, живой пруф — awaited-версия в `test_new_reported_bugs_failing.py::test_b_core_9`. Дубли по-хорошему консолидировать (стр. 195) — не в этом заходе.
+
+**Сверка стале-заголовков (ответ на «глянь есть ли баги»):** верхние зонные записи всё ещё несут `reported` — **B-PIPE-6, B-BRIDGE-2, B-DISP-4/6, B-CASC-1/4, B-CORE-1/5** — но по стр. 188 они **починены** (`272cf7f`+), а бэклог 2026-07-15 закрыт целиком (7 fixed / 3 rejected, см. заходы выше). Эти шапки — **долг документации, не открытые баги**; беглый grep `reported` вводит в заблуждение. Коллизия ID: `B-CORE-9/10` из среза 2026-07-15 ≠ `B-CORE-10` МЕШ-1 (namespace переиспользован). Обе — hygiene, не код.

@@ -122,5 +122,11 @@ class CostCap:
         return True
 
     def reset(self) -> None:
+        # B-CORE-8: an explicit reset is a clean slate — restore the SAME state as __init__,
+        # including the day anchor. Leaving `_reset_day` set would make reset() disagree with a
+        # fresh CostCap; clearing it re-anchors the day on the next maybe_reset tick. (Unlike
+        # maybe_reset's None-path, reset() deliberately clears count/trip, so re-anchoring is
+        # correct here.) reset() is a test/admin helper — no production path calls it.
         self._count = 0
         self._tripped = False
+        self._reset_day = None

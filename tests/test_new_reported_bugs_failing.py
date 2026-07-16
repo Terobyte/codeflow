@@ -411,3 +411,44 @@ def test_b_core_6_runner_active_task_leak_on_runtime_error():
     # Expected: The reference to cancelled old active task is cleared or set to None.
     # Actual: runner._active still references the leaked mock task object.
     assert runner._active is None, "B-CORE-6: runner._active task reference was not cleared"
+
+
+# B-CORE-8 — CostCap.reset() does not clear _reset_day
+def test_b_core_8_cost_cap_reset_does_not_clear_reset_day():
+    cap = CostCap(max_paid_calls_per_day=3)
+    cap.record_paid_attempt(100000.0)
+    assert cap._reset_day is not None
+    cap.reset()
+    # Expected: reset() should restore a clean state where _reset_day = None.
+    # Actual: _reset_day remains set.
+    assert cap._reset_day is None, "B-CORE-8: CostCap.reset() did not clear _reset_day"
+
+
+# B-CORE-9 — _dispatch_tool json.dumps raises TypeError on non-serializable tool results
+@pytest.mark.asyncio
+async def test_b_core_9_dispatch_tool_raises_type_error_on_non_serializable():
+    from synapse.dispatcher.tools import ToolCall
+    bridge = MagicMock()
+    bridge.clock = SystemClock()
+    bridge.cfg = SynapseConfig()
+    handlers = ToolHandlers(bridge, MagicMock())
+    
+    async def mock_submit(*args, **kwargs):
+        return Path("/some/path")
+        
+    handlers.submit_task = mock_submit
+    
+    loop = DispatcherTurnLoop(MagicMock(), handlers, MagicMock(), MagicMock(), MagicMock(), SystemClock(), SynapseConfig())
+    
+    call = ToolCall(id="call_1", name="submit_task", arguments={"text": "hello"})
+    history = []
+    
+    # Expected: _dispatch_tool should not crash with TypeError when serializing.
+    # Actual: json.dumps raises TypeError on Path object.
+    try:
+        await loop._dispatch_tool(call, history)
+        assert len(history) == 1
+        assert "content" in history[0]
+    except TypeError:
+        pytest.fail("B-CORE-9: _dispatch_tool raised TypeError on non-serializable tool result")
+
