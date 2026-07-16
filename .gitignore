@@ -7,3 +7,4 @@ journals-staging/
 benchmarks/
 *.egg-info/
 .playwright-mcp/
+.zcode/
