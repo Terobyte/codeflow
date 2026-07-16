@@ -10,6 +10,15 @@
   // хост-страницы (B-UI-5). Ошибка сети/парсинга = серый «неизвестно», решений не принимаем.
   const COLORS = { green: "#2ecc71", yellow: "#f1c40f", red: "#e74c3c" };
 
+  // С5 (runs/2026-07-15-c5-bearer-authn.md): виджет инжектится в чужую страницу того же
+  // origin, так что токен, сохранённый основным клиентом (app.js) в localStorage, ему виден
+  // под тем же ключом. Своего диалога ввода виджет не заводит (см. logs.html — тот же довод).
+  const TOKEN_KEY = "synapse-api-token";
+  function authHeaders() {
+    const token = localStorage.getItem(TOKEN_KEY);
+    return token ? { Authorization: "Bearer " + token } : {};
+  }
+
   const dot = document.createElement("div");
   dot.id = "synapse-kora-status";
   dot.style.position = "fixed";
@@ -38,7 +47,15 @@
     // B-UI-6: fetch И res.json() под ОДНИМ try — 200 с битым/обрезанным телом (таймаут прокси
     // в tailnet) больше не роняет полл незамеченным SyntaxError'ом.
     try {
-      const res = await fetch("./kora-status", { cache: "no-store" });
+      const res = await fetch("./kora-status", { cache: "no-store", headers: authHeaders() });
+      if (res.status === 401) {
+        // NO-SHIP судьи (С5): `!res.ok` раньше молчаливо оставлял точку серой "неизвестно"
+        // даже когда валидный токен уже лежит в браузере (fetch его просто не слал). Тайтл
+        // теперь называет причину явно, а не маскирует 401 под «статус неизвестен».
+        dot.style.background = "#888";
+        dot.title = "Кора: нужен токен доступа — открой /client/ и введи его";
+        return;
+      }
       if (!res.ok) {
         dot.style.background = "#888";
         return;

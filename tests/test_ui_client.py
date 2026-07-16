@@ -86,7 +86,10 @@ def test_app_js_wires_voice_with_visible_states():
     body = (CLIENT_DIR / "app.js").read_text(encoding="utf-8")
     for token in (
         './vendor/pipecat.mjs"', "PipecatClient", "SmallWebRTCTransport",
-        'webrtcUrl: "/api/offer"', "enableMic: true", "onTrackStarted", "MediaStream",
+        # С5: webrtcUrl (deprecated, string-only) заменён на webrtcRequestParams{endpoint,
+        # headers} — только так голос может донести bearer-токен (runs/2026-07-15-c5-…).
+        "webrtcRequestParams", 'endpoint: "/api/offer"', "new Headers(", "Authorization",
+        "enableMic: true", "onTrackStarted", "MediaStream",
         # Ж2-фиксы: гвард НЕ требует participant (transport зовёт onTrackStarted(track)
         # без него — иначе аудио бота молча выбрасывается) + видимые стейты и таймаут
         # вместо вечного «подключаюсь…» на зависшем getUserMedia.
@@ -95,6 +98,7 @@ def test_app_js_wires_voice_with_visible_states():
     ):
         assert token in body, f"app.js voice wiring missing {token!r}"
     assert "participant && !participant.local" not in body
+    assert 'webrtcUrl: "/api/offer"' not in body  # С5: deprecated string-only call path is gone
 
 
 def _webrtc_server_or_skip():

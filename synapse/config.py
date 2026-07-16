@@ -21,6 +21,9 @@ class SynapseConfig:
     deepgram_api_key: str | None = None
     fish_audio_api_key: str | None = None
     fish_reference_id: str | None = None
+    # С5: bearer-токен control plane (middleware в webrtc_server.py). None = deny — не
+    # «authn выключен» (см. run()/_require_api_token, где пустой токен роняет старт сервера).
+    api_token: str | None = None
     # KV-1a §4.1: собственный голос Коры на Play-пути (REST). Незаданный → резолвится в
     # fish_reference_id ДО обращения к кэшу (одинаковый реальный звук закономерно делит ключ),
     # поэтому это не required-секрет: фича деградирует, не ломается.
@@ -114,6 +117,7 @@ class SynapseConfig:
             deepgram_api_key=e.get("DEEPGRAM_API_KEY") or None,
             fish_audio_api_key=e.get("FISH_AUDIO_API_KEY") or None,
             fish_reference_id=e.get("FISH_REFERENCE_ID") or None,
+            api_token=e.get("SYNAPSE_API_TOKEN") or None,
             kora_fish_reference_id=e.get("KORA_FISH_REFERENCE_ID") or None,
             kora_workspace_dir=e.get("KORA_WORKSPACE_DIR") or None,
             kora_cli_path=e.get("KORA_CLI_PATH") or None,

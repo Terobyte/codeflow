@@ -1221,6 +1221,32 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
                           flush_voice_feed=_flush_voice_final, observers=observers)
 
 
+def _require_api_token(cfg: SynapseConfig) -> None:
+    """С5: fail-closed старта сервера — `SynapseConfig.from_env` обязан остаться чистым парсером
+    (B4, не имеет права бросить), поэтому политика «нет токена → не стартуем» живёт здесь, а не
+    там. Вынесено в отдельную функцию, чтобы тест мог звать её напрямую, не поднимая uvicorn.
+    `insecure-dev` разрешён явно — маркер локальной разработки, не секрет."""
+    if not cfg.api_token:
+        raise RuntimeError(
+            "synapse: SYNAPSE_API_TOKEN не задан — control plane не может стартовать без "
+            "bearer-токена. Задай SYNAPSE_API_TOKEN в .env (см. .env.example); для локальной "
+            "разработки допустимо SYNAPSE_API_TOKEN=insecure-dev."
+        )
+    # Амендмент 1: не-ASCII токен отвергаем НА СТАРТЕ, а не разбираемся с ним в рантайме.
+    # Middleware сравнивает сырые байты заголовка с utf-8 ожидаемого — упасть оно не может,
+    # но браузер такой токен либо не отправит вовсе (проверено: `new Headers()` кидает
+    # «String contains non ISO-8859-1 code point» на кириллице), либо отправит НЕ ТЕМИ
+    # байтами: latin-1 «café» уходит одним байтом 0xE9, а сервер ждёт utf-8 0xC3 0xA9 —
+    # телефон получает вечный 401, пока curl тем же токеном работает. Такое не диагностируют.
+    if not cfg.api_token.isascii():
+        raise RuntimeError(
+            "synapse: SYNAPSE_API_TOKEN содержит не-ASCII символы — PWA такой токен отправить "
+            "не сможет (браузер запрещает не-ISO-8859-1 в заголовке, а latin-1 уходит в другой "
+            "кодировке, чем ждёт сервер), и телефон молча получал бы 401 при работающем curl. "
+            "Возьми ASCII-токен, например `openssl rand -hex 32`."
+        )
+
+
 def run() -> None:
     """`python -m synapse.pipeline.app` — boots the WebRTC demo server. The agent is now served
     over pipecat SmallWebRTCTransport (see synapse.pipeline.webrtc_server), so the browser's own
@@ -1234,6 +1260,7 @@ def run() -> None:
 
     load_dotenv()
     cfg = SynapseConfig.from_env()
+    _require_api_token(cfg)  # С5: fail-closed — нет токена, нет старта (B4 остаётся на from_env)
     host = build_host(cfg)
     app = build_web_app(host)
     uvicorn.run(app, host="localhost", port=7860)

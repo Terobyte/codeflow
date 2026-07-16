@@ -41,9 +41,21 @@
 // дисплей локального времени, решений по времени нет.
 const feed = document.getElementById("feed");
 const empty = document.getElementById("empty");
+const EMPTY_DEFAULT_TEXT = empty.textContent;
+
+// С5 (runs/2026-07-15-c5-bearer-authn.md): эта страница — standalone-поверхность вне SPA
+// app.js, но живёт на том же origin, так что токен, сохранённый основным клиентом в
+// localStorage, ей виден. Читаем его напрямую тем же ключом (TOKEN_KEY в app.js); своего
+// диалога ввода здесь не заводим — не SPA, дублировать модалку было бы scope creep.
+const TOKEN_KEY = "synapse-api-token";
+function authHeaders() {
+  const token = localStorage.getItem(TOKEN_KEY);
+  return token ? { Authorization: "Bearer " + token } : {};
+}
 
 function render(entries) {
   const atBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 40;
+  empty.textContent = EMPTY_DEFAULT_TEXT;
   empty.style.display = entries.length ? "none" : "block";
   feed.replaceChildren();
   for (const e of entries) {
@@ -64,9 +76,17 @@ function render(entries) {
 async function poll() {
   let res;
   try {
-    res = await fetch("./kora-log", { cache: "no-store" });
+    res = await fetch("./kora-log", { cache: "no-store", headers: authHeaders() });
   } catch {
     return; // сеть упала — оставляем последнее отрисованное
+  }
+  if (res.status === 401) {
+    // NO-SHIP судьи (С5): без токена (или просроченный) `if (!res.ok) return;` навсегда
+    // маскировал 401 под «Лента пуста» — молчаливый отказ вместо видимого состояния. Явный текст.
+    feed.replaceChildren();
+    empty.textContent = "Нужен токен доступа — открой /client/ и введи его там.";
+    empty.style.display = "block";
+    return;
   }
   if (!res.ok) return;
   const data = await res.json();

@@ -26,7 +26,9 @@ from synapse.pipeline import webrtc_server
 from synapse.pipeline.tts_cache import TTSCache
 from synapse.pipeline.webrtc_server import build_web_app
 
-_CSRF = {"content-type": "application/json", "origin": "http://testserver"}
+# С5: control plane требует bearer-токен — стаб-хосты ниже несут cfg.api_token="test-token".
+_CSRF = {"content-type": "application/json", "origin": "http://testserver",
+         "authorization": "Bearer test-token"}
 
 DISP_ID = "voice-disp"
 KORA_ID = "voice-kora"
@@ -50,6 +52,7 @@ class _TTSHost:
             fish_audio_api_key="fish-k",
             fish_reference_id=DISP_ID,
             kora_fish_reference_id=kora_voice,
+            api_token="test-token",
         )
         self.tts_cache = TTSCache(tmp_path / "cache", self.cfg.fish_tts_model, DISP_ID)
 
@@ -242,7 +245,8 @@ class _ProdShapedHost:
     `cfg.fish_reference_id or ""`. Именно это выражение роут обязан повторить для disp."""
 
     def __init__(self, tmp_path, disp_voice: str | None):
-        self.cfg = SynapseConfig(fish_audio_api_key="fish-k", fish_reference_id=disp_voice)
+        self.cfg = SynapseConfig(fish_audio_api_key="fish-k", fish_reference_id=disp_voice,
+                                 api_token="test-token")
         self.tts_cache = TTSCache(
             tmp_path / "cache", self.cfg.fish_tts_model, self.cfg.fish_reference_id or ""
         )

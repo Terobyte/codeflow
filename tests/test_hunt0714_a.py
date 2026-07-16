@@ -319,6 +319,7 @@ def test_B10_malformed_json_post_returns_400_not_500(tmp_path):
     from starlette.testclient import TestClient
 
     host = MagicMock()
+    host.cfg.api_token = "test-token"  # С5: /api/projects is behind bearer authn now
     app = build_web_app(host)
     # raise_server_exceptions=False: observe the real HTTP status the server would send a
     # client instead of pytest re-raising the escaped JSONDecodeError as a Python exception.
@@ -329,7 +330,8 @@ def test_B10_malformed_json_post_returns_400_not_500(tmp_path):
         content=b"{not valid json",
         # CSRF-satisfying headers: JSON content-type + Origin whose netloc matches Host
         # (TestClient's default Host is "testserver").
-        headers={"content-type": "application/json", "origin": "http://testserver"},
+        headers={"content-type": "application/json", "origin": "http://testserver",
+                 "authorization": "Bearer test-token"},
     )
 
     assert resp.status_code == 400, (

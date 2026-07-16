@@ -337,7 +337,12 @@ def test_app_js_network_contract_is_unchanged():
     assert '"/api/browse"' in browse, "эндпоинт browse больше не литерал — пинить нечего"
     assert "getJSON(url)" in browse
     # Мимо пяти хелперов в сеть ходит ровно один путь — SDK голоса (POST /api/offer).
-    assert 'webrtcUrl: "/api/offer"' in js
+    # С5: webrtcUrl (deprecated, string-only) заменён на webrtcRequestParams{endpoint,headers} —
+    # это единственный способ донести bearer-токен до вендоренного SDP-обмена (без нового
+    # эндпоинта и без изменения самого пути /api/offer).
+    assert "webrtcRequestParams" in js
+    assert 'endpoint: "/api/offer"' in js
+    assert 'webrtcUrl: "/api/offer"' not in js
     # Ни один fetch не ходит по литеральному URL напрямую: пять хелперов принимают url
     # параметром, и это единственная дверь наружу.
     assert not re.search(r'\bfetch\("', js), "новый fetch по литеральному URL мимо хелперов"

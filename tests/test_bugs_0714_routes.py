@@ -38,7 +38,10 @@ from starlette.testclient import TestClient
 # CSRF-satisfying headers shared by every mutating POST (matches test_hunt0714_a.py's
 # _csrf_ok pattern: JSON content-type + Origin whose netloc matches TestClient's default
 # Host "testserver").
-_CSRF_HEADERS = {"content-type": "application/json", "origin": "http://testserver"}
+# С5 (bearer authn middleware): every /api/* route is now behind Authorization -- merged in
+# below so existing CSRF/route assertions keep proving what they proved before the auth fix.
+_AUTH_HEADERS = {"authorization": "Bearer test-token"}
+_CSRF_HEADERS = {"content-type": "application/json", "origin": "http://testserver", **_AUTH_HEADERS}
 
 
 def _threads_host(tmp_path):
@@ -46,6 +49,7 @@ def _threads_host(tmp_path):
     routes under test, without needing the full SynapseHost/Kora wiring."""
     host = MagicMock()
     host.threads = ThreadStore(FakeClock(), str(tmp_path / "threads"))
+    host.cfg.api_token = "test-token"  # С5: MagicMock auto-vivifies .cfg; pin the token it needs
     return host
 
 
@@ -59,12 +63,13 @@ def _threads_host(tmp_path):
 
 def test_B50_browse_null_byte_path_must_not_500():
     host = MagicMock()
+    host.cfg.api_token = "test-token"  # С5: /api/browse is behind bearer authn now
     app = build_web_app(host)
     # raise_server_exceptions=False: observe the real HTTP status the server would send a
     # client instead of pytest re-raising the escaped ValueError as a Python exception.
     client = TestClient(app, raise_server_exceptions=False)
 
-    resp = client.get("/api/browse?path=%00")
+    resp = client.get("/api/browse?path=%00", headers=_AUTH_HEADERS)
 
     assert resp.status_code in (200, 400), (
         "B50: a null-byte path must fall back to home (200) or 400, not crash -- "
@@ -101,6 +106,8 @@ def test_B51_string_false_confirm_must_not_be_treated_as_confirmed():
         def __init__(self) -> None:
             self.threads = MagicMock()
             self.threads.get.return_value = _DummyThread()  # non-None -> route proceeds
+            from synapse.config import SynapseConfig
+            self.cfg = SynapseConfig(api_token="test-token")  # С5: /api/threads/*/gate needs a token
 
         async def gate_action(self, thread_id, action, model=None, confirm=False, fast=False,
                               user_initiated=True):
@@ -140,7 +147,7 @@ def test_B56_archived_false_string_must_return_non_archived_threads(tmp_path):
     app = build_web_app(host)
     client = TestClient(app, raise_server_exceptions=False)
 
-    resp = client.get("/api/threads?archived=false")
+    resp = client.get("/api/threads?archived=false", headers=_AUTH_HEADERS)
 
     assert resp.status_code == 200
     ids = [row["id"] for row in resp.json()["threads"]]
@@ -167,7 +174,7 @@ def test_B57_feed_limit_zero_must_return_zero_entries(tmp_path):
     app = build_web_app(host)
     client = TestClient(app, raise_server_exceptions=False)
 
-    resp = client.get(f"/api/threads/{t.id}/feed?limit=0")
+    resp = client.get(f"/api/threads/{t.id}/feed?limit=0", headers=_AUTH_HEADERS)
 
     assert resp.status_code == 200
     assert resp.json()["entries"] == [], (

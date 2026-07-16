@@ -24,7 +24,9 @@ from synapse.pipeline import webrtc_server
 from synapse.pipeline.tts_cache import TTSCache
 from synapse.pipeline.webrtc_server import build_web_app
 
-_CSRF = {"content-type": "application/json", "origin": "http://testserver"}
+# С5: control plane требует bearer-токен — _TTSHost ниже несёт cfg.api_token="test-token".
+_CSRF = {"content-type": "application/json", "origin": "http://testserver",
+         "authorization": "Bearer test-token"}
 
 CLEAN = "Готово, задача выполнена, все тесты зелёные."
 DIRTY = "готово: правил app.py:1024, тесты зелёные"
@@ -44,7 +46,7 @@ class _TTSHost:
     def __init__(self, tmp_path, **cfg_kw):
         self.cfg = SynapseConfig(
             fish_audio_api_key="fish-k", fish_reference_id="voice-1",
-            google_api_key="g-key", **cfg_kw,
+            google_api_key="g-key", api_token="test-token", **cfg_kw,
         )
         self.tts_cache = TTSCache(tmp_path / "cache", self.cfg.fish_tts_model,
                                   self.cfg.fish_reference_id or "")

@@ -44,59 +44,183 @@ const AV_DISP = [["circle", { cx: "6", cy: "19", r: "3" }],
                  ["circle", { cx: "18", cy: "5", r: "3" }]];
 
 const FETCH_TIMEOUT_MS = 15000;
+
+// ---------- С5: bearer-токен для control plane ----------
+// Токен живёт в localStorage; сервер (middleware, synapse/pipeline/webrtc_server.py) требует
+// его на всём control plane кроме bootstrap-статики. Единая точка — withAuth(): решение «взять
+// токен / поймать 401 / спросить один раз / повторить» живёт ЗДЕСЬ, а не размазано по пяти
+// хелперам ниже — каждый из них лишь оборачивает свой вызов сети в withAuth(attempt).
+const TOKEN_KEY = "synapse-api-token";
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ""; }
+function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
+
+// Сервер симметрично отвергает не-ASCII токен на старте (_require_api_token,
+// synapse/pipeline/app.py): живой Chromium собирает latin-1-заголовок из "café" молча —
+// уходит байтом 0xE9 против utf-8 секрета на сервере → вечный тихий 401; кириллица вообще
+// кидает TypeError на new Headers(...). Отвергаем не-ASCII ввод сразу, до сохранения.
+function isAsciiToken(t) { return /^[\x00-\x7f]*$/.test(t); }
+
+function authHeaders(extra) {
+  const h = new Headers(extra || {});
+  const token = getToken();
+  if (token) h.set("Authorization", "Bearer " + token);
+  return h;
+}
+
+// Single-flight: страница шлёт несколько запросов параллельно (loadLists = 2 разом) — пять
+// одновременных 401 не имеют права открыть диалог токена пять раз. Все ждут ОДИН промис.
+let tokenPromptPromise = null;
+function ensureToken() {
+  if (tokenPromptPromise) return tokenPromptPromise;
+  tokenPromptPromise = openTokenDialog().finally(() => { tokenPromptPromise = null; });
+  return tokenPromptPromise;
+}
+
+// doFetch — замыкание, которое делает ровно один сетевой вызов с текущими заголовками (создаёт
+// свой AbortController/таймаут — см. каждый хелпер ниже). На 401 спрашиваем токен и повторяем
+// ровно один раз со свежим значением; отмена диалога возвращает исходный 401 как есть.
+async function withAuth(doFetch) {
+  let res = await doFetch();
+  if (res.status === 401) {
+    const fresh = await ensureToken();
+    if (fresh) res = await doFetch();
+  }
+  return res;
+}
+
+// Диалог токена — inline DOM, НЕ window.prompt: проектная дисциплина выкинула его ещё в
+// UI-5 (rename), лексический якорь держит test_hygiene.py. Узел собирается лениво один раз и
+// живёт вне #shell — переиспользует готовые классы модалки-пикера (.modal-layer/.picker-panel/
+// .picker-error/.picker-actions/.primary-button/.ghost-button), своего CSS не заводит.
+let tokenDialog = null;
+function buildTokenDialog() {
+  const layer = el("div", "modal-layer");
+  layer.hidden = true;
+  const panel = el("div", "picker-panel");
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-label", "Access token required");
+  panel.appendChild(el("p", "picker-path", "Server requires an access token"));
+  const error = el("p", "picker-error");
+  error.setAttribute("role", "status");
+  error.setAttribute("aria-live", "assertive");
+  const input = el("input");
+  input.type = "password";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.placeholder = "Paste token…";
+  const actions = el("div", "picker-actions");
+  const save = el("button", "primary-button", "Save token");
+  save.type = "button";
+  const cancel = el("button", "ghost-button", "Cancel");
+  cancel.type = "button";
+  actions.appendChild(save);
+  actions.appendChild(cancel);
+  panel.appendChild(error);
+  panel.appendChild(input);
+  panel.appendChild(actions);
+  layer.appendChild(panel);
+  document.body.appendChild(layer);
+  return { layer, input, error, save, cancel };
+}
+function openTokenDialog() {
+  if (!tokenDialog) tokenDialog = buildTokenDialog();
+  const { layer, input, error, save, cancel } = tokenDialog;
+  error.textContent = "";
+  input.value = "";
+  layer.hidden = false;
+  input.focus();
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      layer.hidden = true;
+      save.removeEventListener("click", onSave);
+      cancel.removeEventListener("click", onCancel);
+      input.removeEventListener("keydown", onKeydown);
+      resolve(value);
+    };
+    const onSave = () => {
+      const val = input.value.trim();
+      if (!val) { error.textContent = "Token can't be empty."; return; }
+      if (!isAsciiToken(val)) {
+        error.textContent = "Token must be plain ASCII — non-ASCII characters break the auth header.";
+        return;
+      }
+      setToken(val);
+      finish(val);
+    };
+    const onCancel = () => finish(null);
+    const onKeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); onSave(); }
+      else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onCancel(); }
+    };
+    save.addEventListener("click", onSave);
+    cancel.addEventListener("click", onCancel);
+    input.addEventListener("keydown", onKeydown);
+  });
+}
+
 async function getJSON(url) {
   // B-CORE-2: AbortController + таймаут — «молчащий» сервер не оставит промис висеть навсегда.
-  const ctrl = new AbortController();
-  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
-    if (!res.ok) {
-      // B55: статус едет на ошибке — вызыватель различает «треда нет» (404) от сетевого блипа.
-      const err = new Error(url + " → " + res.status);
-      err.status = res.status;
-      throw err;
-    }
-    return await res.json();
-  } finally { clearTimeout(timeout); }
+  const attempt = () => {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    return fetch(url, { cache: "no-store", signal: ctrl.signal, headers: authHeaders() })
+      .finally(() => clearTimeout(timeout));
+  };
+  const res = await withAuth(attempt);
+  if (!res.ok) {
+    // B55: статус едет на ошибке — вызыватель различает «треда нет» (404) от сетевого блипа.
+    const err = new Error(url + " → " + res.status);
+    err.status = res.status;
+    throw err;
+  }
+  return await res.json();
 }
 function postJSON(url, body) {
-  const ctrl = new AbortController();
-  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS); // B-CORE-2
-  return fetch(url, { method: "POST", headers: { "content-type": "application/json" },
-                      body: JSON.stringify(body), signal: ctrl.signal })
-    .finally(() => clearTimeout(timeout));
+  return withAuth(() => {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS); // B-CORE-2
+    return fetch(url, { method: "POST", headers: authHeaders({ "content-type": "application/json" }),
+                        body: JSON.stringify(body), signal: ctrl.signal })
+      .finally(() => clearTimeout(timeout));
+  });
 }
 // POST → бинарный ответ (Play-озвучка: /api/tts отдаёт audio/wav). Тот же CSRF/timeout-
 // паттерн, что postJSON; на !ok кидает Error со .status, тело отдаёт Blob-ом.
 async function postBlob(url, body) {
-  const ctrl = new AbortController();
-  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
-                                   body: JSON.stringify(body), signal: ctrl.signal });
-    if (!res.ok) {
-      const err = new Error("HTTP " + res.status);
-      err.status = res.status;
-      throw err;
-    }
-    return await res.blob();
-  } finally { clearTimeout(timeout); }
+  const res = await withAuth(() => {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    return fetch(url, { method: "POST", headers: authHeaders({ "content-type": "application/json" }),
+                        body: JSON.stringify(body), signal: ctrl.signal })
+      .finally(() => clearTimeout(timeout));
+  });
+  if (!res.ok) {
+    const err = new Error("HTTP " + res.status);
+    err.status = res.status;
+    throw err;
+  }
+  return await res.blob();
 }
 // UI-5 (S30): PATCH для rename треда — тот же CSRF/timeout-паттерн, что postJSON.
 function patchJSON(url, body) {
-  const ctrl = new AbortController();
-  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-  return fetch(url, { method: "PATCH", headers: { "content-type": "application/json" },
-                      body: JSON.stringify(body), signal: ctrl.signal })
-    .finally(() => clearTimeout(timeout));
+  return withAuth(() => {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    return fetch(url, { method: "PATCH", headers: authHeaders({ "content-type": "application/json" }),
+                        body: JSON.stringify(body), signal: ctrl.signal })
+      .finally(() => clearTimeout(timeout));
+  });
 }
 // UI-5 (S31): DELETE для удаления проекта.
 function deleteJSON(url) {
-  const ctrl = new AbortController();
-  const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-  return fetch(url, { method: "DELETE", headers: { "content-type": "application/json" },
-                      signal: ctrl.signal })
-    .finally(() => clearTimeout(timeout));
+  return withAuth(() => {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    return fetch(url, { method: "DELETE", headers: authHeaders({ "content-type": "application/json" }),
+                        signal: ctrl.signal })
+      .finally(() => clearTimeout(timeout));
+  });
 }
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -1058,10 +1182,20 @@ async function connectVoice() {
   // и таймаут дают видимую ошибку. permissions.query нет в старом Safari → пропускаем.
   const perm = await navigator.permissions.query({ name: "microphone" }).catch(() => null);
   if (perm && perm.state === "denied") throw new Error("microphone is blocked for this site");
+  // С5: голос обходит все 5 fetch-хелперов — SDP-обмен идёт прямо в вендоренном бандле, поэтому
+  // токен нужен ДО первого оффера. webrtcUrl (deprecated, строка-only) заменён на
+  // webrtcRequestParams{endpoint,headers}: headers ОБЯЗАН быть new Headers(...) — бандл зовёт
+  // .entries() на нём, обычный объект даёт TypeError внутри чужого кода (_resolveRequestInfo/
+  // Gr()). Content-Type транспорт ставит сам; те же заголовки уходят и в PATCH trickle-ICE.
+  let token = getToken();
+  if (!token) token = await ensureToken(); // тот же single-flight диалог, что у остального control plane
+  if (!token) throw new Error("access token required for voice");
   // Identity-guard (урок слайса 3): колбэки действуют только пока `me` — текущий клиент,
   // иначе поздний onDisconnected СТАРОЙ сессии глушил бы новую после авто-реконнекта.
   const me = new PipecatClient({
-    transport: new SmallWebRTCTransport({ webrtcUrl: "/api/offer" }),
+    transport: new SmallWebRTCTransport({
+      webrtcRequestParams: { endpoint: "/api/offer", headers: new Headers({ Authorization: "Bearer " + token }) },
+    }),
     enableMic: true,
     callbacks: {
       onConnected: () => { if (client === me) setMicState("on"); },

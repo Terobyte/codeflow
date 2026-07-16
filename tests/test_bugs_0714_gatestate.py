@@ -45,6 +45,7 @@ def _fake_cfg(tmp_path) -> SynapseConfig:
         google_api_key="fake", openrouter_api_key="fake", anthropic_api_key="fake",
         deepgram_api_key="fake", fish_audio_api_key="fake", fish_reference_id="fake",
         journal_dir=str(tmp_path), kora_workspace_dir=str(tmp_path / "ws"),
+        api_token="test-token",  # С5: build_web_app's authn middleware needs a real token
     )
 
 
@@ -186,7 +187,8 @@ def test_B49_archive_must_refuse_while_task_pending_confirmation(tmp_path):
     resp = client.post(
         f"/api/threads/{t.id}/archive",
         content=b"{}",
-        headers={"content-type": "application/json", "origin": "http://testserver"},
+        headers={"content-type": "application/json", "origin": "http://testserver",
+                 "authorization": "Bearer test-token"},
     )
 
     assert resp.status_code == 409, (

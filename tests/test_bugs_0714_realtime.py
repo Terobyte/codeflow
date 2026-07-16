@@ -165,6 +165,7 @@ def _voice_route_host(tmp_path):
         deepgram_api_key="fake", fish_audio_api_key="fake", fish_reference_id="fake",
         journal_dir=str(tmp_path / "j"), kora_workspace_dir=str(tmp_path / "ws"),
         kora_enabled=False,
+        api_token="test-token",  # С5: build_web_app's authn middleware needs a real token
     )
     host = build_host(cfg, clock=FakeClock(0.0))
     app = build_web_app(host)
@@ -194,7 +195,8 @@ def test_B43_active_thread_must_not_rebind_while_voice_session_live(tmp_path):
     resp = client.post(
         "/api/active-thread",
         json={"id": t2.id},
-        headers={"content-type": "application/json", "origin": "http://testserver"},
+        headers={"content-type": "application/json", "origin": "http://testserver",
+                 "authorization": "Bearer test-token"},
     )
 
     assert resp.status_code == 200  # setup sanity: the request itself is well-formed/accepted
@@ -219,7 +221,8 @@ def test_B43_invariant_active_thread_rebinds_when_no_voice_session_live(tmp_path
     resp = client.post(
         "/api/active-thread",
         json={"id": t2.id},
-        headers={"content-type": "application/json", "origin": "http://testserver"},
+        headers={"content-type": "application/json", "origin": "http://testserver",
+                 "authorization": "Bearer test-token"},
     )
 
     assert resp.status_code == 200

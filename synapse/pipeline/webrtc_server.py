@@ -11,6 +11,7 @@ app.py top (S4).
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import uuid
@@ -114,6 +115,65 @@ def build_web_app(host: SynapseHost) -> FastAPI:
     per-connection `SynapseSession` (`run_session`) wired to `host`, and preempts whichever
     session was previously active (DoD-2: exactly one live client)."""
     app = FastAPI()
+
+    # С5 (bearer authn, runs/2026-07-15-c5-bearer-authn.md): deny-by-default middleware — не
+    # per-route проверка (Развилка 4 контракта: следующий добавленный роут иначе открыт по
+    # умолчанию). Открыт только bootstrap-статика PWA — иначе клиенту неоткуда взять токен,
+    # чтобы загрузиться и спросить его у юзера; всё остальное (включая /client/dev — prebuilt
+    # депрекирован, амендмент контракта) — 401 без валидного Authorization.
+    _OPEN_PATHS = frozenset({
+        "/", "/client/", "/client/index.html", "/client/app.js", "/client/style.css",
+        "/client/vendor/pipecat.mjs", "/client/thread", "/client/manifest.webmanifest",
+        "/client/icon-192.png", "/client/icon-512.png", "/client/apple-touch-icon.png",
+        "/client/logs", "/client/status-widget.js",
+        # Судья (не блокер): браузер сам дёргает /favicon.ico на каждой загрузке страницы,
+        # роута под ним в приложении нет (Starlette отдаёт 404 без данных), так что открытие
+        # дыры не даёт -- зато без этой записи каждый легитимный визит писал бы AUTH_FAILURE
+        # в аудит-журнал, засоряя ровно тот след, ради которого С5 существует.
+        "/favicon.ico",
+    })
+    _OPEN_ASSET_PREFIX = "/client/assets/"
+
+    @app.middleware("http")
+    async def _require_bearer_token(request: Request, call_next):
+        path = request.url.path
+        if path in _OPEN_PATHS or path.startswith(_OPEN_ASSET_PREFIX):
+            return await call_next(request)
+        # getattr дважды: часть тестовых стаб-хостов — вообще object() без .cfg, а
+        # SynapseConfig без SYNAPSE_API_TOKEN даёт cfg.api_token=None — оба случая обязаны
+        # деградировать в deny, а не в «проверка выключена».
+        token = getattr(getattr(host, "cfg", None), "api_token", None)
+        # Амендмент 1 (2026-07-15, NO-SHIP судьи): `request.headers.get("authorization")`
+        # декодирует сырые байты сокета через latin-1 (Starlette `Headers.__getitem__`), и
+        # `hmac.compare_digest` на `str` бросает `TypeError`, если хоть один операнд
+        # содержит не-ASCII символы — раньше это превращало ЛЮБОЙ мусорный заголовок (или
+        # не-ASCII токен в конфиге) в 500 вместо 401. Сравниваем СЫРЫМИ БАЙТАМИ
+        # (`request.headers.raw` — то, что ASGI-сервер положил в scope до всякого
+        # декодирования): `hmac.compare_digest(bytes, bytes)` не бросает никогда, вне
+        # зависимости от содержимого, так что вопрос «в какой кодировке клиент прислал
+        # не-ASCII токен» для БЕЗОПАСНОСТИ сравнения не стоит — падать по этой причине
+        # больше некому. Ожидаемая сторона кодируется UTF-8: секрет читается из окружения
+        # как `str`, UTF-8 — кодировка, которой не-ASCII заголовок реально придёт по проводу
+        # (curl/браузер); сравнение остаётся constant-time и побайтовым (лексический якорь
+        # теста — `hmac.compare_digest` в исходнике).
+        supplied = b""
+        for raw_key, raw_value in request.headers.raw:
+            if raw_key.lower() == b"authorization":
+                supplied = raw_value
+                break
+        # `not token` — ОТДЕЛЬНАЯ проверка ДО сравнения, коротким замыканием ДО
+        # compare_digest: при token=None `f"Bearer {token}"` даёт валидную строку-ловушку
+        # "Bearer None", которую иначе пришлось бы отдельно отсеивать.
+        if not token or not hmac.compare_digest(supplied, f"Bearer {token}".encode("utf-8")):
+            journal = getattr(host, "journal", None)
+            if journal is not None:
+                try:
+                    from synapse.journal import AlertKind
+                    journal.alert(AlertKind.AUTH_FAILURE, {"path": path})
+                except Exception:  # noqa: BLE001 — B-CORE-3: сбойный журнал ПЕРЕВЫБРАСЫВАЕТ,
+                    pass          # а 401 не имеет права стать 500 из-за упавшего алерта.
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
 
     # B28: the journal fd lives as long as the host; close it when uvicorn shuts down (the
     # only live-path close — console.py closes its own). Looked up lazily inside the handler:
