@@ -106,6 +106,8 @@ class SynapseConfig:
     # UI-5 (S10): порог компакта истории диспетчера — ПЕРЕД ходом, если история длиннее,
     # старшая половина жмётся одним LLM-вызовом (только user/assistant, NO-EXFIL). 0 = выкл.
     dispatcher_compact_after: int = 40
+    # ADV-2: дефолт персоны; Thread.persona перекрывает его для отдельного треда.
+    default_persona: str = "техлид"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SynapseConfig":
@@ -127,6 +129,8 @@ class SynapseConfig:
         # dataclass default instead of clobbering it with None.
         if e.get("FISH_TTS_MODEL"):
             kwargs["fish_tts_model"] = e["FISH_TTS_MODEL"]
+        if e.get("SYNAPSE_DEFAULT_PERSONA"):
+            kwargs["default_persona"] = e["SYNAPSE_DEFAULT_PERSONA"]
         # Same "override only when explicitly set" rule for the non-None Kora defaults.
         # B26: empty value = unset -> keep the dataclass default (same "override only when
         # explicitly set" rule as FISH_TTS_MODEL/_num above), never an active False.

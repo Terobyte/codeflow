@@ -47,7 +47,7 @@ from synapse.journal import AlertKind, TurnJournal
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
 from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook, make_guarded_assistant_aggregator
 from synapse.pipeline.tts_cache import TTSCache, TTSCacheObserver
-from synapse.prompt import STAGE_RULES_COLLECT, STAGE_RULES_PROPOSE
+from synapse.prompt import STAGE_RULES_COLLECT, STAGE_RULES_PROPOSE, build_persona_block
 from synapse.threads import ThreadStore
 
 logger = logging.getLogger(__name__)
@@ -732,6 +732,12 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             return STAGE_RULES_PROPOSE
         return ""
 
+    def _persona_block_for(thread_id: str | None) -> str:
+        th = threads.get(thread_id) if thread_id else None
+        if th is None or th.stage not in ("collect", "propose"):
+            return ""
+        return build_persona_block(th.persona or cfg.default_persona)
+
     def _on_compact(thread_id: str) -> None:
         # UI-5 (S10): факт компакта истории → запись в ленту треда. Сырой feed-файл не
         # меняется компактом (он жмёт только LLM-историю в памяти), это лишь уведомление.
@@ -927,6 +933,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             http_handlers, confirm_flow, store, journal, clock, cfg,
             thread_feed_reader=threads.read_feed,
             stage_block_for=_stage_block_for,
+            persona_block_for=_persona_block_for,
             on_compact=_on_compact,
             owner_thread_for=lambda task_id: (
                 th.id if (th := threads.thread_for_task(task_id)) else None
@@ -971,6 +978,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # Kept on the long-lived host so the independently constructed voice session can refresh
     # its system prompt from the same stage resolver as the HTTP DispatcherTurnLoop.
     host.stage_block_for = _stage_block_for
+    host.persona_block_for = _persona_block_for
     # С2: HTTP-канал зовёт handlers.end_turn() рядом с journal.end_turn() — нужно держать
     # http_handlers на хосте (раньше это была только локальная переменная build_host).
     host.http_handlers = http_handlers
@@ -983,7 +991,8 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     )
     host.turn_context_for = lambda tid: build_turn_context(
         cfg=cfg, store=store, clock=clock, thread_id=tid,
-        stage_block_for=_stage_block_for, owner_thread_for=_owner_thread_for,
+        stage_block_for=_stage_block_for, persona_block_for=_persona_block_for,
+        owner_thread_for=_owner_thread_for,
     )
     # Play-озвучка ленты (tero 2026-07-14): кэш реалтайм-аудио на диск, ключ по содержимому.
     # Пост-хок атрибут на долгоживущем хосте — тот же приём, что host.turn_context_for выше.

@@ -38,6 +38,7 @@ class Thread:
     request_text: str | None = None  # свод запроса — носитель между COLLECT и запусками (UI-4)
     last_model: str | None = None    # модель последнего гейт-запуска (UI-4)
     archived: bool = False           # архив треда (UI-5)
+    persona: str | None = None       # ADV-2: per-thread оверрайд; None → дефолт конфига
     created_ts: float = 0.0
     updated_ts: float = 0.0
     task_ids: list[str] = field(default_factory=list)
@@ -88,6 +89,7 @@ class ThreadStore:
                 request_text=d.get("request_text"),
                 last_model=d.get("last_model"),
                 archived=bool(d.get("archived", False)),
+                persona=d.get("persona"),
                 created_ts=float(d.get("created_ts") or 0.0),
                 updated_ts=float(d.get("updated_ts") or 0.0),
                 task_ids=[str(x) for x in (d.get("task_ids") or [])],
@@ -103,7 +105,7 @@ class ThreadStore:
             data = {
                 "id": t.id, "title": t.title, "project_id": t.project_id, "stage": t.stage,
                 "last_outcome": t.last_outcome, "request_text": t.request_text,
-                "last_model": t.last_model, "archived": t.archived,
+                "last_model": t.last_model, "archived": t.archived, "persona": t.persona,
                 "created_ts": t.created_ts, "updated_ts": t.updated_ts, "task_ids": t.task_ids,
             }
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -271,6 +273,17 @@ class ThreadStore:
             t.request_text = text
             t.updated_ts = self._clock.now()
             self._persist(t)
+
+    def set_persona(self, thread_id: str, persona: str | None) -> bool:
+        """Persist a per-thread persona override; catalog validation belongs to the tool."""
+        with self._lock:
+            t = self._threads.get(thread_id)
+            if t is None:
+                return False
+            t.persona = persona
+            t.updated_ts = self._clock.now()
+            self._persist(t)
+            return True
 
     def set_last_model(self, thread_id: str, model: str) -> None:
         """Модель последнего гейт-запуска (дефолт-кандидат для следующего, находка E)."""

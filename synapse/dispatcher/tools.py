@@ -30,6 +30,7 @@ from synapse.bridge.state import TaskStore, should_hide_task
 from synapse.clock import Clock
 from synapse.config import SynapseConfig
 from synapse.journal import TurnJournal
+from synapse.prompt import PERSONA_PRESETS
 
 SUBMIT_TASK_SCHEMA = FunctionSchema(
     name="submit_task",
@@ -104,6 +105,16 @@ BIND_PROJECT_SCHEMA = FunctionSchema(
     required=["project_name"],
 )
 
+SET_PERSONA_SCHEMA = FunctionSchema(
+    name="set_persona",
+    description=(
+        "Сменить персону диспетчера для текущего треда. Меняет только стиль и фокус; "
+        "правила и возможности не меняются. Невалидное имя возвращает каталог."
+    ),
+    properties={"name": {"type": "string", "description": "Имя персоны из каталога пресетов."}},
+    required=["name"],
+)
+
 ALL_SCHEMAS = [
     SUBMIT_TASK_SCHEMA,
     CONFIRM_TASK_SCHEMA,
@@ -113,6 +124,7 @@ ALL_SCHEMAS = [
     PROPOSE_REQUEST_SCHEMA,
     GATE_ACTION_SCHEMA,
     BIND_PROJECT_SCHEMA,
+    SET_PERSONA_SCHEMA,
 ]
 
 
@@ -402,6 +414,26 @@ class ToolHandlers:
         )
         return result
 
+    async def set_persona(self, name: str) -> dict[str, Any]:
+        async def _do() -> dict[str, Any]:
+            if self.bridge.threads is None or self.bridge.thread_id_for is None:
+                return {"outcome": "dispatcher_unavailable"}
+            thread_id = self.bridge.thread_id_for()
+            if thread_id is None:
+                return {"outcome": "no_active_thread"}
+            wanted = name.strip().casefold()
+            if wanted not in PERSONA_PRESETS:
+                return {"outcome": "unknown_persona", "catalog": sorted(PERSONA_PRESETS)}
+            if not self.bridge.threads.set_persona(thread_id, wanted):
+                return {"outcome": "no_active_thread"}
+            return {"outcome": "persona_set", "persona": wanted}
+
+        result, deduped = await self._guarded("set_persona", {"name": name}, _do)
+        self._journal.record_tool_call(
+            "set_persona", {"name": name}, {**result, "deduped": deduped}
+        )
+        return result
+
 
 def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
     """Wraps each pure handler as a pipecat function-call callback (S7: the result is
@@ -443,6 +475,10 @@ def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
         result = await handlers.bind_project(**params.arguments)
         await params.result_callback(result)
 
+    async def _set_persona(params: FunctionCallParams) -> None:
+        result = await handlers.set_persona(**params.arguments)
+        await params.result_callback(result)
+
     llm_or_switcher.register_function("submit_task", _submit_task, cancel_on_interruption=False)
     llm_or_switcher.register_function("confirm_task", _confirm_task, cancel_on_interruption=False)
     llm_or_switcher.register_function("request_cancel", _request_cancel, cancel_on_interruption=False)
@@ -451,4 +487,5 @@ def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
     llm_or_switcher.register_function("propose_request", _propose_request, cancel_on_interruption=False)
     llm_or_switcher.register_function("gate_action", _gate_action, cancel_on_interruption=False)
     llm_or_switcher.register_function("bind_project", _bind_project, cancel_on_interruption=False)
+    llm_or_switcher.register_function("set_persona", _set_persona, cancel_on_interruption=False)
     llm_or_switcher.register_function("get_task_status", _get_task_status, cancel_on_interruption=True)

@@ -86,6 +86,7 @@ class DispatcherTurnLoop:
         task_dictionary: dict[str, str] | None = None,
         thread_feed_reader: Callable[[str], list[dict]] | None = None,
         stage_block_for: Callable[[str], str] | None = None,
+        persona_block_for: Callable[[str], str] | None = None,
         on_compact: Callable[[str], None] | None = None,
         owner_thread_for: Callable[[str], str | None] | None = None,
         on_user_turn: Callable[[str, str, float], None] | None = None,
@@ -101,6 +102,7 @@ class DispatcherTurnLoop:
         # UI-3 (спека §4, находка A): пер-тред контекст. История LLM ключуется по треду.
         self._thread_feed_reader = thread_feed_reader
         self._stage_block_for = stage_block_for
+        self._persona_block_for = persona_block_for
         # UI-5 (S10): колбэк на факт компакта истории треда (лента пишет event «контекст сжат»).
         self._on_compact = on_compact
         # С3: fan-out user turn на ApprovalService (опционально — стабы/консоль без approvals).
@@ -285,6 +287,7 @@ class DispatcherTurnLoop:
             cfg=self._cfg, store=self._store, clock=self._clock, thread_id=thread_id,
             task_dictionary=self._task_dictionary,
             stage_block_for=self._stage_block_for,
+            persona_block_for=self._persona_block_for,
             owner_thread_for=self._owner_thread_for,
         )
         messages: list[dict[str, Any]] = [
@@ -319,6 +322,7 @@ class DispatcherTurnLoop:
         ctx = build_turn_context(
             cfg=self._cfg, store=self._store, clock=self._clock, thread_id=thread_id,
             stage_block_for=self._stage_block_for,
+            persona_block_for=self._persona_block_for,
             owner_thread_for=self._owner_thread_for,
         )
         return ctx.state_block

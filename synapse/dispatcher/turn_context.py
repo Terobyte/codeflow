@@ -42,6 +42,7 @@ def build_turn_context(
     thread_id: str | None,
     task_dictionary: dict[str, str] | None = None,
     stage_block_for: Callable[[str | None], str] | None = None,
+    persona_block_for: Callable[[str | None], str] | None = None,
     owner_thread_for: Callable[[str], str | None] | None = None,
 ) -> TurnContext:
     """Собрать TurnContext для хода в треде `thread_id`.
@@ -51,7 +52,10 @@ def build_turn_context(
     задача чужого треда прячется (`should_hide_task`) — голос раньше вообще не видел
     состояния, теперь видит правильно отскоупленное."""
     stage_block = stage_block_for(thread_id) if stage_block_for is not None else ""
-    prompt = build_system_prompt(cfg, task_dictionary or {}, stage_block=stage_block)
+    persona_block = persona_block_for(thread_id) if persona_block_for is not None else ""
+    prompt = build_system_prompt(
+        cfg, task_dictionary or {}, stage_block=stage_block, persona_block=persona_block
+    )
     task = store.task
     hide = (task is not None and owner_thread_for is not None
             and should_hide_task(task, thread_id, owner_thread_for(task.id)))
