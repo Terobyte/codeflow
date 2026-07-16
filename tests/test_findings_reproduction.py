@@ -103,24 +103,24 @@ async def test_p1_cost_cap_blocked_degraded_response(tmp_path):
     app = webrtc_server.build_web_app(host=host)
     th = host.threads.create("тред")
     ep = _endpoint(app, "api_thread_message")
-    
+
     # Mock ingest_user_turn to raise CostCapBlocked
     host.text_loop.ingest_user_turn = AsyncMock(side_effect=CostCapBlocked())
-    
+
     # In the fixed implementation, this should return a 200 JSONResponse with reply and degraded=True
     resp = await ep(th.id, FakeRequest({"text": "привет"}))
     assert resp.status_code == 200
     data = json.loads(resp.body)
     assert data.get("degraded") is True
     assert "Дневной лимит платных запросов исчерпан" in data.get("reply")
-    
+
     # Feed should contain the user and assistant fallback text
     feed = host.threads.read_feed(th.id)
     assert len(feed) >= 2
     assert feed[-2]["kind"] == "user"
     assert feed[-1]["kind"] == "assistant"
     assert "Дневной лимит платных запросов исчерпан" in feed[-1]["text"]
-    
+
     # Alert should be written to journal
     host.journal.alert.assert_any_call("COST_CAP", {"channel": "http"})
 
@@ -132,24 +132,24 @@ async def test_p1_provider_unavailable_degraded_response(tmp_path):
     app = webrtc_server.build_web_app(host=host)
     th = host.threads.create("тред")
     ep = _endpoint(app, "api_thread_message")
-    
+
     # Mock ingest_user_turn to raise ProviderUnavailable
     host.text_loop.ingest_user_turn = AsyncMock(side_effect=ProviderUnavailable("Timeout"))
-    
+
     # In the fixed implementation, this should return a 200 JSONResponse with reply and degraded=True
     resp = await ep(th.id, FakeRequest({"text": "привет"}))
     assert resp.status_code == 200
     data = json.loads(resp.body)
     assert data.get("degraded") is True
     assert "Связь с мозгом потеряна" in data.get("reply")
-    
+
     # Feed should contain the user and assistant fallback text
     feed = host.threads.read_feed(th.id)
     assert len(feed) >= 2
     assert feed[-2]["kind"] == "user"
     assert feed[-1]["kind"] == "assistant"
     assert "Связь с мозгом потеряна" in feed[-1]["text"]
-    
+
     # Alert should be written to journal
     host.journal.alert.assert_any_call("ALL_TIERS_FAILED", {"channel": "http", "reason": "provider"})
 
@@ -166,7 +166,7 @@ class EmptyResponseProvider(Provider):
 def test_p2_run_task_empty_response_not_ok():
     task = Task("t01", "test", "prompt", lambda text: True)
     provider = EmptyResponseProvider()
-    
+
     result = run_task(provider, task, attempt=1, retries=0, timeout_s=5.0)
     assert result.ok is False, "Empty response should be marked as ok=False"
     assert result.error_kind == "invalid_response", "Should have an error kind"
@@ -176,34 +176,34 @@ def test_p2_run_task_empty_response_not_ok():
 
 def test_p2_benchmark_validators_are_strict():
     task_map = {t.id: t for t in TASKS}
-    
+
     # t01: Reply with exactly ACK-01
     assert not task_map["t01"].validator("Here is ACK-01")
-    
+
     # t02: Reply with only the number
     assert not task_map["t02"].validator("The result is 391")
-    
+
     # t03: Explain DNS in one sentence
     assert not task_map["t03"].validator("DNS переводит имена. Также он делает запросы.") # Two sentences
-    
+
     # t04: JSON city/country exact structure
     assert not task_map["t04"].validator('{"city":"London"}')
-    
+
     # t05: Translate to Russian
     assert not task_map["t05"].validator("The build finished successfully.") # English
-    
+
     # t06: One word sentiment
     assert not task_map["t06"].validator("It is positive") # Not one word
-    
+
     # t07: Code under 20 chars with last item
     assert not task_map["t07"].validator("def get_last(lst):\n    return lst[-1]\n") # Too long / not expression
-    
+
     # t08: Reply as H:MM
     assert not task_map["t08"].validator("The time was 2:27")
-    
+
     # t09: Exactly three comma-separated codes
     assert not task_map["t09"].validator("400") # Only one
-    
+
     # t10: Reply with one word
     assert not task_map["t10"].validator("The answer is green.")
 
