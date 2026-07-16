@@ -427,3 +427,62 @@ def test_app_wires_on_answer_to_provide_answer(tmp_path):
     assert host.bridge.on_answer.__name__ == "_voice_answer"
     # без awaiting-задачи доставка честно отказывает — guard делегировал в provide_answer
     assert host.bridge.on_answer("ответ") is False
+
+
+# =========================================================================================
+# 8. Pre-flight демо (спека demo-video §6 п.1) — цикл интервью: два последовательных
+#    AskUserQuestion в ОДНОМ ране, идентичные ответы «да»/«да». Существующие тесты кроют
+#    один вопрос; цикл следовал из кода (_handle_question без once-латча), но не был доказан.
+#    Подозреваемый — B14-дедуп на одинаковых ответах.
+# =========================================================================================
+
+
+async def test_interview_cycle_two_questions_same_run_identical_answers(tmp_path):
+    runner, store, journal, ws, speaks = make_runner(tmp_path)
+    store.start_task("tk", "прототип идеи из игры", TaskStatus.RUNNING, 0.0)
+
+    # вопрос 1 → ответ «да»
+    gate1 = asyncio.create_task(_ask(runner, _one_question(q="Тёмная тема?", labels=("да", "нет"))))
+    await asyncio.sleep(0)
+    assert store.awaiting_answer is True
+    assert runner.provide_answer("да") is True
+    assert store.awaiting_answer is False  # снялся первый раз
+    r1 = await gate1
+    assert r1["hookSpecificOutput"]["updatedInput"]["answers"]["Тёмная тема?"] == "да"
+    assert runner._pending_answer is None  # слот чист перед вторым вопросом
+
+    # вопрос 2 — тот же ран: паркуется заново, ИДЕНТИЧНЫЙ ответ доходит дословно
+    gate2 = asyncio.create_task(_ask(runner, _one_question(q="Одна страница?", labels=("да", "нет"))))
+    await asyncio.sleep(0)
+    assert store.awaiting_answer is True  # поднялся второй раз
+    assert not gate2.done()
+    assert runner.provide_answer("да") is True
+    assert store.awaiting_answer is False  # снялся второй раз
+    r2 = await gate2
+    assert r2["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert r2["hookSpecificOutput"]["updatedInput"]["answers"]["Одна страница?"] == "да"
+    assert runner._pending_answer is None
+
+    # оба вопроса озвучены, оба ответа зафиксированы: 2×asked + 2×answered в журнале
+    assert len(speaks) == 2
+    assert "Тёмная тема?" in speaks[0] and "Одна страница?" in speaks[1]
+    rows = _journal_rows(journal)
+    assert sum(r["type"] == "kora_question_asked" for r in rows) == 2
+    assert sum(r["type"] == "kora_question_answered" for r in rows) == 2
+
+
+async def test_answer_kora_identical_text_across_turns_not_deduped(tmp_path):
+    # Демо-риск B14: «да» на вопрос 1 (ход 1) и «да» на вопрос 2 (ход 2) — одинаковые
+    # аргументы, но РАЗНЫЕ ходы; латч живёт внутри хода и обязан пропустить второй ответ.
+    # (test_answer_kora_dedup_resets_new_turn проверяет новые ходы с РАЗНЫМИ текстами —
+    # здесь именно одинаковый текст + честный end_turn между ходами, как в живом тракте.)
+    calls: list[str] = []
+    handlers, store, journal = make_answer_handlers(tmp_path, on_answer=lambda t: (calls.append(t) or True))
+    handlers.begin_turn("t1")
+    r1 = await handlers.answer_kora(text="да")
+    handlers.end_turn()
+    handlers.begin_turn("t2")
+    r2 = await handlers.answer_kora(text="да")
+    assert r1 == {"outcome": "answer_delivered"}
+    assert r2 == {"outcome": "answer_delivered"}
+    assert calls == ["да", "да"]  # оба дошли, дедуп не съел второй
