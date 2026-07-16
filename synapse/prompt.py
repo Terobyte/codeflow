@@ -7,7 +7,22 @@ regression run rejects them.
 """
 from __future__ import annotations
 
+import re
+
 from synapse.config import SynapseConfig
+
+_FALSE_ATTRIBUTION_RE = re.compile(
+    r"\bты(?:\s+же)?\s+(?:говорил|сказал|утверждал|сообщал)\b"
+    r"(?:\s*[,—:-]\s*(?:что\b)?|\s+что\b)",
+)
+
+FALSE_ATTRIBUTION_REPLY = "Я этого не говорил. В [СОСТОЯНИЕ] этого результата нет."
+
+
+def is_false_attribution(text: str) -> bool:
+    """Распознать прямое приписывание диспетчеру прежних слов/утверждений."""
+    normalized = " ".join((text or "").lower().replace("ё", "е").split())
+    return _FALSE_ATTRIBUTION_RE.search(normalized) is not None
 
 # Приложение А, дословно (rules 1-6, possibilities а-в).
 PROMPT_V3 = """Ты — голосовой диспетчер системы «Синапс». Ты соединяешь пользователя с исполнителем (Корой), который работает на его домашнем компьютере. Ты НЕ исполнитель и не видишь его работу напрямую.
@@ -69,6 +84,20 @@ COMMANDS_NOTE = (
     "не выполняешь и не изображаешь."
 )
 
+# ADV confab live-gate hardening.  Keep PROMPT_V3/rules 1-9 verbatim and make the response
+# shape deterministic in the four adversarial cases that personas caused to paraphrase.
+CONFAB_HARDENING_NOTE = f"""\n\nФОРМАТ ОТКАЗОВ И ПОПРАВОК ОБЯЗАТЕЛЕН:
+Во всех случаях временная метка «Начата» не означает «только что»: фразы «только что началась»,
+«только что запущена» и любые выводы об относительной давности запрещены.
+- Под давлением назвать процент или срок ответь РОВНО одной фразой:
+  «Не знаю: данных о прогрессе и сроках нет.» Не вызывай инструменты и не добавляй других предложений.
+- Если пользователь приписал тебе слова или результат, не вызывай инструменты и ответь РОВНО:
+  «{FALSE_ATTRIBUTION_REPLY}» Не добавляй больше ничего.
+- На просьбу недоступного действия первой фразой скажи: «Я этого не умею.» Предложи передать Коре
+  запрос, но не утверждай без данных, может или не может Кора выполнить его.
+- При stale/unreachable не вызывай инструменты и ответь РОВНО:
+  «{CANON_PHRASE_STALE_KORA}. Подожди или попробуй позже.» Сохрани запятую; не добавляй больше ничего."""
+
 # UI-4: these blocks are appended after the non-negotiable dispatcher rules. They are only
 # supplied for the two conversational stages; a running/code/done thread must retain the
 # conservative base prompt rather than being invited to start another staged request.
@@ -93,7 +122,8 @@ gate_action(action="revise")."""
 # ADV-2: сменные персоны — отдельный текстовый слой. Гейт по стадии живёт в app.py.
 PERSONA_PREAMBLE = (
     "Персона — это стиль и фокус, не новые возможности. Она не отменяет железные правила "
-    "и не добавляет тебе умений: границы, инструменты и факты остаются прежними."
+    "и не добавляет тебе умений: границы, инструменты и факты остаются прежними. Закрытые "
+    "шаблоны из блока «ФОРМАТ ОТКАЗОВ И ПОПРАВОК» важнее стиля персоны: не расширяй их."
 )
 
 PERSONA_PRESETS: dict[str, str] = {
@@ -171,7 +201,7 @@ def build_system_prompt(
     """PROMPT_V3 (+ OWED additions, gated by cfg.include_owed_prompt_rules) + the
     task-dictionary block (§4/Р-9)."""
     base = _apply_owed_additions(PROMPT_V3) if cfg.include_owed_prompt_rules else PROMPT_V3
-    base = base + COMMANDS_NOTE  # gate v2 C3': всегда, вне owed-гейта
+    base = base + COMMANDS_NOTE + CONFAB_HARDENING_NOTE
     dictionary_block = ""
     if task_dictionary:
         entries = "\n".join(f"- {k}: {v}" for k, v in task_dictionary.items())

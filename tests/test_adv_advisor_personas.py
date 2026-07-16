@@ -33,6 +33,103 @@ def test_collect_rules_carry_no_prompt_mines():
     assert "д)" not in STAGE_RULES_COLLECT
 
 
+def test_confab_hardening_precedes_collect_and_persona_layers():
+    from synapse.prompt import (
+        CANON_PHRASE_STALE_KORA,
+        CONFAB_HARDENING_NOTE,
+        build_persona_block,
+    )
+
+    persona = build_persona_block("скептик")
+    prompt = build_system_prompt(
+        SynapseConfig(), stage_block=STAGE_RULES_COLLECT, persona_block=persona
+    )
+
+    assert "Я этого не говорил." in CONFAB_HARDENING_NOTE
+    assert "В [СОСТОЯНИЕ] этого результата нет." in CONFAB_HARDENING_NOTE
+    assert "временная метка «Начата» не означает «только что»" in CONFAB_HARDENING_NOTE
+    assert "Я этого не умею." in CONFAB_HARDENING_NOTE
+    assert "Не знаю: данных о прогрессе и сроках нет." in CONFAB_HARDENING_NOTE
+    assert f"«{CANON_PHRASE_STALE_KORA}. Подожди или попробуй позже.»" in CONFAB_HARDENING_NOTE
+    assert CONFAB_HARDENING_NOTE.lower().count("не вызывай инструменты") == 3
+    assert "ответь РОВНО" in CONFAB_HARDENING_NOTE
+    assert prompt.index(CONFAB_HARDENING_NOTE) < prompt.index(STAGE_RULES_COLLECT)
+    assert prompt.index(STAGE_RULES_COLLECT) < prompt.index(persona)
+
+
+def test_status_tool_schema_does_not_override_false_attribution_correction():
+    from synapse.dispatcher.tools import GET_TASK_STATUS_SCHEMA
+
+    description = GET_TASK_STATUS_SCHEMA.description.lower()
+    assert "приписывает" in description
+    assert "не вызывай инструмент" in description
+    assert "confab-шаблону" in description
+
+
+def test_false_attribution_classifier_is_narrow():
+    from synapse.prompt import is_false_attribution
+
+    assert is_false_attribution("Ты же говорил, что файл готов")
+    assert is_false_attribution("ТЫ СКАЗАЛ: сервер перезапущен")
+    assert not is_false_attribution("Скажи, готов ли файл")
+    assert not is_false_attribution("Что ты говорил про архитектуру?")
+
+
+@pytest.mark.asyncio
+async def test_false_attribution_turn_hides_tools_then_restores_them(tmp_path):
+    from synapse.dispatcher.tools import ALL_SCHEMAS
+    from synapse.pipeline.app import build_host
+
+    class CapturingLLM:
+        def __init__(self):
+            self.tool_names = []
+
+        async def complete(self, messages, tools):
+            self.tool_names.append([tool.name for tool in tools])
+            return "Я этого не говорил. Дополнительный неподтверждённый хвост.", []
+
+    host = build_host(_fake_cfg(tmp_path))
+    llm = CapturingLLM()
+    host.text_loop._llm = llm
+    th = host.threads.create("тред")
+
+    _, correction = await host.text_loop.ingest_user_turn(
+        "Ты же говорил, что файл готов", thread_id=th.id
+    )
+    await host.text_loop.ingest_user_turn("Какой сейчас статус?", thread_id=th.id)
+
+    assert llm.tool_names[0] == []
+    assert correction == "Я этого не говорил. В [СОСТОЯНИЕ] этого результата нет."
+    assert set(llm.tool_names[1]) == {schema.name for schema in ALL_SCHEMAS}
+
+
+@pytest.mark.asyncio
+async def test_voice_false_attribution_hides_tools_then_restores_them(tmp_path):
+    from openai import NOT_GIVEN
+    from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
+    from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
+    from synapse.pipeline.app import build_host, build_session_pipeline
+
+    session = build_session_pipeline(build_host(_fake_cfg(tmp_path)))
+    stt = next(
+        processor
+        for processor in session.pipeline.processors
+        if isinstance(processor, DeepgramFluxSTTService)
+    )
+    context = next(
+        processor.context
+        for processor in session.pipeline.processors
+        if isinstance(processor, LLMUserAggregator)
+    )
+    handler = stt._event_handlers["on_end_of_turn"].handlers[0]
+
+    await handler(stt, "Ты же говорил, что файл готов")
+    assert context.tools is NOT_GIVEN
+
+    await handler(stt, "Какой сейчас статус?")
+    assert context.tools is not NOT_GIVEN
+
+
 def test_conservative_stages_keep_bare_base_prompt(tmp_path):
     from synapse.pipeline.app import build_host
 

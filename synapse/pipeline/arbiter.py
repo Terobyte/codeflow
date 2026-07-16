@@ -19,7 +19,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from pipecat.frames.frames import Frame, TextFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    Frame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    TextFrame,
+    TTSSpeakFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 Splitter = Callable[[str], list[str]]
@@ -56,6 +62,7 @@ class ArbiterPolicy:
     def __init__(self, splitter: Splitter | None = None) -> None:
         self._splitter = splitter or default_sentence_splitter
         self._queue: list[QueueItem] = []
+        self._dispatcher_override: str | None = None
 
     def __len__(self) -> int:
         return len(self._queue)
@@ -82,6 +89,14 @@ class ArbiterPolicy:
     def flush_dispatcher(self) -> None:
         self._queue = [item for item in self._queue if item.source != "dispatcher"]
 
+    def set_dispatcher_override(self, text: str | None) -> None:
+        """Replace the next complete LLM response; used by narrow deterministic guards."""
+        self._dispatcher_override = text
+
+    def consume_dispatcher_override(self) -> str | None:
+        text, self._dispatcher_override = self._dispatcher_override, None
+        return text
+
     def pop_next(self) -> QueueItem | None:
         if not self._queue:
             return None
@@ -100,15 +115,36 @@ class TTSArbiterProcessor(FrameProcessor):
     def __init__(self, policy: ArbiterPolicy) -> None:
         super().__init__()
         self._policy = policy
+        self._active_override: str | None = None
+        self._override_emitted = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._active_override = self._policy.consume_dispatcher_override()
+            self._override_emitted = False
+            await self.push_frame(frame, direction)
+            return
+        if isinstance(frame, LLMFullResponseEndFrame):
+            if self._active_override is not None and not self._override_emitted:
+                self._policy.push_dispatcher_text(self._active_override)
+                await self._drain()
+            self._active_override = None
+            self._override_emitted = False
+            await self.push_frame(frame, direction)
+            return
         if isinstance(frame, TTSSpeakFrame):
             self._policy.push_speak(frame.text)
             await self._drain()
             return
         if isinstance(frame, TextFrame):
-            self._policy.push_dispatcher_text(frame.text)
+            if self._active_override is not None:
+                if not self._override_emitted:
+                    self._policy.push_dispatcher_text(self._active_override)
+                    self._override_emitted = True
+                # Suppress every provider-authored chunk in this generation.
+            else:
+                self._policy.push_dispatcher_text(frame.text)
             await self._drain()
             return
         await self.push_frame(frame, direction)

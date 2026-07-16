@@ -20,6 +20,7 @@ from synapse.config import SynapseConfig
 from synapse.dispatcher.tools import ALL_SCHEMAS, ToolCall, ToolHandlers
 from synapse.dispatcher.turn_context import build_turn_context
 from synapse.journal import TurnJournal, TurnRecord
+from synapse.prompt import FALSE_ATTRIBUTION_REPLY, is_false_attribution
 
 # B5: the authoritative set of dispatchable tool names — dispatch never resolves anything else.
 _VALID_TOOL_NAMES = frozenset(s.name for s in ALL_SCHEMAS)
@@ -264,6 +265,12 @@ class DispatcherTurnLoop:
         finally:
             record.latency_ms = (self._clock.now() - now) * 1000.0
             self._journal.check_grounding(record, had_active_task)
+        # A live model can obey the correction and still append persona-flavoured status prose.
+        # The attribution classifier is intentionally narrow and tools were suppressed in
+        # _complete, so close this one response shape deterministically before journaling/feed.
+        if is_false_attribution(transcript):
+            text = FALSE_ATTRIBUTION_REPLY
+            record.llm_output = text
         # Commit this turn's user msg + final assistant reply to the SHARED history in one
         # synchronous burst (no await between the two appends → no concurrent turn can interleave
         # and stack a second user with no assistant between).
@@ -294,7 +301,14 @@ class DispatcherTurnLoop:
             {"role": "system", "content": ctx.system_message},
             *history,
         ]
-        return await self._llm.complete(messages, ALL_SCHEMAS)
+        latest_user = next(
+            (m.get("content", "") for m in reversed(history) if m.get("role") == "user"), ""
+        )
+        # Confab gate: a status tool-pass can erase the mandatory correction from the final
+        # answer (observed live across personas).  The current state snapshot is already in the
+        # system message, so attribution turns need no tools; the next ordinary turn restores all.
+        tools = [] if is_false_attribution(latest_user) else ALL_SCHEMAS
+        return await self._llm.complete(messages, tools)
 
     async def _dispatch_tool(self, call: ToolCall, history: list[dict[str, Any]]) -> Any:
         # B5: dispatch ONLY the declared tools. A hallucinated/adversarial name that collides with

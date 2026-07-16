@@ -47,7 +47,13 @@ from synapse.journal import AlertKind, TurnJournal
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor
 from synapse.pipeline.context_guard import GenerationGuard, GenerationStartHook, make_guarded_assistant_aggregator
 from synapse.pipeline.tts_cache import TTSCache, TTSCacheObserver
-from synapse.prompt import STAGE_RULES_COLLECT, STAGE_RULES_PROPOSE, build_persona_block
+from synapse.prompt import (
+    FALSE_ATTRIBUTION_REPLY,
+    STAGE_RULES_COLLECT,
+    STAGE_RULES_PROPOSE,
+    build_persona_block,
+    is_false_attribution,
+)
 from synapse.threads import ThreadStore
 
 logger = logging.getLogger(__name__)
@@ -1125,6 +1131,13 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
                 {"role": "system", "content": voice_system},
                 *(m for m in context.get_messages() if m.get("role") != "system"),
             ])
+            # Same confab guard as DispatcherTurnLoop: do not let a get_task_status tool-pass
+            # replace the explicit «Я этого не говорил» correction. Restore the complete tool
+            # catalog on the next normal voice turn.
+            context.set_tools([] if is_false_attribution(transcript) else ALL_SCHEMAS)
+            host.arbiter_policy.set_dispatcher_override(
+                FALSE_ATTRIBUTION_REPLY if is_false_attribution(transcript) else None
+            )
         # Gate v2 D1'/D3': реплики звонка → лента треда (континуитет live→чат). Всё ВНЕ
         # turn_lock-секции (MINOR lock-скоуп): append-ы не держат очередь ходов; сам тред уже
         # создан выше, до сборки system message первого хода.

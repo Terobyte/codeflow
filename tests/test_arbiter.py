@@ -1,5 +1,10 @@
 import pytest
-from pipecat.frames.frames import TextFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    TextFrame,
+    TTSSpeakFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection
 
 from synapse.pipeline.arbiter import ArbiterPolicy, TTSArbiterProcessor, default_sentence_splitter
@@ -94,6 +99,25 @@ async def test_drain_pushes_speak_as_tts_speak_frame_out_of_context_and_dispatch
     speak_frame, _ = captured[1]
     assert isinstance(dispatcher_frame, TextFrame) and not isinstance(dispatcher_frame, TTSSpeakFrame)
     assert isinstance(speak_frame, TTSSpeakFrame) and speak_frame.append_to_context is False
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_override_replaces_all_streamed_llm_text():
+    policy = ArbiterPolicy(splitter=fixed_splitter)
+    policy.set_dispatcher_override("fixed correction")
+    proc = TTSArbiterProcessor(policy)
+    captured = []
+
+    async def fake_push_frame(frame, direction=FrameDirection.DOWNSTREAM):
+        captured.append(frame)
+
+    proc.push_frame = fake_push_frame
+    await proc.process_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(TextFrame("provider "), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(TextFrame("tail"), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
+
+    assert [f.text for f in captured if isinstance(f, TextFrame)] == ["fixed correction"]
 
 
 def test_default_splitter_preserves_whitespace_no_mashing():
