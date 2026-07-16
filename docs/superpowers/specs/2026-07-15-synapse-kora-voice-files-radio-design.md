@@ -29,7 +29,7 @@ implementation-plan владелец плана обязан заменить `O
 | --- | --- | --- | --- |
 | SDK pin `claude-agent-sdk==0.2.116` | **DONE в этой правке** | точный pin в `pyproject.toml`; lock/окружение подтверждается при установке | SDK probes, KV-3b, KV-4 |
 | Phase 0 C4 Task 4.2 | **OPEN** | `CostCapBlocked` и исчерпанный `ProviderUnavailable` на voice+HTTP routes дают одну degraded-реплику, HTTP 200 и `degraded: true`; обе feed-записи и тесты | AI-1..AI-3 |
-| Phase 0 C5 bearer authn | **OPEN** | fail-closed bearer на control/download/settings routes + `AUTH_FAILURE` tests | AI-1..AI-3, KV-4, KV-5 |
+| Phase 0 C5 bearer authn | **ЗАКРЫТ 2026-07-15** (`22c1cc5`, `tests/test_c5_authn.py` + `test_c5_client_authn.py` + `test_c5_static_surfaces_authn.py`, суита 835) | fail-closed bearer на control/download/settings routes + `AUTH_FAILURE` tests | AI-1..AI-3, KV-4, KV-5 |
 | Phase 0 C6 journal isolation | **OPEN** | journal/artifact root вне доступного Коре project root; секреты не наследуются SDK subprocess; tests | KV-4, KV-5 |
 | Probe P1 SDK bidirectional | **OPEN** | артефакт §14.2.1 | KV-3b |
 | Probe P2 SDK MCP | **OPEN** | артефакт §14.2.2 | KV-4 |
@@ -38,6 +38,16 @@ implementation-plan владелец плана обязан заменить `O
 | Probe P4 Fish MP3 segments | **OPEN** | артефакт §14.2.5 | KV-5 |
 | Probe P5 PWA media auth | **OPEN** | артефакт §14.2.6 на iPhone Safari | KV-5 |
 | HTTPS staging | **OPEN** | staging origin с TLS, где выполнены P4/P5 | KV-5 |
+
+**С5 закрыт, но deny-by-default сдвинул границу для всех следующих слайсов (2026-07-15).**
+Токен требуется на ВСЁМ, кроме bootstrap-статики PWA, и это правило по умолчанию: новый роут
+KV-4 (`deliver_file`) или KV-5 (радио) закрыт автоматически, заводить authn заново не нужно —
+но и открыть его «на время отладки» молча тоже не выйдет. Два следствия, которые слайсы обязаны
+переварить, а не переоткрывать: (1) **любая новая клиентская поверхность обязана носить токен
+сама** — статика открыта, но её fetch-и нет: на этом уже погорели `logs.html`/`status-widget.js`,
+которые молча умерли, потому что были «просто статикой»; (2) **токен обязан быть ASCII** —
+браузер не отправит не-ISO-8859-1 заголовок, а latin-1 уйдёт не теми байтами, поэтому
+`_require_api_token` отвергает такой токен на старте.
 
 Жёсткие развилки: сериализация follow-up допустима, потеря follow-up или новый
 SDK subprocess — no-go KV-3b; невидимый MCP tool при рабочей permission-
