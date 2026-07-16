@@ -81,6 +81,20 @@ class TaskState:
 
 
 @dataclass(frozen=True)
+class AwaitingRequest:
+    """Persisted schema-1 identity for a parked ``reply_to_flow`` invocation."""
+
+    schema: int
+    request_id: str
+    thread_id: str
+    task_id: str
+    run_kind: str
+    flow_instruction: str
+    answer_format: str
+    created_at: float
+
+
+@dataclass(frozen=True)
 class TaskStartCheckpoint:
     """Rollback token for the host's cross-store run-start saga.
 
@@ -193,7 +207,10 @@ class TaskStore:
         # persisted (like the live SDK stream it tracks): a dead runner post-restart must never
         # strand a stale «Кора ждёт ответа». Carries NO question text/options (Р-8/Р-15
         # redaction — the question is voiced only via on_speak, never rendered into [СОСТОЯНИЕ]).
-        self._awaiting_answer: bool = False
+        # Schema 0 is the legacy transient AskUserQuestion marker.  Schema 1 is an addressed
+        # reply_to_flow request and is persisted; its *visibility* is still gated by a matching
+        # RUNNING task, so S13 restart reconciliation cannot resurrect a dead SDK stream.
+        self._awaiting: AwaitingRequest | dict[str, int] | None = None
         self._state_path: Path | None = Path(journal_dir) / "state.json" if journal_dir else None
         if self._state_path is not None:
             self._load()
@@ -208,18 +225,61 @@ class TaskStore:
 
     @property
     def awaiting_answer(self) -> bool:
-        return self._awaiting_answer
+        # Frozen schema-0 compatibility: the raw transient marker remains true until the
+        # AskUserQuestion handler's finally clears it, even after cancel.  Every renderer and
+        # liveness consumer uses `_awaiting_active()` and therefore still gates on RUNNING.
+        if isinstance(self._awaiting, dict):
+            return True
+        return self._awaiting_active()
 
-    def set_awaiting(self) -> None:
+    @property
+    def awaiting(self) -> AwaitingRequest | None:
+        return self._awaiting if isinstance(self._awaiting, AwaitingRequest) else None
+
+    def set_awaiting(self, request: AwaitingRequest | None = None) -> None:
         """Kora's stream is now parked in the gate waiting for the user's answer (E5). TRANSIENT
         — deliberately does NOT call `_persist`: this tracks a live SDK stream that cannot
         survive a restart, so it must never be written to state.json (P10)."""
-        self._awaiting_answer = True
+        with self._lock:
+            self._awaiting = request if request is not None else {"schema": 0}
+            if request is not None:
+                self._persist_unlocked()
 
-    def clear_awaiting(self) -> None:
+    def clear_awaiting(self, request_id: str | None = None) -> bool:
         """The answer was delivered or the parked run was cancelled/superseded. TRANSIENT — no
         `_persist`, same contract as `set_awaiting`."""
-        self._awaiting_answer = False
+        with self._lock:
+            if request_id is not None:
+                current = self.awaiting
+                if current is None or current.request_id != request_id:
+                    return False
+            was_persisted = isinstance(self._awaiting, AwaitingRequest)
+            if self._awaiting is None:
+                return False
+            self._awaiting = None
+            if was_persisted:
+                self._persist_unlocked()
+            return True
+
+    def _awaiting_active(self) -> bool:
+        if self._awaiting is None:
+            return False
+        if isinstance(self._awaiting, dict):
+            return self._task is None or self._task.status == TaskStatus.RUNNING
+        return (
+            self._task is not None
+            and self._task.id == self._awaiting.task_id
+            and self._task.status == TaskStatus.RUNNING
+        )
+
+    def _awaiting_lines(self) -> list[str]:
+        current = self.awaiting
+        if current is None or not self._awaiting_active():
+            return []
+        lines = [f"[ЗАПРОС КОРЫ]: {current.flow_instruction}"]
+        if current.answer_format:
+            lines.append(f"[ФОРМАТ ОТВЕТА]: {current.answer_format}")
+        return lines
 
     def has_active_task(self) -> bool:
         return self._task is not None and self._task.status in (
@@ -364,7 +424,7 @@ class TaskStore:
         # B19: gated on the task actually RUNNING (mirrors render_state/snapshot) — after
         # request_cancel flips status, a stale _awaiting_answer flag must not keep reporting OK.
         # No-task+awaiting stays OK (transient set_awaiting window, see test_answer_kora §4).
-        if self._awaiting_answer and (self._task is None or self._task.status == TaskStatus.RUNNING):
+        if self._awaiting_active():
             return Liveness.OK
         # B23: a genuinely COMPLETED task means Кора finished and stopped emitting heartbeats —
         # the ever-growing age of the last event is NOT a liveness signal, so report OK. Otherwise
@@ -409,8 +469,11 @@ class TaskStore:
         ]
         # E5 (MAJOR-R4): REDACTED marker only — the question text/options are voiced by Kora via
         # on_speak (Р-8/Р-15 compliant), NEVER rendered here. Gated on RUNNING (R6).
-        if self._awaiting_answer and t.status == TaskStatus.RUNNING:
-            lines.append("Кора ждёт твоего ответа на свой вопрос (детали озвучены голосом).")
+        if self._awaiting_active():
+            if self.awaiting is None:
+                lines.append("Кора ждёт твоего ответа на свой вопрос (детали озвучены голосом).")
+            else:
+                lines.extend(self._awaiting_lines())
         lines.append("События:")
         if not t.events:
             lines.append("  (пока нет)")
@@ -444,7 +507,17 @@ class TaskStore:
             },
             "liveness": live.value,
             # E5: bool only, gated RUNNING (R6) — no question text leaks (Р-8/Р-15, MAJOR-R4).
-            "awaiting_answer": self._awaiting_answer and t.status == TaskStatus.RUNNING,
+            "awaiting_answer": self._awaiting_active(),
+            **(
+                {
+                    "kora_request": {
+                        "flow_instruction": self.awaiting.flow_instruction,
+                        "answer_format": self.awaiting.answer_format,
+                    }
+                }
+                if self.awaiting is not None and self._awaiting_active()
+                else {}
+            ),
         }
 
     def render_state_template(self, now: float, stale_after_s: float, unreachable_after_s: float) -> str:
@@ -454,7 +527,12 @@ class TaskStore:
             return CANON_PHRASE_STALE_KORA
         # E5 (MAJOR-R1): deterministic truth on the cost-cap hard-stop path — a parked question
         # is not a stalled task. Checked before the generic status phrases below.
-        if self._awaiting_answer and self._task is not None and self._task.status == TaskStatus.RUNNING:
+        if self._awaiting_active():
+            # B-BRIDGE-12: this is the SPOKEN / reconnect-greeting path (no LLM, no trust
+            # framing possible). It must never voice Kora's Flow-directed flow_instruction/
+            # answer_format to the user — only render_state() (the LLM [СОСТОЯНИЕ] block) carries
+            # those, tagged untrusted. A schema-1 park greets with the same generic line as
+            # schema-0; the actual question is voiced separately by Kora via on_speak.
             return "Кора ждёт твоего ответа на свой вопрос."
         if self._task is None:
             return "Активных задач нет."
@@ -494,6 +572,20 @@ class TaskStore:
             "task": _task_to_dict(self._task) if self._task else None,
             "last_event_ts": self._last_event_ts,
             "staged": self._staged,
+            "awaiting": (
+                {
+                    "schema": self._awaiting.schema,
+                    "request_id": self._awaiting.request_id,
+                    "thread_id": self._awaiting.thread_id,
+                    "task_id": self._awaiting.task_id,
+                    "run_kind": self._awaiting.run_kind,
+                    "flow_instruction": self._awaiting.flow_instruction,
+                    "answer_format": self._awaiting.answer_format,
+                    "created_at": self._awaiting.created_at,
+                }
+                if isinstance(self._awaiting, AwaitingRequest)
+                else None
+            ),
         }
         tmp = self._state_path.with_suffix(".json.tmp")
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -523,6 +615,29 @@ class TaskStore:
             self._task = None
             self._last_event_ts = None
             self._staged = None
+        # B-BRIDGE-13: parse the awaiting blob in its OWN try/except. A malformed schema-1
+        # awaiting (missing key / non-numeric created_at — reachable only via external state.json
+        # tampering, since the app always writes it well-formed) must NOT take the valid task/
+        # staged down with it as collateral, nor skip the S13 zombie-reconcile below (B18: a
+        # corrupt state.json must never lose a healthy boot). It is dropped in isolation.
+        try:
+            awaiting = data.get("awaiting")
+            self._awaiting = (
+                AwaitingRequest(
+                    schema=1,
+                    request_id=str(awaiting["request_id"]),
+                    thread_id=str(awaiting["thread_id"]),
+                    task_id=str(awaiting["task_id"]),
+                    run_kind=str(awaiting["run_kind"]),
+                    flow_instruction=str(awaiting.get("flow_instruction") or ""),
+                    answer_format=str(awaiting.get("answer_format") or ""),
+                    created_at=float(awaiting["created_at"]),
+                )
+                if isinstance(awaiting, dict) and awaiting.get("schema") == 1
+                else None
+            )
+        except (KeyError, ValueError, TypeError):
+            self._awaiting = None
         # S13 (UI v2, слайс UI-2): зомби-реконсиляция бута. RUNNING в state.json на старте
         # процесса = сервер умер посреди рана: живого продюсера после рестарта не существует
         # по определению, а оставить как есть — liveness врёт OK и has_active_task() режет

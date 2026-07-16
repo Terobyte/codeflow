@@ -950,6 +950,28 @@ def build_web_app(host: SynapseHost) -> FastAPI:
             return JSONResponse({"error": "no such thread"}, status_code=404)
         return JSONResponse(_thread_dict(thread))
 
+    @app.post("/api/threads/{thread_id}/answer-kora")
+    async def api_thread_answer_kora(thread_id: str, request: Request):
+        """Authenticated UI click is the second key for one live schema-1 request."""
+        if not _csrf_ok(request):
+            return JSONResponse({"error": "csrf"}, status_code=403)
+        if host.threads.get(thread_id) is None:
+            return JSONResponse({"error": "no such thread"}, status_code=404)
+        data, err = await _json_body(request)
+        if err is not None:
+            return err
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"error": "empty text"}, status_code=400)
+        if data.get("confirm") is not True:
+            return JSONResponse({"error": "confirm_required"}, status_code=400)
+        if host.store.awaiting is None:
+            return JSONResponse({"error": "no_pending_question"}, status_code=409)
+        result = host.answer_kora(thread_id, text, user_initiated=True)
+        outcome = result.get("outcome") if isinstance(result, dict) else None
+        status = 200 if outcome == "answer_delivered" else 409
+        return JSONResponse(result if isinstance(result, dict) else {"outcome": outcome}, status_code=status)
+
     @app.post("/api/active-thread")
     async def api_active_thread(request: Request):
         if not _csrf_ok(request):

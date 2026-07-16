@@ -33,7 +33,12 @@ from pipecat.services.fish.tts import FishAudioTTSService
 from pathlib import Path
 
 from synapse.bridge.confirm import ConfirmFlow, KeywordClassifier
-from synapse.bridge.approvals import ApprovalService, gate_digest
+from synapse.bridge.approvals import (
+    AnswerApprovalService,
+    ApprovalService,
+    answer_digest,
+    gate_digest,
+)
 from synapse.bridge.kora import KoraRunner
 from synapse.bridge.runspec import RunSpec
 from synapse.bridge.state import Liveness, SpeakLedger, TaskStore
@@ -123,6 +128,7 @@ class SynapseHost:
         breaker: CircuitBreaker,
         cost_cap: CostCap,
         approvals: ApprovalService | None = None,
+        answer_approvals: AnswerApprovalService | None = None,
         kora_runner: KoraRunner | None = None,
         kora_log: deque | None = None,
         threads: Any = None,
@@ -147,6 +153,7 @@ class SynapseHost:
         self.cost_cap = cost_cap
         # С3: двухключевой контракт gate_action. None в стабах (тесты, не-гейт-сценарии).
         self.approvals = approvals
+        self.answer_approvals = answer_approvals
         # The real Kora producer (M1 slice 1), held on the host so its single in-flight task
         # survives WebRTC reconnects like the rest of the long-lived state. None when disabled.
         self.kora_runner = kora_runner
@@ -178,6 +185,46 @@ class SynapseHost:
         self._output_task: Any = None
         # UI-4: per-thread гейт-локи — single-flight двух конкурентных гейт-вызовов на один тред.
         self._gate_locks: dict[str, asyncio.Lock] = {}
+
+    def answer_kora(
+        self, thread_id: str | None, text: str, *, user_initiated: bool = False
+    ) -> bool | dict[str, Any]:
+        """Route legacy verbatim replies and schema-1 summaries from live host identity."""
+        if self.kora_runner is None:
+            return False
+        current = self.store.awaiting
+        if current is None:
+            return self.kora_runner.provide_answer(text)
+        task = self.store.task
+        if thread_id != current.thread_id:
+            return {"outcome": "stale_answer"}
+        if (
+            task is None
+            or task.id != current.task_id
+            or task.status.value != "running"
+        ):
+            return {
+                "outcome": self.kora_runner.provide_answer(current.request_id, text)
+            }
+        if current.run_kind not in {"code", "docs"}:
+            return {"outcome": "answer_route_denied"}
+        if user_initiated:
+            outcome = self.kora_runner.provide_answer(current.request_id, text)
+            return {"outcome": outcome}
+        if self.answer_approvals is None:
+            return {"outcome": "approval_unavailable"}
+        digest = answer_digest(text, current.request_id, current.thread_id)
+        approval = self.answer_approvals.consume(
+            current.thread_id, current.request_id, digest, self.clock.now()
+        )
+        if approval is None:
+            readback = self.answer_approvals.stage(
+                current.thread_id, current.request_id, digest, text, self.clock.now()
+            )
+            self.speak(readback)
+            return {"outcome": "confirm_required", "readback": readback}
+        outcome = self.kora_runner.provide_answer(current.request_id, text)
+        return {"outcome": outcome, "approval_id": approval.approval_id}
 
     @property
     def current_http_thread(self) -> dict:
@@ -568,7 +615,13 @@ class SynapseHost:
             )
             self.kora_runner.start(
                 task_id, text,
-                RunSpec(thread_id=th.id, project_root=root, gate_mode=gate_mode, model=model),
+                RunSpec(
+                    thread_id=th.id,
+                    project_root=root,
+                    gate_mode=gate_mode,
+                    model=model,
+                    run_kind="docs" if gate_mode == "docs_only" else "code",
+                ),
             )
         except Exception:
             # Conditional rollback tokens prevent a failed predecessor from clobbering a
@@ -671,6 +724,9 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
     # больше не власть: голосовой запуск требует readback → user turn → affirm + совпадение digest.
     # TTL = тот же confirm_timeout_s (единый бюджет подтверждения для обоих сервисов).
     approvals = ApprovalService(clock, cfg.confirm_timeout_s, cfg.affirm_words, cfg.deny_words)
+    answer_approvals = AnswerApprovalService(
+        clock, cfg.confirm_timeout_s, cfg.affirm_words, cfg.deny_words
+    )
 
     arbiter_policy = ArbiterPolicy()
 
@@ -823,6 +879,9 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         return {"outcome": "project_bound", "project_id": project_id}
 
     def _awaiting_thread_id() -> str | None:
+        current = store.awaiting
+        if current is not None and store.awaiting_answer:
+            return current.thread_id
         task = store.task
         th = threads.thread_for_task(task.id) if task is not None else None
         return th.id if th is not None else None
@@ -840,7 +899,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         awaiting = _awaiting_thread_id()
         if awaiting is not None and voice_thread["id"] not in (None, awaiting):
             return False  # голос стоит в чужом треде — ответ Коре не отсюда
-        return kora_runner.provide_answer(text)
+        return _h["host"].answer_kora(voice_thread["id"] or awaiting, text, user_initiated=False)
 
     def _http_answer(text: str) -> bool:
         if kora_runner is None:
@@ -848,7 +907,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         awaiting = _awaiting_thread_id()
         if awaiting is None or current_http_thread["id"] != awaiting:
             return False  # реплика из треда Б не должна улетать ответом Коре в А
-        return kora_runner.provide_answer(text)
+        return _h["host"].answer_kora(current_http_thread["id"], text, user_initiated=False)
 
     def _resolve_project_root(th) -> str | None:
         # UI v3: единый резолвер для голоса и HTTP — Кора работает в папке проекта треда.
@@ -948,9 +1007,9 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
             owner_thread_for=lambda task_id: (
                 th.id if (th := threads.thread_for_task(task_id)) else None
             ),
-            on_user_turn=(
-                lambda tid, tr, now: approvals.note_user_turn(tid, tr, now)
-                if approvals is not None else None
+            on_user_turn=lambda tid, tr, now: (
+                approvals.note_user_turn(tid, tr, now),
+                answer_approvals.note_user_turn(tid, tr, now),
             ),
         )
 
@@ -975,6 +1034,7 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         breaker=breaker,
         cost_cap=cost_cap,
         approvals=approvals,
+        answer_approvals=answer_approvals,
         kora_runner=kora_runner,
         kora_log=kora_log,
         threads=threads,
@@ -1120,6 +1180,10 @@ def build_session_pipeline(host: SynapseHost) -> SynapseSession:
             # approval-flow (gate_action). Ключится по голосовому треду.
             if host.approvals is not None:
                 host.approvals.note_user_turn(host.voice_thread["id"], transcript, host.clock.now())
+            if host.answer_approvals is not None:
+                host.answer_approvals.note_user_turn(
+                    host.voice_thread["id"], transcript, host.clock.now()
+                )
             # UI-4: voice uses pipecat's own live context, not DispatcherTurnLoop. Refresh the
             # single system item in place before the user aggregator starts generation, keeping
             # its accumulated assistant/tool tail intact.

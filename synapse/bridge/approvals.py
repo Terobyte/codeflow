@@ -43,6 +43,13 @@ def gate_digest(request_text: str | None, action: str, model: str | None,
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def answer_digest(summary: str, request_id: str, thread_id: str) -> str:
+    """Identity-bound digest for a Flow-authored answer to one Kora request."""
+    return hashlib.sha256(
+        "|".join((summary, request_id, thread_id)).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class _Pending:
     approval_id: str
@@ -155,4 +162,87 @@ class ApprovalService:
         return Approval(
             approval_id=pending.approval_id,
             thread_id=thread_id, action=action, digest=digest,
+        )
+
+
+@dataclass(frozen=True)
+class _PendingAnswer:
+    approval_id: str
+    request_id: str
+    thread_id: str
+    digest: str
+    staged_turn_seq: int
+    expires_at: float
+
+
+class AnswerApprovalService:
+    """Two-key approval for a summary that can steer a parked code/docs run.
+
+    It is deliberately separate from ``ApprovalService``: one thread may simultaneously own a
+    staged launch action and a Kora interview request, and neither pending may evict the other.
+    """
+
+    def __init__(
+        self,
+        clock: Clock,
+        ttl_s: float,
+        affirm_words: frozenset[str],
+        deny_words: frozenset[str],
+    ) -> None:
+        self._clock = clock
+        self._ttl_s = ttl_s
+        self._affirm_words = affirm_words
+        self._deny_words = deny_words
+        self._pending: dict[str, _PendingAnswer] = {}
+        self._last_user_turn: dict[str, tuple[int, str]] = {}
+        self._user_turn_seq: dict[str, int] = {}
+
+    def stage(
+        self, thread_id: str, request_id: str, digest: str, summary: str, now: float
+    ) -> str:
+        self._pending[request_id] = _PendingAnswer(
+            approval_id=_new_approval_id(now),
+            request_id=request_id,
+            thread_id=thread_id,
+            digest=digest,
+            staged_turn_seq=self._user_turn_seq.get(thread_id, 0),
+            expires_at=now + self._ttl_s,
+        )
+        return f"Свод для Коры: «{summary}». Подтверди: «да», или отклони: «нет»."
+
+    def note_user_turn(self, thread_id: str, transcript: str, now: float) -> None:
+        seq = self._user_turn_seq.get(thread_id, 0) + 1
+        self._user_turn_seq[thread_id] = seq
+        self._last_user_turn[thread_id] = (seq, transcript)
+
+    def invalidate(self, request_id: str) -> None:
+        self._pending.pop(request_id, None)
+
+    def consume(
+        self, thread_id: str, request_id: str, digest: str, now: float
+    ) -> Approval | None:
+        pending = self._pending.get(request_id)
+        if pending is None:
+            return None
+        if now > pending.expires_at:
+            self._pending.pop(request_id, None)
+            return None
+        if pending.thread_id != thread_id or pending.digest != digest:
+            self._pending.pop(request_id, None)
+            return None
+        noted = self._last_user_turn.get(thread_id)
+        if noted is None or noted[0] <= pending.staged_turn_seq:
+            return None
+        response = classify_affirm(noted[1], self._affirm_words, self._deny_words)
+        if response == "deny":
+            self._pending.pop(request_id, None)
+            return None
+        if response != "affirm":
+            return None
+        self._pending.pop(request_id, None)
+        return Approval(
+            approval_id=pending.approval_id,
+            thread_id=thread_id,
+            action="answer_kora",
+            digest=digest,
         )

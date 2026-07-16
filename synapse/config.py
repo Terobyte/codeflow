@@ -39,6 +39,9 @@ class SynapseConfig:
     # KV-2 §4.2: кап длины для speakable() — форматного фильтра «текст Коры звучит как речь,
     # а не как зачитанный markdown». Длиннее — не разговорная реплика, идёт через speakify.
     kora_speak_max_chars: int = 350
+    kora_reply_speak_max_chars: int = 2000
+    kora_reply_instruction_max_chars: int = 1200
+    kora_reply_format_max_chars: int = 400
 
     request_timeout_s: float = 10.0
 
@@ -169,6 +172,14 @@ class SynapseConfig:
         speak_cap = _num("KORA_SPEAK_MAX_CHARS", int)
         if speak_cap is not None:
             kwargs["kora_speak_max_chars"] = speak_cap
+        for env_key, field_name in (
+            ("KORA_REPLY_SPEAK_MAX_CHARS", "kora_reply_speak_max_chars"),
+            ("KORA_REPLY_INSTRUCTION_MAX_CHARS", "kora_reply_instruction_max_chars"),
+            ("KORA_REPLY_FORMAT_MAX_CHARS", "kora_reply_format_max_chars"),
+        ):
+            value = _num(env_key, int)
+            if value is not None:
+                kwargs[field_name] = value
         return cls(**kwargs)
 
     def validate_voice_keys(self) -> None:

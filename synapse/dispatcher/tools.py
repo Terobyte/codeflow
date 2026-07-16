@@ -78,9 +78,16 @@ ANSWER_KORA_SCHEMA = FunctionSchema(
     name="answer_kora",
     description=(
         "Передать Коре ответ пользователя на её уточняющий вопрос — дословно, без переписывания. "
-        "Использовать только когда [СОСТОЯНИЕ] показывает, что Кора ждёт ответа на свой вопрос."
+        "Использовать только когда [СОСТОЯНИЕ] показывает, что Кора ждёт ответа. Для "
+        "[ЗАПРОС КОРЫ] собери свод по [ФОРМАТ ОТВЕТА], зачитай его и после явного подтверждения "
+        "повторно передай тот же свод; request_id выбирает хост."
     ),
-    properties={"text": {"type": "string", "description": "Реплика пользователя дословно."}},
+    properties={
+        "text": {
+            "type": "string",
+            "description": "Реплика пользователя дословно либо подтверждённый свод для schema-1.",
+        }
+    },
     required=["text"],
 )
 
@@ -160,7 +167,7 @@ class KoraBridge:
     # M1 slice 3 (E5): deliver the user's reply to a parked AskUserQuestion, verbatim. Wired to
     # KoraRunner.provide_answer; returns True iff a question was actually pending. Fires INSIDE
     # ToolHandlers._do (answer_kora), like the other on_* callbacks.
-    on_answer: Callable[[str], bool] | None = None
+    on_answer: Callable[[str], Any] | None = None
     # UI-4: staging tools are deliberately callbacks, so voice and HTTP select their own
     # current thread without sharing mutable routing state.
     on_propose: Callable[[str], Any] | None = None
@@ -350,8 +357,13 @@ class ToolHandlers:
 
     async def answer_kora(self, text: str) -> dict[str, Any]:
         async def _do() -> dict[str, Any]:
-            ok = self.bridge.on_answer(text) if self.bridge.on_answer else False
-            return {"outcome": "answer_delivered" if ok else "no_pending_question"}
+            value = (
+                await self._callback(self.bridge.on_answer, text)
+                if self.bridge.on_answer else False
+            )
+            if isinstance(value, dict):
+                return value
+            return {"outcome": "answer_delivered" if value else "no_pending_question"}
 
         result, deduped = await self._guarded("answer_kora", {"text": text}, _do)
         self._journal.record_tool_call("answer_kora", {"text": text}, {**result, "deduped": deduped})

@@ -33,7 +33,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from synapse.bridge.runspec import RunSpec
-from synapse.bridge.state import EventClass, KoraEvent, SpeakLedger, TaskStatus, TaskStore
+from synapse.bridge.state import (
+    AwaitingRequest,
+    EventClass,
+    KoraEvent,
+    SpeakLedger,
+    TaskStatus,
+    TaskStore,
+)
 from synapse.clock import Clock
 from synapse.config import SynapseConfig
 from synapse.journal import AlertKind, TurnJournal
@@ -78,6 +85,40 @@ _BASH_SECRET_TOKENS = (
     ".claude.json", ".credentials",
 )
 
+# B-BRIDGE-11: the bracket labels the host uses to delimit the [СОСТОЯНИЕ] block. A reply field
+# carrying one of these (or a raw line break) could forge a second host-authored line inside
+# Flow's LLM context, indistinguishable from the real one. Reply fields are short single-line
+# directives — reject the forge at the input boundary rather than strip/repair it downstream.
+_STATE_MARKER_TOKENS = ("[СОСТОЯНИЕ]", "[ЗАПРОС КОРЫ]", "[ФОРМАТ ОТВЕТА]")
+
+
+class ReplyFieldError(ValueError):
+    """Value-redacted contract error returned to Kora as loud MCP tool content."""
+
+
+def _validate_reply_field(
+    name: str, value: Any, max_chars: int, *, required: bool = False
+) -> str:
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise ReplyFieldError(f"{name}: expected string")
+    value = value.strip()
+    if required and not value:
+        raise ReplyFieldError(f"{name}: required")
+    if len(value) > max_chars:
+        raise ReplyFieldError(f"{name}: exceeds {max_chars} characters")
+    folded = value.casefold()
+    if any(token.casefold() in folded for token in _BASH_SECRET_TOKENS):
+        raise ReplyFieldError(f"{name}: secret_path token denied")
+    # B-BRIDGE-11: no line breaks and no reserved state-marker labels — either would let this
+    # field forge a host-authored line in the [СОСТОЯНИЕ] block Flow reads.
+    if "\n" in value or "\r" in value:
+        raise ReplyFieldError(f"{name}: line breaks not allowed")
+    if any(marker.casefold() in folded for marker in _STATE_MARKER_TOKENS):
+        raise ReplyFieldError(f"{name}: state marker token denied")
+    return value
+
 # Gate v2 (A2', sec-1): скан каталога ВНЕ workspace ограничен глубиной и числом записей —
 # полный os.walk по ~/ был бы unusable (минуты). Cap исчерпан → allow (best-effort: Bash
 # всё равно открыт, скан — защита от случайного, не от злонамеренного).
@@ -101,6 +142,7 @@ _KORA_REAL_CLI_ENV = "SYNAPSE_KORA_REAL_CLI"
 # Upper bound for noticing an AskUserQuestion park/unpark transition.  Tests monkeypatch this
 # to keep parking scenarios fast; active deadline precision remains min(tick, remaining).
 _WATCHDOG_TICK_S = 1.0
+_reply_seq = itertools.count(1)
 
 # Slice-4 secret containment (§2.8, BLOCKER-1): a secret INSIDE the workspace is still a
 # secret — deny it for every file tool BEFORE the in-workspace allow. macOS APFS is
@@ -451,6 +493,7 @@ class KoraRunner:
         # try/finally under an identity guard, so a superseding run never clobbers the successor's
         # question (MAJOR-C1); `_run`'s finally stays terminalize-only.
         self._pending_answer: asyncio.Future[str] | None = None
+        self._pending_request_id: str | None = None
         # UI-2 (спека §3, находка B): per-run снапшот launch-параметров. Ставится в начале
         # _run ДО создания клиента; ЕДИНСТВЕННЫЙ источник корня для _build_options /
         # _system_prompt / _gate_decision на время рана. Владелец = task_id (identity-guard,
@@ -462,6 +505,8 @@ class KoraRunner:
         # (честный сентинел, как _run_root); НЕ ставить дефолт "full" в слот, иначе
         # is-not-None всегда истинно и зеркало ломается. ПЕРВЫЙ читатель spec.gate_mode.
         self._run_gate_mode: str | None = None
+        self._run_thread_id: str | None = None
+        self._run_kind: str | None = None
 
     # --- launch / cancel (host-facing) -----------------------------------------------------
 
@@ -491,15 +536,40 @@ class KoraRunner:
         if self._active is not None and not self._active.done():
             self._active.cancel()
 
-    def provide_answer(self, text: str) -> bool:
+    def provide_answer(self, *args: str) -> bool | str:
         """Host-facing (wired to the dispatcher's answer_kora tool via KoraBridge.on_answer):
         deliver the user's reply, verbatim, to the parked AskUserQuestion. Clears the store's
         awaiting flag SYNCHRONOUSLY BEFORE `set_result` (R5) so there is no resume-gap window in
         which [СОСТОЯНИЕ] still shows «ждёт ответа» after the answer was accepted. Returns True
         iff a question was actually pending — False lets the tool report `no_pending_question`."""
+        if len(args) == 1:
+            request_id = None
+            text = args[0]
+            if self._pending_request_id is not None:
+                return False
+        elif len(args) == 2:
+            request_id, text = args
+            current = self._store.awaiting
+            if current is not None and current.request_id != request_id:
+                return "stale_answer"
+            if current is None or self._pending_request_id != request_id:
+                return "no_pending_question"
+            # B-PIPE-7: a schema-1 reply future must never be resolved once its run has left
+            # RUNNING. request_cancel() flips the task to CANCEL_REQUESTED synchronously, but this
+            # parked handler's finally/teardown runs async — so there is a window where the future
+            # is still live while the task is dying. answer_kora's "task not running" fallback
+            # lands here with an UNAPPROVED summary; delivering it would push past the two-key
+            # AnswerApprovalService gate into a dying SDK session. Refuse — schema-1 is always
+            # code/docs and always requires RUNNING + approval (or an explicit user_initiated
+            # delivery, which reaches this method only while the task is still RUNNING).
+            task = self._store.task
+            if task is None or task.id != current.task_id or task.status != TaskStatus.RUNNING:
+                return "no_pending_question"
+        else:
+            raise TypeError("provide_answer expects text or request_id, text")
         fut = self._pending_answer
         if fut is not None and not fut.done():
-            self._store.clear_awaiting()
+            self._store.clear_awaiting(request_id)
             # B-BRIDGE-2: the parked future can be cancelled between the `not fut.done()` check and
             # `set_result` (a superseding task cancels `self._active`, which propagates into the
             # parked future). set_result on a cancelled/done future raises InvalidStateError and
@@ -508,9 +578,9 @@ class KoraRunner:
             try:
                 fut.set_result(text)
             except asyncio.InvalidStateError:
-                return False
-            return True
-        return False
+                return False if request_id is None else "no_pending_question"
+            return True if request_id is None else "answer_delivered"
+        return False if request_id is None else "no_pending_question"
 
     # --- run / stream ----------------------------------------------------------------------
 
@@ -523,6 +593,8 @@ class KoraRunner:
         self._run_owner, self._run_root = task_id, root
         self._run_model = spec.model or self._cfg.kora_model
         self._run_gate_mode = spec.gate_mode or "full"
+        self._run_thread_id = spec.thread_id
+        self._run_kind = spec.run_kind
         stream_task = asyncio.create_task(self._stream(task_id, text))
         try:
             await self._watch_deadline(stream_task, self._cfg.kora_deadline_s)
@@ -542,6 +614,8 @@ class KoraRunner:
                 self._run_root = None
                 self._run_model = None
                 self._run_gate_mode = None
+                self._run_thread_id = None
+                self._run_kind = None
             self._terminalize_if_running(task_id)
             # UI-2 (находка G): исход запуска → тред. Источник — терминальный статус стора
             # ПОСЛЕ terminalize; чужой task в сторе (суперсид) → исход не наш, молчим.
@@ -702,6 +776,9 @@ class KoraRunner:
             f"одним-двумя короткими абзацами: без markdown-разметки, таблиц, код-блоков, "
             f"путей и идентификаторов. Все технические выкладки, списки файлов и команды "
             f"держи в thinking и в tool-вызовах — пользователю говори итог и смысл. "
+            f"Всю речь наружу отправляй через reply_to_flow: final=false, когда нужен "
+            f"собранный Flow ответ, final=true для сообщения без ожидания. Не помещай в поля "
+            f"секреты, содержимое файлов или пути к секретам. "
             f"Задача пользователя: {task_text}"
         )
 
@@ -714,17 +791,19 @@ class KoraRunner:
         permission-requiring tools — Read/Glob/Bash bypassed it and a secret leaked — whereas a
         PreToolUse hook fires for EVERY tool, so the gate runs on all of them. SDK import is lazy
         so the module loads without the package."""
-        from claude_agent_sdk import ClaudeAgentOptions
+        from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server
         from claude_agent_sdk.types import HookMatcher
 
         workspace = self._current_root()
         workspace.mkdir(parents=True, exist_ok=True)
+        flow_server = create_sdk_mcp_server("flow", tools=[self._build_reply_tool(task_id)])
         return ClaudeAgentOptions(
             cwd=str(workspace),
             permission_mode="default",
             allowed_tools=[],
             disallowed_tools=[],
             setting_sources=[],
+            mcp_servers={"flow": flow_server},
             env=self._worker_env(),
             # B-BRIDGE-9: хук несёт личность СВОЕГО рана — без неё гейт судил вызов по снапшоту
             # того, кто занял поля последним. task_id известен ровно здесь, в момент сборки.
@@ -738,6 +817,104 @@ class KoraRunner:
             max_budget_usd=self._cfg.kora_max_budget_usd,
             system_prompt=self._system_prompt(workspace, text),
         )
+
+    def _build_reply_tool(self, task_id: str) -> Any:
+        from claude_agent_sdk import tool
+
+        @tool(
+            "reply_to_flow",
+            "Озвучить сообщение и при необходимости запросить у Flow собранный ответ.",
+            {
+                "type": "object",
+                "properties": {
+                    "speak_text": {"type": "string"},
+                    "flow_instruction": {"type": "string"},
+                    "answer_format": {"type": "string"},
+                    "final": {"type": "boolean"},
+                },
+                "required": ["speak_text", "final"],
+                "additionalProperties": False,
+            },
+        )
+        async def reply_to_flow(args: dict[str, Any]) -> dict[str, Any]:
+            task = self._store.task
+            if (
+                self._run_owner != task_id
+                or task is None
+                or task.id != task_id
+                or task.status != TaskStatus.RUNNING
+                or self._run_kind not in {"code", "docs"}
+            ):
+                return self._mcp_error("reply_to_flow: stale or unauthorized run")
+            try:
+                spoken = _validate_reply_field(
+                    "speak_text", args.get("speak_text"),
+                    self._cfg.kora_reply_speak_max_chars, required=True,
+                )
+                instruction = _validate_reply_field(
+                    "flow_instruction", args.get("flow_instruction"),
+                    self._cfg.kora_reply_instruction_max_chars,
+                )
+                answer_format = _validate_reply_field(
+                    "answer_format", args.get("answer_format"),
+                    self._cfg.kora_reply_format_max_chars,
+                )
+                final = args.get("final")
+                if not isinstance(final, bool):
+                    raise ReplyFieldError("final: expected boolean")
+            except ReplyFieldError as exc:
+                return self._mcp_error(str(exc))
+
+            if final:
+                if self._on_speak is not None:
+                    self._on_speak(spoken)
+                return self._mcp_text("message delivered")
+
+            # B-BRIDGE-10: МЕШ-1 parks one question at a time. `_pending_answer`/
+            # `_pending_request_id`/`store._awaiting` are single slots, and the SDK dispatches tool
+            # calls as INDEPENDENT concurrent tasks — a second reply_to_flow while one is still
+            # parked would clobber the first's slots, orphan its future and fail the whole run.
+            # Reject the second park loudly and synchronously, before touching any slot, so the
+            # in-flight park stays intact and individually deliverable.
+            if self._pending_answer is not None and not self._pending_answer.done():
+                return self._mcp_error(
+                    "reply_to_flow: вопрос уже ожидает ответа — дождись его перед новым запросом"
+                )
+
+            request_id = f"reply-{int(self._clock.now() * 1000)}-{next(_reply_seq)}"
+            fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            self._pending_answer = fut
+            self._pending_request_id = request_id
+            try:
+                self._store.set_awaiting(AwaitingRequest(
+                    schema=1,
+                    request_id=request_id,
+                    thread_id=self._run_thread_id or "",
+                    task_id=task_id,
+                    run_kind=self._run_kind,
+                    flow_instruction=instruction,
+                    answer_format=answer_format,
+                    created_at=self._clock.now(),
+                ))
+                if self._on_speak is not None:
+                    self._on_speak(spoken)
+                answer = await fut
+            finally:
+                if self._pending_answer is fut and self._pending_request_id == request_id:
+                    self._pending_answer = None
+                    self._pending_request_id = None
+                    self._store.clear_awaiting(request_id)
+            return self._mcp_text(answer)
+
+        return reply_to_flow
+
+    @staticmethod
+    def _mcp_text(text: str) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": text}]}
+
+    @staticmethod
+    def _mcp_error(reason: str) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": reason}], "is_error": True}
 
     def _gate_decision(self, tool_name: str, tool_input: dict[str, Any],
                        task_id: str | None = None) -> tuple[bool, str | None, str]:
@@ -783,6 +960,17 @@ class KoraRunner:
         предиката, снапшот в них ставится тестом напрямую; гвард не включается."""
         if task_id is not None and self._run_owner != task_id:
             return False, "superseded_run", "superseded_run"
+        if tool_name == "mcp__flow__reply_to_flow":
+            allowed = (
+                task_id is not None
+                and self._run_kind in {"code", "docs"}
+                and self._store.task is not None
+                and self._store.task.id == task_id
+                and self._store.task.status == TaskStatus.RUNNING
+            )
+            if allowed:
+                return True, "reply_to_flow", "allow"
+            return False, "reply_to_flow_denied", "reply_to_flow_denied"
         key = _PATH_KEY.get(tool_name)
         if key is None:
             if tool_name in _SAFE_META_TOOLS:
@@ -971,6 +1159,7 @@ class KoraRunner:
         # never resolve a not-yet-created future.
         fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._pending_answer = fut
+        self._pending_request_id = None
         self._store.set_awaiting()
         if self._on_speak is not None:  # P6 None-guard
             self._on_speak(spoken)
@@ -981,6 +1170,7 @@ class KoraRunner:
             # superseding run that overwrote `_pending_answer` must keep its own state intact.
             if self._pending_answer is fut:
                 self._pending_answer = None
+                self._pending_request_id = None
                 self._store.clear_awaiting()
         # Verbatim (§2.9): the user's reply goes UNTOUCHED into every question key, label or
         # free-form alike (§2b — the CLI does not validate it against the options).
