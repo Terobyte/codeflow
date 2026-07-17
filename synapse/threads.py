@@ -54,6 +54,7 @@ class RunStartCheckpoint:
     previous_last_model: str | None
     previous_updated_ts: float
     previous_task_owner: str | None
+    auxiliary: bool = False
 
 
 class ThreadStore:
@@ -148,11 +149,48 @@ class ThreadStore:
                 raise
             return checkpoint
 
+    def begin_aux_run(
+        self, thread_id: str, task_id: str, model: str | None = None
+    ) -> RunStartCheckpoint:
+        """Record a non-FSM run (currently consult) without moving the stage."""
+        with self._lock:
+            t = self._threads.get(thread_id)
+            if t is None:
+                raise KeyError(thread_id)
+            checkpoint = RunStartCheckpoint(
+                thread_id=thread_id,
+                task_id=task_id,
+                previous_stage=t.stage,
+                previous_last_model=t.last_model,
+                previous_updated_ts=t.updated_ts,
+                previous_task_owner=self._task_index.get(task_id),
+                auxiliary=True,
+            )
+            # Consult is conversation bookkeeping, not an executable task.  Keep the
+            # ephemeral owner index so live callbacks can find the thread, but do not append
+            # to durable ``task_ids``: doing so would permanently consume the one-shot project
+            # binding even though no code/docs run has started.
+            self._task_index[task_id] = thread_id
+            if model is not None:
+                t.last_model = model
+            t.updated_ts = self._clock.now()
+            try:
+                self._persist(t)
+            except Exception:
+                self._restore_run_unlocked(t, checkpoint)
+                raise
+            return checkpoint
+
     def rollback_run(self, checkpoint: RunStartCheckpoint) -> bool:
         """Compensate a rejected runner start without clobbering a successor run."""
         with self._lock:
             t = self._threads.get(checkpoint.thread_id)
-            if t is None or not t.task_ids or t.task_ids[-1] != checkpoint.task_id:
+            if t is None:
+                return False
+            if checkpoint.auxiliary:
+                if self._task_index.get(checkpoint.task_id) != checkpoint.thread_id:
+                    return False
+            elif not t.task_ids or t.task_ids[-1] != checkpoint.task_id:
                 return False
             self._restore_run_unlocked(t, checkpoint)
             self._persist(t)
@@ -162,7 +200,7 @@ class ThreadStore:
         t.stage = checkpoint.previous_stage
         t.last_model = checkpoint.previous_last_model
         t.updated_ts = checkpoint.previous_updated_ts
-        if t.task_ids and t.task_ids[-1] == checkpoint.task_id:
+        if not checkpoint.auxiliary and t.task_ids and t.task_ids[-1] == checkpoint.task_id:
             t.task_ids.pop()
         if checkpoint.previous_task_owner is None:
             self._task_index.pop(checkpoint.task_id, None)
@@ -376,6 +414,33 @@ class ThreadStore:
 
     def _feed_path(self, thread_id: str) -> Path:
         return self._root / f"{thread_id}.feed.jsonl"
+
+    def case_path(self, thread_id: str) -> Path:
+        """Host-side durable memory sibling; Kora receives its content, never this path."""
+        return self._root / f"{thread_id}.case.md"
+
+    def read_case(self, thread_id: str) -> str:
+        with self._lock:
+            path = self.case_path(thread_id)
+            if not path.exists():
+                return ""
+            try:
+                return path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return ""
+
+    def append_case(self, thread_id: str, heading: str, text: str) -> bool:
+        """Append host-authored case material without exposing the file to the agent."""
+        with self._lock:
+            if thread_id not in self._threads:
+                return False
+            path = self.case_path(thread_id)
+            existed = path.exists()
+            with path.open("a", encoding="utf-8") as f:
+                if not existed:
+                    f.write("# Дело треда\n")
+                f.write(f"\n## {heading}\n{text.strip()}\n")
+            return True
 
     def append_feed(self, thread_id: str, entry: dict) -> None:
         # Append, count update and the occasional ring rewrite are one operation. Without this

@@ -91,6 +91,22 @@ ANSWER_KORA_SCHEMA = FunctionSchema(
     required=["text"],
 )
 
+CONSULT_KORA_SCHEMA = FunctionSchema(
+    name="consult_kora",
+    description=(
+        "Попросить Кору прочитать проект и обсудить идею в read-only режиме. Первый вызов "
+        "запускает консилиум; следующий передаёт новый бриф той же ожидающей Коре. "
+        "Доступно в любой стадии разговора; стадия рана не меняется."
+    ),
+    properties={
+        "briefing": {
+            "type": "string",
+            "description": "Контекст разговора, уже принятые решения и конкретный вопрос Коре.",
+        }
+    },
+    required=["briefing"],
+)
+
 PROPOSE_REQUEST_SCHEMA = FunctionSchema(
     name="propose_request",
     description="Сохранить согласованный свод запроса и показать пользователю карточку следующего шага.",
@@ -133,6 +149,7 @@ ALL_SCHEMAS = [
     GET_TASK_STATUS_SCHEMA,
     REQUEST_CANCEL_SCHEMA,
     ANSWER_KORA_SCHEMA,
+    CONSULT_KORA_SCHEMA,
     PROPOSE_REQUEST_SCHEMA,
     GATE_ACTION_SCHEMA,
     BIND_PROJECT_SCHEMA,
@@ -168,6 +185,7 @@ class KoraBridge:
     # KoraRunner.provide_answer; returns True iff a question was actually pending. Fires INSIDE
     # ToolHandlers._do (answer_kora), like the other on_* callbacks.
     on_answer: Callable[[str], Any] | None = None
+    on_consult: Callable[[str], Any] | None = None
     # UI-4: staging tools are deliberately callbacks, so voice and HTTP select their own
     # current thread without sharing mutable routing state.
     on_propose: Callable[[str], Any] | None = None
@@ -369,6 +387,19 @@ class ToolHandlers:
         self._journal.record_tool_call("answer_kora", {"text": text}, {**result, "deduped": deduped})
         return result
 
+    async def consult_kora(self, briefing: str) -> dict[str, Any]:
+        async def _do() -> dict[str, Any]:
+            if self.bridge.on_consult is None:
+                return {"outcome": "dispatcher_unavailable"}
+            value = await self._callback(self.bridge.on_consult, briefing)
+            return value if isinstance(value, dict) else {"outcome": "consult_started"}
+
+        result, deduped = await self._guarded("consult_kora", {"briefing": briefing}, _do)
+        self._journal.record_tool_call(
+            "consult_kora", {"briefing": briefing}, {**result, "deduped": deduped}
+        )
+        return result
+
     async def _callback(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         result = callback(*args, **kwargs)
         return await result if inspect.isawaitable(result) else result
@@ -480,6 +511,10 @@ def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
         result = await handlers.answer_kora(**params.arguments)
         await params.result_callback(result)
 
+    async def _consult_kora(params: FunctionCallParams) -> None:
+        result = await handlers.consult_kora(**params.arguments)
+        await params.result_callback(result)
+
     async def _propose_request(params: FunctionCallParams) -> None:
         result = await handlers.propose_request(**params.arguments)
         await params.result_callback(result)
@@ -501,6 +536,7 @@ def register_all(llm_or_switcher: Any, handlers: ToolHandlers) -> None:
     llm_or_switcher.register_function("request_cancel", _request_cancel, cancel_on_interruption=False)
     # E5 (S5): barge-in must NOT drop the answer — losing it would strand Kora blocked forever.
     llm_or_switcher.register_function("answer_kora", _answer_kora, cancel_on_interruption=False)
+    llm_or_switcher.register_function("consult_kora", _consult_kora, cancel_on_interruption=False)
     llm_or_switcher.register_function("propose_request", _propose_request, cancel_on_interruption=False)
     llm_or_switcher.register_function("gate_action", _gate_action, cancel_on_interruption=False)
     llm_or_switcher.register_function("bind_project", _bind_project, cancel_on_interruption=False)

@@ -96,6 +96,24 @@ class ReplyFieldError(ValueError):
     """Value-redacted contract error returned to Kora as loud MCP tool content."""
 
 
+class ConsultIdleTimeout(TimeoutError):
+    """A parked consult waited too long for its Flow follow-up briefing."""
+
+
+def _casefold_relative(path: Path, root: Path) -> bool:
+    """Case-insensitive lexical containment for case-insensitive host filesystems."""
+    path_parts = tuple(part.casefold() for part in path.parts)
+    root_parts = tuple(part.casefold() for part in root.parts)
+    return path_parts[:len(root_parts)] == root_parts
+
+
+def _consult_case_overlap(path: Path, journal_root: Path, *, recursive: bool) -> bool:
+    """Deny the private case tree itself and recursive searches rooted above it."""
+    return _casefold_relative(path, journal_root) or (
+        recursive and _casefold_relative(journal_root, path)
+    )
+
+
 def _validate_reply_field(
     name: str, value: Any, max_chars: int, *, required: bool = False
 ) -> str:
@@ -473,6 +491,8 @@ class KoraRunner:
         client_factory: Callable[[Any], Any] | None = None,
         log_sink: Callable[[dict[str, Any]], None] | None = None,
         on_run_finished: Callable[[str, str, str | None], None] | None = None,
+        on_case_entry: Callable[[str, str, str], None] | None = None,
+        on_consult_parked: Callable[[AwaitingRequest], None] | None = None,
     ) -> None:
         self._cfg = cfg
         self._store = store
@@ -486,6 +506,8 @@ class KoraRunner:
         self._log_sink = log_sink
         # UI-2 (находка G): колбэк исхода запуска → тред. None → feature unwired (тесты без тредов).
         self._on_run_finished = on_run_finished
+        self._on_case_entry = on_case_entry
+        self._on_consult_parked = on_consult_parked
         self._active: asyncio.Task[None] | None = None
         # M1 slice 3 (E5): while Kora's stream is blocked in the gate on an AskUserQuestion, this
         # holds the future the dispatcher's answer_kora resolves. None whenever no question is
@@ -507,6 +529,7 @@ class KoraRunner:
         self._run_gate_mode: str | None = None
         self._run_thread_id: str | None = None
         self._run_kind: str | None = None
+        self._consult_final_task_id: str | None = None
 
     # --- launch / cancel (host-facing) -----------------------------------------------------
 
@@ -535,6 +558,22 @@ class KoraRunner:
         «отмени задачу» actually stops Kora, not just frees the slot."""
         if self._active is not None and not self._active.done():
             self._active.cancel()
+
+    def _cancel_finalized_consult(self, task_id: str) -> None:
+        """End a consult after its final reply tool result has been returned to the SDK."""
+        if (
+            self._run_owner == task_id
+            and self._active is not None
+            and not self._active.done()
+        ):
+            self._active.cancel()
+
+    @property
+    def active_run_kind(self) -> str | None:
+        """Host-visible identity for deterministic busy routing."""
+        if self._active is None or self._active.done():
+            return None
+        return self._run_kind
 
     def provide_answer(self, *args: str) -> bool | str:
         """Host-facing (wired to the dispatcher's answer_kora tool via KoraBridge.on_answer):
@@ -596,8 +635,18 @@ class KoraRunner:
         self._run_thread_id = spec.thread_id
         self._run_kind = spec.run_kind
         stream_task = asyncio.create_task(self._stream(task_id, text))
+        terminal_outcome: str | None = None
         try:
             await self._watch_deadline(stream_task, self._cfg.kora_deadline_s)
+        except ConsultIdleTimeout:
+            terminal_outcome = "idle_timeout"
+        except asyncio.CancelledError:
+            if self._consult_final_task_id != task_id:
+                raise
+            terminal_outcome = "completed"
+            current = self._store.task
+            if current is not None and current.id == task_id and current.status == TaskStatus.RUNNING:
+                self._store.set_task_status(TaskStatus.COMPLETED)
         except Exception as exc:  # noqa: BLE001 — includes TimeoutError; CancelledError is a
             # BaseException and is NOT caught here, so a cancel/shutdown propagates while the
             # finally below still terminalizes. Any real error is alerted, never swallowed.
@@ -616,6 +665,8 @@ class KoraRunner:
                 self._run_gate_mode = None
                 self._run_thread_id = None
                 self._run_kind = None
+                if self._consult_final_task_id == task_id:
+                    self._consult_final_task_id = None
             self._terminalize_if_running(task_id)
             # UI-2 (находка G): исход запуска → тред. Источник — терминальный статус стора
             # ПОСЛЕ terminalize; чужой task в сторе (суперсид) → исход не наш, молчим.
@@ -625,7 +676,7 @@ class KoraRunner:
             if self._on_run_finished is not None and spec.thread_id:
                 task = self._store.task
                 if task is not None and task.id == task_id:
-                    outcome = {
+                    outcome = terminal_outcome or {
                         TaskStatus.COMPLETED: "completed",
                         TaskStatus.FAILED: "failed",
                     }.get(task.status, "cancelled")
@@ -640,18 +691,35 @@ class KoraRunner:
         """
         loop = asyncio.get_running_loop()
         remaining = max(0.0, budget_s)
+        consult_parked_at: float | None = None
         while True:
             if stream_task.done():
                 stream_task.result()
                 return
             parked = self._store.awaiting_answer
+            if self._run_kind == "consult" and parked:
+                consult_parked_at = consult_parked_at or loop.time()
+                idle_remaining = self._cfg.consult_idle_timeout_s - (
+                    loop.time() - consult_parked_at
+                )
+                if idle_remaining <= 0:
+                    # Leave RUNNING before cancelling the parked SDK future so a concurrent
+                    # follow-up cannot race into a session that the watchdog has already killed.
+                    self._store.request_cancel()
+                    stream_task.cancel()
+                    raise ConsultIdleTimeout("consult parked beyond idle timeout")
+            else:
+                consult_parked_at = None
             if not parked and remaining <= 0:
                 stream_task.cancel()
                 raise TimeoutError(f"kora deadline {budget_s}s exhausted (awaiting excluded)")
             started = loop.time()
+            timeout = _WATCHDOG_TICK_S if parked else min(_WATCHDOG_TICK_S, remaining)
+            if self._run_kind == "consult" and parked:
+                timeout = min(timeout, max(0.0, idle_remaining))
             done, _ = await asyncio.wait(
                 {stream_task},
-                timeout=_WATCHDOG_TICK_S if parked else min(_WATCHDOG_TICK_S, remaining),
+                timeout=timeout,
             )
             if done:
                 stream_task.result()
@@ -687,7 +755,13 @@ class KoraRunner:
                     except Exception:  # noqa: BLE001
                         pass
                 for event in _message_to_events(msg, task_id, text, ts, seq_gen):
-                    apply_event_to_store(event, self._store, self._speak_ledger, self._on_speak, self._journal)
+                    apply_event_to_store(
+                        event,
+                        self._store,
+                        self._speak_ledger,
+                        None if self._run_kind == "consult" else self._on_speak,
+                        self._journal,
+                    )
 
     def _terminalize_if_running(self, task_id: str) -> None:
         """Structural anti-zombie core: only touches a task that is STILL this task and STILL
@@ -760,6 +834,16 @@ class KoraRunner:
         # текст соответствует новому гейту — Bash, чтение И запись открыты по всей машине, кроме
         # секретных; дефолт для безымянного пути — workspace. (До B24 промпт говорил «писать только
         # в workspace» и Кора ОТКАЗЫВАЛАСЬ от задачи на столе, даже не вызвав Write — staging 12:50.)
+        if self._run_kind == "consult":
+            return (
+                f"Ты — Кора, read-only консультант Синапса. Рабочая директория проекта: "
+                f"{workspace}. Можешь читать файлы проекта и искать по ним, кроме секретов. "
+                f"Нельзя запускать Bash, создавать, изменять или удалять файлы. Вся речь наружу "
+                f"идёт только через reply_to_flow: final=false, если ждёшь следующий бриф Flow; "
+                f"final=true, когда консультация закончена. Не используй AskUserQuestion. "
+                f"Говори разговорно и не помещай в reply_to_flow секреты, содержимое файлов "
+                f"или пути к секретам. Бриф и память дела:\n{task_text}"
+            )
         return (
             f"Ты — Кора, исполнитель задач Синапса. Твоя рабочая директория: {workspace}. "
             f"Bash разрешён (рабочая директория — {workspace}); читать файлы можно по всей "
@@ -843,7 +927,7 @@ class KoraRunner:
                 or task is None
                 or task.id != task_id
                 or task.status != TaskStatus.RUNNING
-                or self._run_kind not in {"code", "docs"}
+                or self._run_kind not in {"code", "docs", "consult"}
             ):
                 return self._mcp_error("reply_to_flow: stale or unauthorized run")
             try:
@@ -865,9 +949,23 @@ class KoraRunner:
             except ReplyFieldError as exc:
                 return self._mcp_error(str(exc))
 
+            if self._run_kind == "consult" and self._on_case_entry is not None:
+                try:
+                    self._on_case_entry(self._run_thread_id or "", "Ответ Коры", spoken)
+                except Exception as exc:  # durable-memory I/O must not corrupt the SDK session
+                    self._journal.alert(AlertKind.KORA_RUN_FAILED, {
+                        "reason": "consult_case_write_failed",
+                        "error_type": type(exc).__name__,
+                    })
+
             if final:
                 if self._on_speak is not None:
                     self._on_speak(spoken)
+                if self._run_kind == "consult":
+                    self._consult_final_task_id = task_id
+                    asyncio.get_running_loop().call_soon(
+                        self._cancel_finalized_consult, task_id
+                    )
                 return self._mcp_text("message delivered")
 
             # B-BRIDGE-10: МЕШ-1 parks one question at a time. `_pending_answer`/
@@ -898,6 +996,16 @@ class KoraRunner:
                 ))
                 if self._on_speak is not None:
                     self._on_speak(spoken)
+                if self._run_kind == "consult" and self._on_consult_parked is not None:
+                    try:
+                        current = self._store.awaiting
+                        if current is not None and current.request_id == request_id:
+                            self._on_consult_parked(current)
+                    except Exception as exc:
+                        self._journal.alert(AlertKind.KORA_RUN_FAILED, {
+                            "reason": "consult_followup_schedule_failed",
+                            "error_type": type(exc).__name__,
+                        })
                 answer = await fut
             finally:
                 if self._pending_answer is fut and self._pending_request_id == request_id:
@@ -963,7 +1071,7 @@ class KoraRunner:
         if tool_name == "mcp__flow__reply_to_flow":
             allowed = (
                 task_id is not None
-                and self._run_kind in {"code", "docs"}
+                and self._run_kind in {"code", "docs", "consult"}
                 and self._store.task is not None
                 and self._store.task.id == task_id
                 and self._store.task.status == TaskStatus.RUNNING
@@ -971,6 +1079,12 @@ class KoraRunner:
             if allowed:
                 return True, "reply_to_flow", "allow"
             return False, "reply_to_flow_denied", "reply_to_flow_denied"
+        # МЕШ-2: consult is its own unconditional deny branch, before docs_only and before
+        # any permissive full-mode path.  It must never inherit the docs writer allowlist.
+        if self._current_gate_mode() == "consult" and (
+            tool_name in _MUTATING_FILE_TOOLS or tool_name == "Bash"
+        ):
+            return False, "consult_read_only", "consult_read_only"
         key = _PATH_KEY.get(tool_name)
         if key is None:
             if tool_name in _SAFE_META_TOOLS:
@@ -1010,6 +1124,12 @@ class KoraRunner:
                     return False, "path resolution failed", "path_error"
                 if _is_secret_path(ws_resolved):
                     return False, "secret_path", "secret_path"
+                if self._current_gate_mode() == "consult" and _consult_case_overlap(
+                    ws_resolved,
+                    Path(self._cfg.journal_dir).resolve(),
+                    recursive=tool_name in _READ_SEARCH_TOOLS,
+                ):
+                    return False, "consult_case_private", "consult_case_private"
                 # B16: no-path Grep/Glob/LS default to the workspace root and recurse into it —
                 # deny if a readable secret file lives anywhere in that subtree.
                 if _subtree_has_readable_secret(ws_resolved):
@@ -1032,6 +1152,15 @@ class KoraRunner:
         # absolute path (home dir / username / secret-file layout disclosure oracle).
         if _is_secret_path(resolved):
             return False, "secret_path", "secret_path"
+        # The case file is host-owned memory.  Consult Kora receives a snapshot only through
+        # its briefing and cannot inspect the backing journal tree even though ordinary project
+        # reads are allowed across the machine.
+        if self._current_gate_mode() == "consult" and _consult_case_overlap(
+            resolved,
+            Path(self._cfg.journal_dir).resolve(),
+            recursive=tool_name in _READ_SEARCH_TOOLS,
+        ):
+            return False, "consult_case_private", "consult_case_private"
         if tool_name in _MUTATING_FILE_TOOLS and any(
             resolved.is_relative_to(root) for root in self._protected_roots()
         ):
@@ -1090,7 +1219,7 @@ class KoraRunner:
         # пользователем от имени задачи, которой уже нет; он падает в общий deny ниже (и в
         # журнал как gate_deny/superseded_run, а не молча).
         superseded = task_id is not None and self._run_owner != task_id
-        if name == "AskUserQuestion" and not superseded:
+        if name == "AskUserQuestion" and not superseded and self._run_kind != "consult":
             return await self._handle_question(tinput)
 
         allowed, detail, category = self._gate_decision(name, tinput, task_id)

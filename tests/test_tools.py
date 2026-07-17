@@ -37,7 +37,7 @@ def test_stage_schemas_present_with_expected_shape():
     names = {s.name for s in ALL_SCHEMAS}
     assert names == {
         "submit_task", "confirm_task", "get_task_status", "request_cancel", "answer_kora",
-        "propose_request", "gate_action", "bind_project", "set_persona",
+        "consult_kora", "propose_request", "gate_action", "bind_project", "set_persona",
     }
     assert SUBMIT_TASK_SCHEMA.required == ["text"]
     assert CONFIRM_TASK_SCHEMA.properties["decision"]["enum"] == ["confirm", "deny"]

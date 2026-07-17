@@ -17,7 +17,7 @@ from synapse.bridge.confirm import ConfirmFlow
 from synapse.bridge.state import TaskStore
 from synapse.clock import Clock
 from synapse.config import SynapseConfig
-from synapse.dispatcher.tools import ALL_SCHEMAS, ToolCall, ToolHandlers
+from synapse.dispatcher.tools import ALL_SCHEMAS, CONSULT_KORA_SCHEMA, ToolCall, ToolHandlers
 from synapse.dispatcher.turn_context import build_turn_context
 from synapse.journal import TurnJournal, TurnRecord
 from synapse.prompt import FALSE_ATTRIBUTION_REPLY, is_false_attribution
@@ -37,6 +37,7 @@ class LLMClient(Protocol):
 # calling tools, capped so a pathological LLM can't spin forever (industry default 5-20).
 _MAX_TOOL_PASSES = 5
 _MAX_CACHED_THREADS = 64
+_AUTONOMOUS_TOOLS = [CONSULT_KORA_SCHEMA]
 
 
 def _append_coalesced(hist: list[dict[str, Any]], role: str, text: str) -> None:
@@ -284,8 +285,68 @@ class DispatcherTurnLoop:
                     history.append({"role": "assistant", "content": text})
         return record, text
 
+    async def ingest_autonomous_turn(
+        self, instruction: str, thread_id: str
+    ) -> tuple[TurnRecord, str]:
+        """Run one host-initiated Flow continuation without minting a user turn.
+
+        This deliberately bypasses ConfirmFlow/ApprovalService ``note_user_turn`` and does not
+        commit the synthetic prompt to conversation history.  Treating a Kora callback as a
+        user transcript would let chained untrusted text satisfy the second key of an approval
+        and would make background STT appear to replenish autonomy.
+        """
+        now = self._clock.now()
+        record = self._journal.begin_turn("[автономный follow-up Flow]")
+        record.thread_id = thread_id
+        self._handlers.begin_turn(record.turn_id)
+        had_active_task = self._store.has_active_task()
+        working = list(self._history_for(thread_id))
+        working.append({"role": "user", "content": instruction})
+        text = ""
+        try:
+            text, tool_calls = await self._complete(
+                working, thread_id, tools_override=_AUTONOMOUS_TOOLS
+            )
+            record.llm_output = text
+            passes = 0
+            while tool_calls and passes < _MAX_TOOL_PASSES:
+                working.append({
+                    "role": "assistant",
+                    "content": text or "",
+                    "tool_calls": [
+                        {"id": c.id, "name": c.name, "arguments": c.arguments}
+                        for c in tool_calls
+                    ],
+                })
+                for call in tool_calls:
+                    if call.name == "consult_kora":
+                        await self._dispatch_tool(call, working)
+                    else:
+                        working.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "name": call.name,
+                            "content": json.dumps({"outcome": "autonomous_tool_denied"}),
+                        })
+                text, tool_calls = await self._complete(
+                    working, thread_id, tools_override=_AUTONOMOUS_TOOLS
+                )
+                if text:
+                    record.llm_output = text
+                passes += 1
+            return record, text
+        finally:
+            record.latency_ms = (self._clock.now() - now) * 1000.0
+            self._journal.check_grounding(record, had_active_task)
+            self._journal.end_turn()
+            self._handlers.end_turn()
+
     async def _complete(
-        self, history: list[dict[str, Any]], thread_id: str
+        self,
+        history: list[dict[str, Any]],
+        thread_id: str,
+        *,
+        tools_override: list[Any] | None = None,
     ) -> tuple[str, list[ToolCall]]:
         # С1: единая фабрика контекста хода (раньше — инлайн сборка system_prompt+state_block).
         # Голос теперь собирает через ту же фабрику, поэтому [СОСТОЯНИЕ] симметричен между
@@ -307,7 +368,11 @@ class DispatcherTurnLoop:
         # Confab gate: a status tool-pass can erase the mandatory correction from the final
         # answer (observed live across personas).  The current state snapshot is already in the
         # system message, so attribution turns need no tools; the next ordinary turn restores all.
-        tools = [] if is_false_attribution(latest_user) else ALL_SCHEMAS
+        tools = (
+            []
+            if is_false_attribution(latest_user)
+            else (tools_override if tools_override is not None else ALL_SCHEMAS)
+        )
         return await self._llm.complete(messages, tools)
 
     async def _dispatch_tool(self, call: ToolCall, history: list[dict[str, Any]]) -> Any:

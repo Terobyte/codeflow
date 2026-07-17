@@ -42,6 +42,12 @@ class SynapseConfig:
     kora_reply_speak_max_chars: int = 2000
     kora_reply_instruction_max_chars: int = 1200
     kora_reply_format_max_chars: int = 400
+    # МЕШ-2: Flow, unlike a human interviewee, must not leave a parked consultation
+    # occupying Kora's singleton indefinitely.
+    consult_idle_timeout_s: float = 300.0
+    # МЕШ-3: hard per-session ceiling for Flow-authored follow-up briefings.  User turns do
+    # not replenish it; only starting a fresh consult creates a fresh budget.
+    autonomy_budget: int = 1
 
     request_timeout_s: float = 10.0
 
@@ -180,6 +186,12 @@ class SynapseConfig:
             value = _num(env_key, int)
             if value is not None:
                 kwargs[field_name] = value
+        consult_idle = _num("KORA_CONSULT_IDLE_TIMEOUT_S", float)
+        if consult_idle is not None:
+            kwargs["consult_idle_timeout_s"] = consult_idle
+        autonomy_budget = _num("KORA_AUTONOMY_BUDGET", int)
+        if autonomy_budget is not None:
+            kwargs["autonomy_budget"] = max(0, autonomy_budget)
         return cls(**kwargs)
 
     def validate_voice_keys(self) -> None:

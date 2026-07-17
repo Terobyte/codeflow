@@ -19,4 +19,4 @@ class RunSpec:
     # для гейт-стейта). Дефолт "full" здесь конфлейтил прямую задачу с гейт-раном.
     gate_mode: str | None = None
     model: str | None = None         # None → cfg.kora_model
-    run_kind: str = "code"           # "code" | "docs"; consult arrives in МЕШ-2
+    run_kind: str = "code"           # "code" | "docs" | "consult"
