@@ -9,6 +9,7 @@ is known).
 from __future__ import annotations
 
 import json
+import re
 import threading
 from collections import OrderedDict
 from typing import Any, Callable, Protocol
@@ -38,6 +39,26 @@ class LLMClient(Protocol):
 _MAX_TOOL_PASSES = 5
 _MAX_CACHED_THREADS = 64
 _AUTONOMOUS_TOOLS = [CONSULT_KORA_SCHEMA]
+
+# B-SIM-1: the compaction summarizer (an LLM) is told to keep tokens «дословно», but it
+# demonstrably cannot for high-entropy OPAQUE literals — secrets, hashes, random IDs like
+# RC-9F3A-7712 get silently transposed char-by-char (proven by sim S11), and the loss is
+# invisible to a user who doesn't remember the original. Pure words and pure numbers the
+# summarizer keeps fine (sim S15), so we don't pin those (an appendix of everything would
+# defeat compaction). We extract the dangerous class — a token carrying BOTH a letter and a
+# digit, length >= 6 — and pin it verbatim past the summarizer.
+_VERBATIM_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-_./:][A-Za-z0-9]+)*")
+
+
+def _extract_verbatim_tokens(messages: list[dict[str, Any]]) -> list[str]:
+    """Unique high-entropy literals (letter+digit, len>=6) from the messages being compacted,
+    in first-seen order — pinned verbatim so a lossy summary can't corrupt them (B-SIM-1)."""
+    seen: dict[str, None] = {}
+    for m in messages:
+        for tok in _VERBATIM_TOKEN_RE.findall(str(m.get("content") or "")):
+            if len(tok) >= 6 and any(c.isalpha() for c in tok) and any(c.isdigit() for c in tok):
+                seen.setdefault(tok, None)
+    return list(seen)
 
 
 def _append_coalesced(hist: list[dict[str, Any]], role: str, text: str) -> None:
@@ -460,6 +481,12 @@ class DispatcherTurnLoop:
         except Exception:  # noqa: BLE001 — сбой компакта не должен валить ход диспетчера
             return
         summary = (summary or "").strip() or "[история сжата]"
+        # B-SIM-1: pin exact high-entropy literals from the compacted half verbatim past the
+        # lossy summarizer (see _extract_verbatim_tokens) — a separate line the LLM never touched.
+        pinned = _extract_verbatim_tokens(older)
+        compact_content = f"[КОМПАКТ] {summary}"
+        if pinned:
+            compact_content += "\n[ТОЧНЫЕ ТОКЕНЫ] " + " ".join(pinned)
         # B20: сплайсим по ТЕКУЩЕМУ списку, НЕ по до-await снимку `tail`. Другой ход этого же
         # треда во время нашего `await self._llm.complete` дописывает свою (user,assistant)-пару
         # в КОНЕЦ общего списка (turn_lock отпущен до ingest — B-PIPE-5); ребинд из устаревшего
@@ -471,7 +498,7 @@ class DispatcherTurnLoop:
         compacted = False
         with self._history_lock_for(thread_id):
             if history[:len(older)] == older:
-                history[:len(older)] = [{"role": "user", "content": f"[КОМПАКТ] {summary}"}]
+                history[:len(older)] = [{"role": "user", "content": compact_content}]
                 compacted = True
         if compacted and self._on_compact is not None:
             try:
