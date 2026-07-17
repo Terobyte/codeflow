@@ -1085,6 +1085,21 @@ class KoraRunner:
             tool_name in _MUTATING_FILE_TOOLS or tool_name == "Bash"
         ):
             return False, "consult_read_only", "consult_read_only"
+        # B-M2-12: the case-isolation checks below resolve ONLY the `path` arg.  Glob's `pattern`
+        # (and Grep's `glob` file filter) can carry `..`/absolute traversal that reaches the private
+        # journal tree while `path` stays benign — a fail-open in a security gate whose whole point
+        # is that consult cannot touch the case tree via ANY argument.  A consult read never needs
+        # traversal syntax, so deny it fail-closed regardless of what the downstream glob honors.
+        if self._current_gate_mode() == "consult":
+            search_pattern = None
+            if tool_name == "Glob":
+                search_pattern = (tool_input or {}).get("pattern")
+            elif tool_name == "Grep":
+                search_pattern = (tool_input or {}).get("glob")
+            if isinstance(search_pattern, str) and search_pattern.strip():
+                pat = Path(search_pattern)
+                if pat.is_absolute() or ".." in pat.parts:
+                    return False, "consult_case_private", "consult_case_private"
         key = _PATH_KEY.get(tool_name)
         if key is None:
             if tool_name in _SAFE_META_TOOLS:

@@ -487,6 +487,11 @@ class SynapseHost:
                 if owner == thread_id:
                     self._consult_session_threads.pop(task_id, None)
                     self._consult_budget_remaining.pop(task_id, None)
+            # B-M2-11: release the per-session follow-up idempotency markers too, symmetric with
+            # the two dicts above.  The task store is a singleton (one consult at a time), so every
+            # request_id in the set belongs to the session ending here — clearing it also self-heals
+            # any markers leaked by earlier sessions.
+            self._consult_followup_requests.clear()
             return
         if gate_mode is None and th.request_text is not None:
             return  # B46: несвязанная прямая задача не касается гейт-стейта треда
@@ -999,12 +1004,22 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
                 voice_thread["id"] = th.id
         if th.archived:
             return {"outcome": "thread_archived"}  # B48: свод не коммитится в убранный тред
+        previous_request = th.request_text
         try:
             threads.set_request(th.id, text)
             if th.stage == "collect":
                 threads.set_stage(th.id, "propose")
         except ValueError:
             return {"outcome": "illegal_stage"}
+        # B-M2-10: propose теперь легален в любой стадии (снят collect-гвард), поэтому свод может
+        # смениться ПОСЛЕ завершённого spec_plan. write_code'а сигнал устаревания
+        # (last_outcome=="completed" + план-файл) привязан к ПЛАНУ, не к request_text — новый свод
+        # под старым планом на диске запустил бы устаревший код. Зеркалим revise (B07,
+        # app.py:567-573): при смене свода инвалидируем outcome, чтобы write_code отвечал stale_plan
+        # до свежего spec_plan. Гвардим на РЕАЛЬНОЙ смене текста — идемпотентный ре-propose тем же
+        # сводом не должен ронять ещё валидный план.
+        if text != previous_request:
+            threads.set_outcome(th.id, None)
         # С3 (Ф0.3): смена СВОДА инвалидирует pending approval этого треда (digest несёт
         # request_text — он бы и сам не совпал, но явный invalidate чистит pending сразу, не
         # дожидаясь consume). НЕ внутри ThreadStore — обратная зависимость threads→bridge запрещена.
