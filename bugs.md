@@ -468,3 +468,74 @@ Status: `reported` → `proven` | `rejected(reason)` | `not-test-verifiable(reas
 - trigger: consult-Кора зовёт `Glob(path=<в workspace, не пересекает journal>, pattern="<traversal к journals/threads>")`.
 - expected vs actual: изоляция дела не должна зависеть от того, несёт ли traversal `path` или `pattern` · actual: гейт видит только `path`, паттерн-escape мимо.
 - evidence: `_PATH_KEY["Glob"]="path"`; gate валидирует лишь `key`; шипнутые тесты `test_mesh2_review_kora.py` гоняют только path-based кейсы под layout «journal внутри workspace», где дефолты ловят. **НЕ доказуемо из репо** — зависит от того, honors ли SDK-Glob `..`/absolute в `pattern` при заданном `path`. Разрешение: проверить семантику SDK Glob (эксперимент) → если escape реален, фикс = инспектировать `pattern` на traversal/absolute в consult-режиме; если Glob всегда клампит паттерн под `path`, закрыть как rejected.
+
+---
+
+## 🔫 Багхант МЕШ-2 (третий заход, `ca4ce0d`) — 2026-07-17
+
+Заказ Теро «одна волна багханта соннетами» после фикса B-M2-10/11/12. Дерево заморожено на `ca4ce0d` (свежие фиксы залендан). Фан-аут **4 sonnet-охотника read-only**, гибридное назначение (deep-owner + одна линза сквозь весь consult-скоуп `app.py`+`kora.py`): H1 concurrency/lifecycle · H2 security/read-only-sandbox · H3 state-machine/contract · H4 leaks/cleanup. Свежие фиксы — приоритетная мишень.
+
+**Итог: 7 находок, все 7 proven red-тестом и fixed (суита 957 passed / 1 skipped / 11 xfailed). Мисдоставка follow-up подтверждена ДВУМЯ охотниками независимо (H1+H4) → CRIT.** H2 подтвердил, что B-M2-10/11/12 (литеральные формы) закрыты — переоткрытий нет, только неполнота свежего кода. Статус всех — `reported` до red-теста (соннет-автор), затем `proven`/`rejected`/`not-test-verifiable`.
+
+### B-M2-13 — stale autonomous consult follow-up доставляет ответ на Q1 в pending-future Q2/новой сессии — CRIT — proven → fixed
+- class: concurrency / missing-identity-guard / cross-request data-corruption · found-by: H1 + H4 (независимо, corroborated)
+- location: `app.py:245-260` (`on_consult_parked` — валидирует task/budget лишь на ШЕДУЛЕ), `:262-284` (`_run_consult_followup` — тащит только `request.thread_id`, роняет `request_id`/`task_id`), `:686-721` (`consult_kora` resume-ветка — матчит только `current.thread_id`+`run_kind`), `:710-712` (`provide_answer(current.request_id, briefing)`)
+- symptom: fire-and-forget follow-up, сгенерённый для припаркованного вопроса R1, доставляет свой briefing в ДРУГОЙ, позже припаркованный вопрос (R2 в той же задаче, или R3 в новой сессии на том же треде).
+- trigger: (1) consult на треде T паркует Q1 (R1) → `on_consult_parked` шедулит `_run_consult_followup(request)`; (2) до завершения его LLM-хода (`ingest_autonomous_turn`, сек.) человек отвечает на Q1 напрямую (`provide_answer(R1)`), Кора паркует Q2 (R2) — ЛИБО сессия A истекает по idle/cancel и на том же треде стартует сессия B (R3); (3) stale follow-up завершает LLM-ход, зовёт `consult_kora(T, briefing_Q1, autonomous=True)`; (4) `current = store.awaiting` = R2/R3, чек `current.thread_id==T` проходит (тот же тред), `provide_answer(current.request_id=R2, briefing_Q1)` → **future Q2 получает ответ на Q1**. Живая SDK-сессия Коры продолжается на мисматч-контенте.
+- expected vs actual: autonomous follow-up обязан резолвить РОВНО тот запрос, для которого сгенерён (или безопасно no-op, если он больше не текущий) · actual: слепо отвечает на что угодно припаркованное на треде. Побочно бюджет пересекает сессии: `on_consult_parked` гейтит по `request.task_id` (`:251`), а декремент/рефанд по `active.id` (`:700-703,715-718`).
+- evidence: `consult_kora` resume (`:693-698`) не имеет параметра, связывающего вызов с `request.request_id`/`task_id`; `_consult_followup_tasks` (`:198`) не отменяется на teardown (`:480-495` трогает лишь два дикта + сет) — задача переживает сессию. Сигнатура `consult_kora(thread_id, briefing, autonomous)` структурно не несёт identity.
+- fix-note: архитектурный (Opus) — протянуть originating `request_id`/`task_id` в `consult_kora` autonomous-путь и гвардить `current.request_id == origin` перед `provide_answer`; безопасный no-op (`autonomy_session_stale`) при мисматче.
+
+### B-M2-14 — `propose_request` при ЖИВОМ ране не имеет busy-гварда: сливающийся ран воскрешает `last_outcome="completed"` под новым сводом (гонка мимо B-M2-10) — MAJOR — proven → fixed
+- class: state-machine race (TOCTOU) / stale-plan-guard bypass · found-by: H3 (senior-verified)
+- location: `app.py:991-1031` (`_propose_for` — нет `store.has_active_task()`-чека, в отличие от `revise:564`), `threads.py:210-243` (`finish_run` — generation-guard CAS keys ТОЛЬКО на `stage`), `app.py:638-653` (write_code stale_plan guard), `app.py:526-532` (`_run_finished` → finish_run)
+- symptom: B-M2-10 сбрасывает `last_outcome=None` при смене свода, но `_propose_for` не проверяет, что ран для СТАРОГО свода сейчас RUNNING. `propose` не двигает стадию вне collect → `finish_run`'s stage-CAS (`t.stage != expected_stage`) СОВПАДАЕТ для сливающегося рана → `last_outcome` снова `"completed"` под новым сводом.
+- trigger: (1) propose(R1)→`send_to_kora`(non-fast)→`spec_plan`, task RUNNING; (2) пока ран жив, propose(R2) (нет busy-гварда на входных точках `_voice_propose`/`_http_propose`) → `request_text=R2`, `last_outcome=None`, стадия остаётся `spec_plan`; (3) ран R1 завершается → `_run_finished("completed","docs_only")` → `finish_run(expected_stage="spec_plan")` → CAS совпал → `last_outcome="completed"`; (4) `write_code` проходит stale_plan-гвард и пускает план R1 под свод R2. Вариант-2 (fast→`code`): ран R1 завершается → `finish_run(expected_stage="code", completed_stage="done")` → тред показывает `done/completed` для R2, а на диске код R1.
+- expected vs actual: смена свода при живом ране обязана либо отклоняться busy (как `revise:564`), либо инвалидировать завершение сливающегося рана · actual: `finish_run` generation-guard основан на `stage`, а `propose` стадию не двигает → guard defeated. Отличие от B-M2-10: там propose ПОСЛЕ завершения; здесь ВО ВРЕМЯ рана.
+- fix-note: Opus — добавить busy-гвард в `_propose_for` (зеркало `revise`: при `has_active_task()` не сбрасывать outcome / отклонить), ЛИБО generation-токен в `finish_run`, не завязанный только на stage.
+
+### B-M2-15 — `propose_request` на терминальном `done`-треде затирает `last_outcome=None` без пути восстановления (бричит тред) — MAJOR — proven → fixed
+- class: state-machine dead-end / permanent-corruption · found-by: H3 (senior-verified)
+- location: `app.py:1005-1022` (`_propose_for` — чек только `th.archived`, не `stage`), `threads.py:22-27` (`_STAGE_TRANSITIONS["done"]==frozenset()`), `app.py:557-571` (`revise` — единственный выход из стадии, из `done` даёт `illegal_stage`)
+- symptom: тред, легально дошедший до `stage="done"`/`last_outcome="completed"`, всё ещё принимает `propose_request` (снятый collect-гвард сделал propose «легальным в любой стадии»). `text != previous` → `set_outcome(None)`, но стадия не двигается (propose двигает лишь collect→propose) → тред застревает `done` с `last_outcome=None`. `done` не имеет исходящих переходов → `revise` даёт `illegal_stage`, `send_to_kora`/`write_code` падают на CAS. Тред нерекаверабелен.
+- trigger: (1) обычный флоу → `stage="done"`, `last_outcome="completed"`; (2) юзер продолжает в том же треде, `propose_request(R2)` (легален по текущему stage-agnostic дизайну) → `set_outcome(None)`, стадия `done`. `revise` из done → `{"error":"illegal_stage"}`.
+- evidence: `set_request` (`threads.py:305-313`) НЕ бросает (не ловится `except ValueError` в `_propose_for`); `set_outcome(None)` безусловен при смене текста; `done` терминал.
+- expected vs actual: смена свода на треде, который не может исполнять по нему (терминальная стадия, нет пути назад в collect), должна отклоняться (`illegal_stage`, как ловится `set_stage`-ValueError двумя строками выше) ИЛИ не чистить completion, который не восстановить · actual: `last_outcome` безусловно обнуляется, тред нерекаверабелен.
+- fix-note: Opus/sonner — отклонять propose на терминальной/нерекаверабельной стадии (или не сбрасывать outcome там).
+
+### B-M2-16 — consult-гейт: non-string `pattern`(Glob)/`glob`(Grep) обходит B-M2-12 anti-traversal чек целиком — MAJOR — proven → fixed
+- class: security / input-validation / fail-open · found-by: H2 (scratch-repro)
+- location: `kora.py:1093-1102` (`if isinstance(search_pattern, str) and search_pattern.strip():` — нет `else: deny`)
+- symptom: свежий traversal-гвард бежит только для str. Non-string (список) значение пропускает чек безусловно и падает в обычную `path`-валидацию, которая про `pattern`/`glob` не знает.
+- trigger: `_gate_decision("Glob", {"path":"<ws>/src", "pattern":["..","..","journal","threads","*.case.md"]})` при `_run_gate_mode="consult"`. Строковая `"../../journal/threads/*.case.md"` → deny `consult_case_private`; список тех же сегментов → **allow**.
+- expected vs actual: контракт «case-tree недостижим через ЛЮБОЙ аргумент» — форма аргумента не должна менять решение · actual: str denied, list allowed. Reachability-caveat: зависит от того, шлёт ли schema-constrained Кора non-string arg; но threat-model включает prompt-injected Кору, а гейт — последняя линия → fail-open реален как gate-контракт-дефект.
+- fix-note: root-cause с B-M2-17/18 (Pattern P-M2) — резолв pattern против path + `_consult_case_overlap`, и fail-closed на non-string в consult.
+
+### B-M2-17 — consult-гейт: non-string `path` на Glob/Grep/LS валидирует дефолт-workspace вместо реального аргумента — MAJOR — proven → fixed
+- class: security / input-validation / fail-open · found-by: H2 (scratch-repro)
+- location: `kora.py:1128-1152` (`raw = (tool_input or {}).get(key)`; non-str `raw` → ветка «нет пути → дефолт `_current_root()`»)
+- symptom: non-string `path` у `_READ_SEARCH_TOOLS` молча отбрасывается, валидируется корень workspace вместо переданного значения.
+- trigger: project root ≠ ancestor of journal; `_gate_decision("Glob", {"path":["<journal_dir>"], "pattern":"threads/*.case.md"})`. Строковый `path` → deny; однослементный список → **allow** `(True, None, 'allow')`.
+- expected vs actual: аргумент, целящий в journal, denied независимо от формы · actual: list-path уходит в дефолт-ветку. `kora.py:1129,1137` — list в `raw` после 1128 не читается.
+- fix-note: см. Pattern P-M2 (fail-closed на non-string path в consult).
+
+### B-M2-18 — consult-гейт: pattern/glob traversal-чек ЛЕКСИЧЕСКИЙ (не резолвит) — симлинк-сегмент в паттерне escape'ит — MINOR — proven → fixed
+- class: security / input-validation (defense-in-depth) · found-by: H2
+- location: `kora.py:1093-1102` (только `Path(pattern).parts`/`is_absolute()`, без `.resolve()`, в контраст `:1158-1178` где path всегда резолвится)
+- symptom: чек ищет литеральный `..`/absolute, не резолвит и не сверяет с journal. Сегмент-имя пре-существующего симлинка — ни `..`, ни absolute.
+- trigger: пре-существующий `<benign>/case_link -> <journal_dir>`, затем `_gate_decision("Glob", {"path":"<benign>", "pattern":"case_link/threads/*.case.md"})` → allow. Python `glob.glob` резолвит сквозь симлинк до реального case-файла (подтверждено H2).
+- caveat: требует пре-существующего симлинка (consult не может создать — все мутации denied); поведение bundled-CLI Glob по именованному симлинк-сегменту принято по аналогии, не верифицировано против бинаря. Severity MINOR.
+- fix-note: закрывается resolve-and-overlap фиксом Pattern P-M2.
+
+### B-M2-19 — consult supersede в окне teardown: `_consult_session_threads`/`_consult_budget_remaining` протекают навсегда — MINOR (race-gated) — proven → fixed
+- class: resource-leak / bookkeeping (unbounded over process life, race-gated) · found-by: H4
+- location: `kora.py:654-670` (`_run` finally, identity-guard), `:676-683` (`on_run_finished` гейтед на `store.task.id==task_id`) ↔ `app.py:480-495` (единственное место pop этих диктов), init `:753-754`
+- symptom: `_consult_session_threads[task_id]`/`_consult_budget_remaining[task_id]` не удаляются, если `on_run_finished` задачи-владельца пропущен.
+- trigger: consult A паркуется за idle-timeout → `kora.py:708 request_cancel()` СИНХРОННО флипает статус в CANCEL_REQUESTED → `has_active_task()` (`state.py:284-288`) сразу False, до `_run` finally задачи A. Всё от `request_cancel()` до `raise ConsultIdleTimeout` синхронно; первый yield — `await stream_task` (`:659-660`) в finally. В этом окне чужой `consult_kora`/`gate_action` (сериализован лишь `_launch_lock`, который finally не берёт) зовёт `begin_task(task_id_B)`, перезаписывая синглтон. Когда finally A проверяет `task.id==task_id` (`:677-678`), там уже B → `on_run_finished` для A не вызван → cleanup A не бежит. Записи A висят до конца процесса (self-heal лишь если позже сессия завершится нормально на ТОМ ЖЕ треде).
+- expected vs actual: записи каждой сессии удаляются ровно раз на её teardown · actual: суперсибнутая задача не матчится циклом `:486-489` больше никогда.
+- caveat: race-gated; red-тест требует форсированного interleaving (sync-points). Если детерминированно не форсится → `not-test-verifiable` + manual-verify.
+
+### Pattern P-M2 — consult search-arg валидация неполна (B-M2-16/17/18)
+- members: B-M2-16 B-M2-17 B-M2-18 · один корень: `_gate_decision` валидирует лишь `path`-строку, а `pattern`/`glob` — лексически и только для str.
+- repair (Opus): в consult-режиме для Glob/Grep резолвить эффективную цель (path ⊕ pattern-dir) через `.resolve()` и гнать `_consult_case_overlap` (как path); non-string path/pattern → fail-closed deny. Закрывает все три одним фиксом у источника.
+- **result: fixed** — `kora.py::_gate_decision` (сохранён лексический B-M2-12 fast-path + добавлен non-string fail-closed + resolve-and-overlap). Тесты `tests/test_mesh2_thirdpass_gate.py` (3) red→green, суита 957 зелёных.

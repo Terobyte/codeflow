@@ -1085,20 +1085,42 @@ class KoraRunner:
             tool_name in _MUTATING_FILE_TOOLS or tool_name == "Bash"
         ):
             return False, "consult_read_only", "consult_read_only"
-        # B-M2-12: the case-isolation checks below resolve ONLY the `path` arg.  Glob's `pattern`
-        # (and Grep's `glob` file filter) can carry `..`/absolute traversal that reaches the private
+        # B-M2-12/16/17/18: the case-isolation checks below resolve ONLY the `path` arg.  Glob's
+        # `pattern` (and Grep's `glob` file filter) can carry traversal that reaches the private
         # journal tree while `path` stays benign — a fail-open in a security gate whose whole point
-        # is that consult cannot touch the case tree via ANY argument.  A consult read never needs
-        # traversal syntax, so deny it fail-closed regardless of what the downstream glob honors.
-        if self._current_gate_mode() == "consult":
-            search_pattern = None
-            if tool_name == "Glob":
-                search_pattern = (tool_input or {}).get("pattern")
-            elif tool_name == "Grep":
-                search_pattern = (tool_input or {}).get("glob")
-            if isinstance(search_pattern, str) and search_pattern.strip():
-                pat = Path(search_pattern)
+        # is that consult cannot touch the case tree via ANY argument.
+        if self._current_gate_mode() == "consult" and tool_name in ("Glob", "Grep"):
+            ti = tool_input or {}
+            raw_path = ti.get("path")
+            raw_pattern = ti.get("pattern" if tool_name == "Glob" else "glob")
+            # B-M2-16/17: fail-closed on a non-string path/pattern.  The string checks here and
+            # the `path` validation later silently ignore a list/dict-shaped arg, so the identical
+            # traversal in list form ("..","..",...) slips the isolation the string form gets.  A
+            # consult read only ever needs plain string args → an unexpected shape is undecidable,
+            # deny it rather than fall through.
+            if (raw_path is not None and not isinstance(raw_path, str)) or (
+                raw_pattern is not None and not isinstance(raw_pattern, str)
+            ):
+                return False, "consult_case_private", "consult_case_private"
+            if isinstance(raw_pattern, str) and raw_pattern.strip():
+                # B-M2-12: lexical fast-path — any `..`/absolute traversal syntax in the pattern.
+                pat = Path(raw_pattern)
                 if pat.is_absolute() or ".." in pat.parts:
+                    return False, "consult_case_private", "consult_case_private"
+                # B-M2-18: the lexical check is blind to a symlink segment that NAMES the case tree
+                # without `..`/absolute syntax.  Resolve base⊕pattern (follows symlinks, normalises
+                # `..`) and deny if it overlaps the case tree — the same containment `path` gets at
+                # kora.py:1173, applied to where the glob actually walks.
+                base = self._current_root()
+                if isinstance(raw_path, str) and raw_path.strip():
+                    p = Path(raw_path)
+                    base = p if p.is_absolute() else base / p
+                try:
+                    effective = (base / raw_pattern).resolve()
+                    journal_resolved = Path(self._cfg.journal_dir).resolve()
+                except (OSError, RuntimeError, ValueError):
+                    return False, "path resolution failed", "path_error"
+                if _consult_case_overlap(effective, journal_resolved, recursive=True):
                     return False, "consult_case_private", "consult_case_private"
         key = _PATH_KEY.get(tool_name)
         if key is None:

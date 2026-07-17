@@ -77,6 +77,15 @@ _AUTONOMOUS_FLOW_TURN: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "autonomous_flow_turn", default=False
 )
 
+# B-M2-13: the request_id a consult follow-up was scheduled for.  Set inside
+# `_run_consult_followup` before the LLM turn and read in `consult_kora`'s autonomous branch, so
+# the eventual (LLM-driven, possibly delayed) delivery can refuse when the LIVE pending question
+# has since moved to a different request.  ContextVar (not a host field) keeps concurrent
+# follow-ups isolated and follows the task into the dispatcher's tool callback.
+_CONSULT_FOLLOWUP_ORIGIN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "consult_followup_origin", default=None
+)
+
 
 class TaskLocalThreadDict(dict):
     """Task-local thread dictionary to prevent race conditions on concurrent HTTP turns (B-PIPE-5 residual/R1 dedup)."""
@@ -196,6 +205,10 @@ class SynapseHost:
         self._consult_session_threads: dict[str, str] = {}
         self._consult_followup_requests: set[str] = set()
         self._consult_followup_tasks: set[asyncio.Task[Any]] = set()
+        # B-M2-14: gate task_ids whose in-flight run was invalidated by a propose() changing the
+        # request mid-run.  finish_run's generation guard keys only on stage (which propose does
+        # not move), so the draining run would otherwise resurrect last_outcome for the NEW summary.
+        self._superseded_runs: set[str] = set()
 
     def answer_kora(
         self, thread_id: str | None, text: str, *, user_initiated: bool = False
@@ -262,6 +275,7 @@ class SynapseHost:
     async def _run_consult_followup(self, request: Any) -> None:
         """Ask Flow to synthesize a follow-up without creating an approval-bearing user turn."""
         token = _AUTONOMOUS_FLOW_TURN.set(True)
+        origin_token = _CONSULT_FOLLOWUP_ORIGIN.set(request.request_id)
         previous_thread = self.current_http_thread["id"]
         self.current_http_thread["id"] = request.thread_id
         try:
@@ -282,6 +296,7 @@ class SynapseHost:
         finally:
             self.current_http_thread["id"] = previous_thread
             _AUTONOMOUS_FLOW_TURN.reset(token)
+            _CONSULT_FOLLOWUP_ORIGIN.reset(origin_token)
 
     @property
     def current_http_thread(self) -> dict:
@@ -483,14 +498,16 @@ class SynapseHost:
             self.threads.append_feed(thread_id, {
                 "ts": self.clock.now(), "kind": "event", "text": f"консилиум: {outcome}",
             })
-            for task_id, owner in list(self._consult_session_threads.items()):
-                if owner == thread_id:
-                    self._consult_session_threads.pop(task_id, None)
-                    self._consult_budget_remaining.pop(task_id, None)
-            # B-M2-11: release the per-session follow-up idempotency markers too, symmetric with
-            # the two dicts above.  The task store is a singleton (one consult at a time), so every
-            # request_id in the set belongs to the session ending here — clearing it also self-heals
-            # any markers leaked by earlier sessions.
+            # B-M2-11/19: the task store is a singleton (one consult at a time), so when any consult
+            # teardown fires every entry in these per-session structures belongs to a session that
+            # has already ended — the one ending here, plus any SUPERSEDED session whose own
+            # identity-guarded teardown was skipped (B-M2-19: an idle-cancel flips has_active_task
+            # False, then a rival begin_task overwrites the store slot in the `await stream_task`
+            # window, so the superseded run's finally never calls back).  Clearing all three
+            # wholesale releases the ending session AND self-heals any earlier leak, instead of the
+            # per-thread pop that left a superseded task_id dangling until an incidental thread reuse.
+            self._consult_session_threads.clear()
+            self._consult_budget_remaining.clear()
             self._consult_followup_requests.clear()
             return
         if gate_mode is None and th.request_text is not None:
@@ -522,6 +539,14 @@ class SynapseHost:
                 expected_stage=th.stage,
                 completed_stage="done" if outcome == "completed" and th.stage == "collect" else None,
             )
+            return
+        if th.task_ids and th.task_ids[-1] in self._superseded_runs:
+            # B-M2-14: a propose() changed the request while this run was still draining.  Its
+            # completion must NOT resurrect last_outcome for the NEW summary — finish_run's CAS keys
+            # only on stage, which propose does not move, so it would otherwise re-arm write_code
+            # against a plan built for the OLD summary.  Drop the stale outcome write (propose
+            # already reset last_outcome to None via the B-M2-10 path).
+            self._superseded_runs.discard(th.task_ids[-1])
             return
         expected_stage = "spec_plan" if gate_mode == "docs_only" else "code"
         self.threads.finish_run(
@@ -697,6 +722,15 @@ class SynapseHost:
                     ):
                         return {"outcome": "busy_consult"}
                     if autonomous:
+                        # B-M2-13: an autonomous follow-up may only resolve the SAME parked request
+                        # it was scheduled for.  Between scheduling and this LLM-driven delivery the
+                        # live pending can move (a human answered Q1 and Kora parked Q2, or the
+                        # session was superseded) — `current` is the LIVE pending, not our origin.
+                        # Delivering here would feed Q1's briefing into Q2's future.  No-op on
+                        # mismatch, before spending budget or touching the future.
+                        origin = _CONSULT_FOLLOWUP_ORIGIN.get(None)
+                        if origin is not None and current.request_id != origin:
+                            return {"outcome": "autonomy_session_stale"}
                         remaining = self._consult_budget_remaining.get(active.id, 0)
                         if remaining <= 0:
                             return {"outcome": "autonomy_budget_exhausted"}
@@ -1004,6 +1038,13 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
                 voice_thread["id"] = th.id
         if th.archived:
             return {"outcome": "thread_archived"}  # B48: свод не коммитится в убранный тред
+        # B-M2-15: `done` is terminal (_STAGE_TRANSITIONS["done"] == frozenset()) — no legal path
+        # back to collect to ever re-run against a new summary.  Committing a request here would
+        # only wipe last_outcome (below) and permanently brick the thread (revise and every launch
+        # action then CAS against a stage that can never be re-entered).  Refuse instead — new work
+        # on a finished thread starts a new thread, not a summary swap on the dead one.
+        if th.stage == "done":
+            return {"outcome": "thread_done", "thread_id": th.id, "stage": "done"}
         previous_request = th.request_text
         try:
             threads.set_request(th.id, text)
@@ -1020,6 +1061,16 @@ def build_host(cfg: SynapseConfig, clock: Clock | None = None) -> SynapseHost:
         # сводом не должен ронять ещё валидный план.
         if text != previous_request:
             threads.set_outcome(th.id, None)
+            # B-M2-14: if THIS thread's gate run is still draining (its task is the store's live
+            # task), its completion would resurrect last_outcome for the new summary — finish_run's
+            # CAS keys only on stage, which we did not move.  Mark it superseded so _run_finished
+            # drops that stale outcome write.  A live consult (task_id not in task_ids) never
+            # matches, so it is untouched.
+            host = _h.get("host")
+            active = store.task
+            if (host is not None and th.task_ids and active is not None
+                    and active.id == th.task_ids[-1] and store.has_active_task()):
+                host._superseded_runs.add(th.task_ids[-1])
         # С3 (Ф0.3): смена СВОДА инвалидирует pending approval этого треда (digest несёт
         # request_text — он бы и сам не совпал, но явный invalidate чистит pending сразу, не
         # дожидаясь consume). НЕ внутри ThreadStore — обратная зависимость threads→bridge запрещена.
